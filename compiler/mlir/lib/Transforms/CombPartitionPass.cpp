@@ -277,6 +277,16 @@ buildCombPartition(const ChangeScheduleDag &dag, uint64_t targetSize,
     }
   }
 
+  // Bootstrap the partition forest with the MFFC cones so later merge
+  // phases start from cone-sized candidates rather than singletons.
+  for (const auto &cone : cones) {
+    if (cone.size() < 2)
+      continue;
+    unsigned rep = cone.front();
+    for (unsigned i = 1; i < cone.size(); ++i)
+      unionPartitions(rep, cone[i]);
+  }
+
   // External-path merge test: partitions A and B may merge iff no external
   // path exists in either direction (a path through nodes outside A∪B).
   unsigned testEpoch = 0;
@@ -286,16 +296,21 @@ buildCombPartition(const ChangeScheduleDag &dag, uint64_t targetSize,
     auto direction = [&](int from, int to) {
       ++testEpoch;
       llvm::SmallVector<unsigned, 32> fromMembers = members(from);
-      llvm::SmallVector<unsigned, 32> toMembers = members(to);
+      // Mark only `from` so the walk can still enter and detect `to`
+      // through an outside-A∪B route; marking `to` would make the
+      // reachability check below unreachable.
       for (unsigned m : fromMembers)
-        testMark[m] = testEpoch;
-      for (unsigned m : toMembers)
         testMark[m] = testEpoch;
       llvm::SmallVector<unsigned, 32> work;
       for (unsigned m : fromMembers)
-        for (unsigned sc : succs[m])
-          if (find(sc) != from && find(sc) != to)
-            work.push_back(sc);
+        for (unsigned sc : succs[m]) {
+          int rsc = find(sc);
+          if (rsc == from)
+            continue;
+          if (rsc == to)
+            return true;
+          work.push_back(sc);
+        }
       while (!work.empty()) {
         unsigned u = work.pop_back_val();
         if (testMark[u] == testEpoch)
@@ -303,9 +318,14 @@ buildCombPartition(const ChangeScheduleDag &dag, uint64_t targetSize,
         testMark[u] = testEpoch;
         if (find(u) == to)
           return true;
-        for (unsigned sc : succs[u])
-          if (find(sc) != from && find(sc) != to)
-            work.push_back(sc);
+        for (unsigned sc : succs[u]) {
+          int rsc = find(sc);
+          if (rsc == from)
+            continue;
+          if (rsc == to)
+            return true;
+          work.push_back(sc);
+        }
       }
       return false;
     };
@@ -587,8 +607,6 @@ buildCombPartition(const ChangeScheduleDag &dag, uint64_t targetSize,
     }
     plan.partitionCount = rootId.size();
   }
-  (void)coneOf;
-  (void)cones;
   (void)slotOrderLocal;
   (void)testEpoch;
   return plan;

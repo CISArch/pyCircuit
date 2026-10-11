@@ -414,15 +414,6 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     while (progressed && partCount > 1) {
       progressed = false;
       auto inputs = buildInputPartitions();
-      fprintf(stderr, "[PA] parts=%u\n", partCount);
-      for (auto &[p, ins] : inputs) {
-        if (findRoot(p) != p)
-          continue;
-        fprintf(stderr, "[PA] part %u (size %u) inputs:", p, usize[p]);
-        for (int ip : ins)
-          fprintf(stderr, " %u", ip);
-        fprintf(stderr, "\n");
-      }
       for (auto &[p, ins] : inputs) {
         if (ins.size() != 1 || findRoot(p) != p)
           continue;
@@ -483,12 +474,6 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       }
     }
 
-    {
-      fprintf(stderr, "[GR] final groups:\n");
-      for (unsigned v = 0; v < n; ++v)
-        fprintf(stderr, "[GR] node %u (%s) -> part %d\n", v,
-                ops[v]->getName().getStringRef().str().c_str(), findRoot(v));
-    }
     // 5. Guard: the partition graph must be acyclic; collapse residual SCCs
     // (forced barrier unions can only shrink partitions, but stay safe).
     collapseResidualCycles();
@@ -1133,13 +1118,6 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       for (Operation *nxt : it->second)
         if (--indeg[nxt] == 0)
           ready.push_back(nxt);
-    }
-    if (out.size() != opsInOrder.size()) {
-      llvm::DenseSet<Operation *> emitted(out.begin(), out.end());
-      for (Operation *op : opsInOrder)
-        if (!emitted.contains(op))
-          fprintf(stderr, "[REORDER] stuck %s (indeg=%u)\n",
-                  op->getName().getStringRef().str().c_str(), indeg[op]);
     }
     if (out.size() != opsInOrder.size())
       return; // cyclic (should not happen); keep current order

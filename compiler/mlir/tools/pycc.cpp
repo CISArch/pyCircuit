@@ -2723,7 +2723,7 @@ int main(int argc, char **argv) {
   // still sees those dependencies, so one check after fusion is sufficient.
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createChangeDrivenSchedulePass());
-  if (combPartitionSize > 0 && !enableFuseComb)
+  if (combPartitionSize > 0)
     pm.addNestedPass<func::FuncOp>(
         pyc::createCombPartitionPass(combPartitionSize));
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
