@@ -538,15 +538,72 @@ static bool functionHasSequentialState(func::FuncOp f,
   return hasSeq;
 }
 
+// Per-comb-method local declaration state: values that live entirely inside
+// one comb method become function-local `Wire<>` instead of SimObject struct
+// members, keeping generated headers small (the placement-pass behavior).
+struct CombLocalState {
+  // Values promoted to method-local storage for this comb method.
+  llvm::DenseSet<Value> locals;
+  // Results already declared (first assignment declares with init).
+  llvm::DenseSet<Value> declared;
+
+  void beginMethod() { declared.clear(); }
+};
+
+// A comb-body value can be method-local when it is defined in the body, every
+// use stays inside the same emitted method window (not the yield, not an
+// escape), and it carries no external observation identity (pyc.name / probe /
+// trace) that requires a stable struct address.
+static bool carriesObservationIdentity(Operation *def) {
+  if (def->getAttrOfType<StringAttr>("pyc.name") ||
+      def->getAttr("pyc.debug_keep") || def->getAttr("pyc.observable"))
+    return true;
+  for (NamedAttribute attr : def->getAttrs()) {
+    llvm::StringRef n = attr.getName().strref();
+    if (n.starts_with("pyc.probe") || n.starts_with("pyc.trace"))
+      return true;
+  }
+  return false;
+}
+
+static bool isLocalizableCombValue(Value v, pyc::CombOp comb,
+                                   const llvm::DenseSet<Operation *> &methodOps) {
+  Operation *def = v.getDefiningOp();
+  if (!def || def->getParentOfType<pyc::CombOp>() != comb)
+    return false;
+  if (!methodOps.count(def))
+    return false;
+  if (carriesObservationIdentity(def))
+    return false;
+  for (OpOperand &use : v.getUses()) {
+    Operation *user = use.getOwner();
+    if (isa<pyc::YieldOp>(user) || !methodOps.count(user))
+      return false;
+  }
+  return true;
+}
+
 static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &nt,
-                       llvm::function_ref<void(llvm::raw_ostream &)> buildExpr) {
+                       llvm::function_ref<void(llvm::raw_ostream &)> buildExpr,
+                       CombLocalState *locals = nullptr) {
   std::string expr;
   llvm::raw_string_ostream ess(expr);
   buildExpr(ess);
+  if (locals && locals->locals.count(result)) {
+    // Method-local Wire<>: declare-with-init on first assignment, plain
+    // assignment on reuse.
+    if (locals->declared.insert(result).second)
+      os << "    " << cppType(ty) << " " << nt.get(result) << " = " << ess.str()
+         << ";\n";
+    else
+      os << "    " << nt.get(result) << " = " << ess.str() << ";\n";
+    return;
+  }
   os << "    " << nt.get(result) << " = " << ess.str() << ";\n";
 }
 
-static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTable &nt) {
+static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTable &nt,
+                                   CombLocalState *locals = nullptr) {
   if (auto c = dyn_cast<arith::ConstantOp>(op)) {
     auto value = dyn_cast<IntegerAttr>(c.getValue());
     unsigned w = bitWidth(c.getType());
@@ -567,7 +624,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                      << "ull";
                  }
                  e << "})";
-               });
+               }, locals);
     return success();
   }
   if (auto c = dyn_cast<pyc::ConstantOp>(op)) {
@@ -586,38 +643,38 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                    e << "0x" << llvm::utohexstr(word) << "ull";
                  }
                  e << "})";
-               });
+               }, locals);
     return success();
   }
   if (auto a = dyn_cast<pyc::AliasOp>(op)) {
     assignExpr(a.getResult(), a.getType(), os, nt,
-               [&](llvm::raw_ostream &e) { e << nt.get(a.getIn()); });
+               [&](llvm::raw_ostream &e) { e << nt.get(a.getIn()); }, locals);
     return success();
   }
   if (auto ra = dyn_cast<pyc::ResetActiveOp>(op)) {
     assignExpr(ra.getActive(), ra.getActive().getType(), os, nt,
-               [&](llvm::raw_ostream &e) { e << nt.get(ra.getRst()); });
+               [&](llvm::raw_ostream &e) { e << nt.get(ra.getRst()); }, locals);
     return success();
   }
   if (auto a = dyn_cast<pyc::AddOp>(op)) {
     assignExpr(a.getResult(), a.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "(" << nt.get(a.getLhs()) << " + " << nt.get(a.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto s = dyn_cast<pyc::SubOp>(op)) {
     assignExpr(s.getResult(), s.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "(" << nt.get(s.getLhs()) << " - " << nt.get(s.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto m = dyn_cast<pyc::MulOp>(op)) {
     assignExpr(m.getResult(), m.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "(" << nt.get(m.getLhs()) << " * " << nt.get(m.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto d = dyn_cast<pyc::UdivOp>(op)) {
@@ -627,7 +684,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     assignExpr(d.getResult(), d.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::udiv<" << w << ">(" << nt.get(d.getLhs()) << ", " << nt.get(d.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto r = dyn_cast<pyc::UremOp>(op)) {
@@ -637,7 +694,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     assignExpr(r.getResult(), r.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::urem<" << w << ">(" << nt.get(r.getLhs()) << ", " << nt.get(r.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto d = dyn_cast<pyc::SdivOp>(op)) {
@@ -647,7 +704,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     assignExpr(d.getResult(), d.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::sdiv<" << w << ">(" << nt.get(d.getLhs()) << ", " << nt.get(d.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto r = dyn_cast<pyc::SremOp>(op)) {
@@ -657,7 +714,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     assignExpr(r.getResult(), r.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::srem<" << w << ">(" << nt.get(r.getLhs()) << ", " << nt.get(r.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto m = dyn_cast<pyc::MuxOp>(op)) {
@@ -673,7 +730,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                  else
                    e << "pyc::cpp::mux<" << w << ">(" << nt.get(m.getSel()) << ", " << nt.get(m.getA()) << ", "
                      << nt.get(m.getB()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto s = dyn_cast<arith::SelectOp>(op)) {
@@ -683,33 +740,33 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << "(" << nt.get(s.getCondition()) << ".toBool() ? " << nt.get(s.getTrueValue()) << " : "
                    << nt.get(s.getFalseValue()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto a = dyn_cast<pyc::AndOp>(op)) {
     assignExpr(a.getResult(), a.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "(" << nt.get(a.getLhs()) << " & " << nt.get(a.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto o = dyn_cast<pyc::OrOp>(op)) {
     assignExpr(o.getResult(), o.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "(" << nt.get(o.getLhs()) << " | " << nt.get(o.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto x = dyn_cast<pyc::XorOp>(op)) {
     assignExpr(x.getResult(), x.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "(" << nt.get(x.getLhs()) << " ^ " << nt.get(x.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto n = dyn_cast<pyc::NotOp>(op)) {
     assignExpr(n.getResult(), n.getType(), os, nt,
-               [&](llvm::raw_ostream &e) { e << "(~" << nt.get(n.getIn()) << ")"; });
+               [&](llvm::raw_ostream &e) { e << "(~" << nt.get(n.getIn()) << ")"; }, locals);
     return success();
   }
   if (auto e = dyn_cast<pyc::EqOp>(op)) {
@@ -719,7 +776,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     assignExpr(e.getResult(), e.getType(), os, nt,
                [&](llvm::raw_ostream &eout) {
                  eout << "pyc::cpp::eq<" << w << ">(" << nt.get(e.getLhs()) << ", " << nt.get(e.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto u = dyn_cast<pyc::UltOp>(op)) {
@@ -729,7 +786,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     assignExpr(u.getResult(), u.getType(), os, nt,
                [&](llvm::raw_ostream &eout) {
                  eout << "pyc::cpp::ult<" << w << ">(" << nt.get(u.getLhs()) << ", " << nt.get(u.getRhs()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto s = dyn_cast<pyc::SltOp>(op)) {
@@ -746,7 +803,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                    e << "pyc::cpp::Wire<1>((pyc::cpp::slt<" << w << ">(" << nt.get(s.getLhs()) << ", "
                      << nt.get(s.getRhs()) << ")) ? 1u : 0u)";
                  }
-               });
+               }, locals);
     return success();
   }
   if (auto t = dyn_cast<pyc::TruncOp>(op)) {
@@ -757,7 +814,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     assignExpr(t.getResult(), t.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::trunc<" << ow << ", " << iw << ">(" << nt.get(t.getIn()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto z = dyn_cast<pyc::ZextOp>(op)) {
@@ -768,7 +825,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     assignExpr(z.getResult(), z.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::zext<" << ow << ", " << iw << ">(" << nt.get(z.getIn()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto s = dyn_cast<pyc::SextOp>(op)) {
@@ -779,7 +836,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     assignExpr(s.getResult(), s.getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::sext<" << ow << ", " << iw << ">(" << nt.get(s.getIn()) << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto ex = dyn_cast<pyc::ExtractOp>(op)) {
@@ -791,7 +848,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::extract<" << ow << ", " << iw << ">(" << nt.get(ex.getIn()) << ", "
                    << ex.getLsbAttr().getInt() << "u)";
-               });
+               }, locals);
     return success();
   }
   if (auto tap = dyn_cast<pyc::DelayTapOp>(op)) {
@@ -803,7 +860,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << nt.get(delay.getQ()) << "_inst->tap("
                    << depth.getInt() << "u)";
-               });
+               }, locals);
     return success();
   }
   if (auto sh = dyn_cast<pyc::ShliOp>(op)) {
@@ -814,7 +871,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::shl<" << w << ">(" << nt.get(sh.getIn()) << ", " << sh.getAmountAttr().getInt()
                    << "u)";
-               });
+               }, locals);
     return success();
   }
   if (auto sh = dyn_cast<pyc::LshriOp>(op)) {
@@ -825,7 +882,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::lshr<" << w << ">(" << nt.get(sh.getIn()) << ", " << sh.getAmountAttr().getInt()
                    << "u)";
-               });
+               }, locals);
     return success();
   }
   if (auto sh = dyn_cast<pyc::AshriOp>(op)) {
@@ -836,7 +893,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::ashr<" << w << ">(" << nt.get(sh.getIn()) << ", " << sh.getAmountAttr().getInt()
                    << "u)";
-               });
+               }, locals);
     return success();
   }
   if (auto sh = dyn_cast<pyc::ShlOp>(op)) {
@@ -847,7 +904,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::shl<" << w << ">(" << nt.get(sh.getIn()) << ", static_cast<unsigned>("
                    << nt.get(sh.getAmount()) << ".value()))";
-               });
+               }, locals);
     return success();
   }
   if (auto sh = dyn_cast<pyc::LshrOp>(op)) {
@@ -858,7 +915,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::lshr<" << w << ">(" << nt.get(sh.getIn()) << ", static_cast<unsigned>("
                    << nt.get(sh.getAmount()) << ".value()))";
-               });
+               }, locals);
     return success();
   }
   if (auto sh = dyn_cast<pyc::AshrOp>(op)) {
@@ -869,7 +926,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                [&](llvm::raw_ostream &e) {
                  e << "pyc::cpp::ashr<" << w << ">(" << nt.get(sh.getIn()) << ", static_cast<unsigned>("
                    << nt.get(sh.getAmount()) << ".value()))";
-               });
+               }, locals);
     return success();
   }
   if (auto c = dyn_cast<pyc::ConcatOp>(op)) {
@@ -885,7 +942,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                    e << nt.get(v);
                  }
                  e << ")";
-               });
+               }, locals);
     return success();
   }
   if (auto vg = dyn_cast<pyc::VGetOp>(op)) {
@@ -896,7 +953,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     if (idx < 0 || idx >= vecTy.getDimSize(0))
       return vg.emitError("pyc.v_get index out of range for C++ emission");
     assignExpr(vg.getResult(), vg.getType(), os, nt,
-               [&](llvm::raw_ostream &e) { e << nt.get(vg.getVec()) << "[" << idx << "]"; });
+               [&](llvm::raw_ostream &e) { e << nt.get(vg.getVec()) << "[" << idx << "]"; }, locals);
     return success();
   }
   if (auto vc = dyn_cast<pyc::VCreateOp>(op)) {
@@ -909,7 +966,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                    e << nt.get(v);
                  }
                  e << "}}";
-               });
+               }, locals);
     return success();
   }
   if (auto vb = dyn_cast<pyc::VBroadcastOp>(op)) {
@@ -925,7 +982,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                    e << nt.get(vb.getScalar());
                  }
                  e << "}}";
-               });
+               }, locals);
     return success();
   }
   if (auto vbd = dyn_cast<pyc::VBroadcastDimOp>(op)) {
@@ -962,7 +1019,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                  std::vector<int64_t> idx;
                  walk(0, idx);
                  e << "}}";
-               });
+               }, locals);
     return success();
   }
   auto emitVectorReduce = [&](auto vr, const char *opName, const char *opToken) -> LogicalResult {
@@ -993,7 +1050,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                                          std::to_string(static_cast<long long>(j)) + "]");
                    }
                    e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
-                 });
+                 }, locals);
       return success();
     }
 
@@ -1011,7 +1068,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                                      std::to_string(static_cast<long long>(i)) + "]");
                    }
                    e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
-                 });
+                 }, locals);
       return success();
     }
 
@@ -1041,7 +1098,7 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
                    e << (useTree ? treeReduceExpr(terms, opToken) : chainReduceExpr(terms, opToken));
                  }
                  e << "}}";
-               });
+               }, locals);
     return success();
   };
   if (auto vr = dyn_cast<pyc::VOrReduceOp>(op)) {
@@ -1146,7 +1203,8 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
                                     const CppEmitterOptions &opts,
                                     const EmissionSchedule &schedule,
                                     const llvm::DenseMap<Operation *, unsigned>
-                                        &combIndices) {
+                                        &combIndices,
+                                    llvm::DenseSet<Value> *combLocalSink = nullptr) {
   if (comb.getBody().empty())
     return comb.emitError("pyc.comb must have a non-empty region");
 
@@ -1169,16 +1227,29 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   unsigned combChunkNodes = std::max(1u, opts.combChunkNodes);
   if (combOps.size() > combChunkNodes) {
     // Split oversized comb bodies into chunk helper methods so no single
-    // generated function dominates downstream TU compile cost.
+    // generated function dominates downstream TU compile cost. Values that
+    // stay inside one chunk become method-local Wire<> (small headers).
     const unsigned totalChunks =
         static_cast<unsigned>((combOps.size() + combChunkNodes - 1) / combChunkNodes);
     for (unsigned chunk = 0; chunk < totalChunks; ++chunk) {
       const unsigned beginIdx = chunk * combChunkNodes;
       const unsigned endIdx =
           std::min<unsigned>(beginIdx + combChunkNodes, combOps.size());
+      llvm::DenseSet<Operation *> methodOps;
+      for (unsigned i = beginIdx; i < endIdx; ++i)
+        methodOps.insert(combOps[i]);
+      CombLocalState locals;
+      for (unsigned i = beginIdx; i < endIdx; ++i)
+        for (Value r : combOps[i]->getResults())
+          if (isLocalizableCombValue(r, comb, methodOps))
+            locals.locals.insert(r);
+      if (combLocalSink)
+        for (Value v : locals.locals)
+          combLocalSink->insert(v);
+      locals.beginMethod();
       os << "  inline void eval_comb_" << idx << "_part" << chunk << "() {\n";
       for (unsigned i = beginIdx; i < endIdx; ++i) {
-        if (failed(emitCombAssign(*combOps[i], os, nt)))
+        if (failed(emitCombAssign(*combOps[i], os, nt, &locals)))
           return failure();
       }
       os << "  }\n\n";
@@ -1203,10 +1274,22 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   }
 
   std::string methodName = "eval_comb_" + std::to_string(idx);
+  llvm::DenseSet<Operation *> methodOps;
+  for (Operation *op : combOps)
+    methodOps.insert(op);
+  CombLocalState locals;
+  for (Operation *op : combOps)
+    for (Value r : op->getResults())
+      if (isLocalizableCombValue(r, comb, methodOps))
+        locals.locals.insert(r);
+  if (combLocalSink)
+    for (Value v : locals.locals)
+      combLocalSink->insert(v);
+  locals.beginMethod();
   os << "  inline void " << methodName << "() {\n";
   emitCombInputGuard(comb, os, nt, idx);
   for (Operation *op : combOps) {
-    if (failed(emitCombAssign(*op, os, nt)))
+    if (failed(emitCombAssign(*op, os, nt, &locals)))
       return failure();
   }
 
@@ -1282,16 +1365,48 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << "\n";
 
-  // Internal wires for op results (including inside pyc.comb regions).
+  // Internal wires for op results. Values that stay inside one comb method
+  // are emitted as method-local `Wire<>` (filled in by emitCombMethod below),
+  // so they do not enlarge the struct/header.
   struct Decl {
     std::string name;
     Type ty;
   };
   std::vector<Decl> decls;
   decls.reserve(256);
+  llvm::DenseSet<Value> combLocals;
+  const unsigned combChunkNodes = std::max(1u, opts.combChunkNodes);
+  f.walk([&](pyc::CombOp comb) {
+    if (comb.getBody().empty())
+      return;
+    Block &cb = comb.getBody().front();
+    llvm::SmallVector<Operation *> combOps;
+    for (Operation &op : cb) {
+      if (isa<pyc::YieldOp>(op))
+        break;
+      combOps.push_back(&op);
+    }
+    // Mirror the chunk windows used by emitCombMethod: only values defined
+    // and used inside the same chunk window may become method-local.
+    for (unsigned beginIdx = 0; beginIdx < combOps.size();
+         beginIdx += combChunkNodes) {
+      const unsigned endIdx =
+          std::min<unsigned>(beginIdx + combChunkNodes, combOps.size());
+      llvm::DenseSet<Operation *> methodOps;
+      for (unsigned i = beginIdx; i < endIdx; ++i)
+        methodOps.insert(combOps[i]);
+      for (unsigned i = beginIdx; i < endIdx; ++i)
+        for (Value r : combOps[i]->getResults())
+          if (isLocalizableCombValue(r, comb, methodOps))
+            combLocals.insert(r);
+    }
+  });
   f.walk([&](Operation *op) {
-    for (Value r : op->getResults())
+    for (Value r : op->getResults()) {
+      if (combLocals.count(r))
+        continue;
       decls.push_back(Decl{nt.get(r), r.getType()});
+    }
   });
   std::sort(decls.begin(), decls.end(), [](const Decl &a, const Decl &b) { return a.name < b.name; });
   for (const Decl &d : decls)
@@ -2288,7 +2403,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // Emit fused comb helpers. Indices match body order.
   for (auto [i, comb] : llvm::enumerate(combs)) {
     if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts,
-                              *schedule, combIndex)))
+                              *schedule, combIndex, &combLocals)))
       return failure();
   }
 
