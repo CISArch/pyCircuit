@@ -1178,7 +1178,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
           std::min<unsigned>(beginIdx + combChunkNodes, combOps.size());
       os << "  inline void eval_comb_" << idx << "_part" << chunk << "() {\n";
       for (unsigned i = beginIdx; i < endIdx; ++i) {
-        if (failed(emitCombAssign(*combOps[i], os, nt, nullptr)))
+        if (failed(emitCombAssign(*combOps[i], os, nt)))
           return failure();
       }
       os << "  }\n\n";
@@ -1206,7 +1206,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   os << "  inline void " << methodName << "() {\n";
   emitCombInputGuard(comb, os, nt, idx);
   for (Operation *op : combOps) {
-    if (failed(emitCombAssign(*op, os, nt, nullptr)))
+    if (failed(emitCombAssign(*op, os, nt)))
       return failure();
   }
 
