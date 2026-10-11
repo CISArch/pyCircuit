@@ -206,6 +206,13 @@ static llvm::cl::opt<unsigned> combPartitionSize(
                    "graph partitioning mode (0 = textual runs)"),
     llvm::cl::init(0));
 
+static llvm::cl::opt<unsigned> combRunCap(
+    "comb-run-cap",
+    llvm::cl::desc("Max ops per fused comb region in textual fuse mode "
+                   "(0 = unlimited); smaller regions keep dirty-partition "
+                   "skipping fine-grained"),
+    llvm::cl::init(0));
+
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
@@ -2702,6 +2709,8 @@ int main(int argc, char **argv) {
       // ordering barriers.
       pm.addNestedPass<func::FuncOp>(
           pyc::createFuseCombPass(combPartitionSize));
+    else if (combRunCap > 0)
+      pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass(0, combRunCap));
     else
       pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
   }

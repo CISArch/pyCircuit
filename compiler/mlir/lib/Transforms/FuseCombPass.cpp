@@ -69,6 +69,8 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
   FuseCombPass() = default;
   explicit FuseCombPass(uint64_t smallPartitionThreshold)
       : smallPartitionThreshold(smallPartitionThreshold) {}
+  FuseCombPass(uint64_t smallPartitionThreshold, unsigned runCap)
+      : smallPartitionThreshold(smallPartitionThreshold), runCap(runCap) {}
 
   StringRef getArgument() const override { return "pyc-fuse-comb"; }
   StringRef getDescription() const override {
@@ -93,6 +95,10 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
   }
 
   uint64_t smallPartitionThreshold = 0;
+  // Max ops per textual run (0 = unlimited). Splitting huge fused cones keeps
+  // the dirty-partition skip granularity fine: unchanged tail pieces are
+  // skipped instead of re-evaluating a multi-thousand-op body.
+  unsigned runCap = 0;
 
   // Scratch state for the ESSENT-partition mode (per function).
   llvm::SmallVector<Operation *> ops;
@@ -116,7 +122,19 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
         run.clear();
         return;
       }
-      fuseRun(run);
+      if (runCap == 0 || run.size() <= runCap) {
+        fuseRun(run);
+        run.clear();
+        return;
+      }
+      // Split oversized textual runs at the cap. Pieces stay consecutive in
+      // block order; downstream pieces read producer results, which are
+      // dirty-driven schedule nodes, so no extra polled inputs appear.
+      for (unsigned begin = 0; begin < run.size(); begin += runCap) {
+        unsigned end = std::min<unsigned>(run.size(), begin + runCap);
+        if (end - begin >= 2)
+          fuseRun(ArrayRef<Operation *>(run.data() + begin, end - begin));
+      }
       run.clear();
     };
 
@@ -1139,6 +1157,11 @@ std::unique_ptr<mlir::Pass> createFuseCombPass() { return std::make_unique<FuseC
 std::unique_ptr<mlir::Pass>
 createFuseCombPass(uint64_t smallPartitionThreshold) {
   return std::make_unique<FuseCombPass>(smallPartitionThreshold);
+}
+
+std::unique_ptr<mlir::Pass>
+createFuseCombPass(uint64_t smallPartitionThreshold, unsigned runCap) {
+  return std::make_unique<FuseCombPass>(smallPartitionThreshold, runCap);
 }
 
 static PassRegistration<FuseCombPass> pass;

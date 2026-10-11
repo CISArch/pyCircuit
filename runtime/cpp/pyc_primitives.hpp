@@ -101,12 +101,15 @@ public:
   }
 
   // Applies a pending edge and reports whether the visible register output changed.
+  // The visible copy is skipped when the sampled value equals the current one.
   inline bool tick_commit() {
     if (__builtin_expect(pending, 0)) {
       const bool changed = q != qNext;
-      q = qNext;
       pending = false;
-      return changed;
+      if (!changed)
+        return false;
+      q = qNext;
+      return true;
     }
     return false;
   }
@@ -271,12 +274,15 @@ public:
   }
 
   // Applies a pending edge and reports whether the visible vector output changed.
+  // The visible copy is skipped when the sampled value equals the current one.
   inline bool tick_commit() {
     if (__builtin_expect(pending, 0)) {
       const bool changed = q != qNext;
-      q = qNext;
       pending = false;
-      return changed;
+      if (!changed)
+        return false;
+      q = qNext;
+      return true;
     }
     return false;
   }

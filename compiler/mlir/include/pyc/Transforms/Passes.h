@@ -18,6 +18,10 @@ std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
 std::unique_ptr<::mlir::Pass>
 createFuseCombPass(uint64_t smallPartitionThreshold);
+/// Textual-run fuse with a run-size cap: maximal consecutive runs are split
+/// every `runCap` ops so dirty-partition skipping keeps a fine granularity.
+std::unique_ptr<::mlir::Pass> createFuseCombPass(uint64_t smallPartitionThreshold,
+                                                unsigned runCap);
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
 std::unique_ptr<::mlir::Pass>
 createRetimePipelinesPass(unsigned maxStages = 0,

@@ -1213,9 +1213,30 @@ static void emitMetadataCombFanout(
   os << indent << "  _pyc_mark_comb_dirty(_pyc_consumer);\n";
 }
 
+// True when the input is produced (possibly through a chain of pure
+// single-operand view ops such as extract/trunc/zext/sext/alias) by a
+// change-schedule node. The schedule's dependency graph wires fanout through
+// those views, so the consumer is already dirty-marked when the underlying
+// state changes; polling its snapshot every pass is wasted work.
 static bool isDirtyDrivenInput(Value input) {
-  Operation *producer = input.getDefiningOp();
-  return producer && isChangeScheduleNode(producer);
+  Value v = input;
+  for (unsigned hops = 0; hops < 8; ++hops) {
+    Operation *producer = v.getDefiningOp();
+    if (!producer)
+      return false; // block argument / port: a real boundary.
+    if (isChangeScheduleNode(producer))
+      return true;
+    if (isa<pyc::TruncOp, pyc::ZextOp, pyc::SextOp, pyc::AliasOp>(producer)) {
+      v = producer->getOperand(0);
+      continue;
+    }
+    if (auto ex = dyn_cast<pyc::ExtractOp>(producer)) {
+      v = ex.getIn();
+      continue;
+    }
+    return false;
+  }
+  return false;
 }
 
 static bool hasDirtyPolledBoundaryInput(pyc::CombOp comb) {
@@ -1618,7 +1639,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "    return _pyc_comb_dirty.test(id);\n";
     os << "  }\n";
     os << "  inline void _pyc_mark_comb_dirty(unsigned id) {\n";
-    os << "    _pyc_comb_dirty.mark(id);\n";
+    os << "    _pyc_comb_dirty.markUnchecked(id);\n";
     os << "  }\n\n";
   }
 

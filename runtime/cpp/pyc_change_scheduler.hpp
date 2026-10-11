@@ -25,6 +25,12 @@ public:
     assert(rank < kCapacity && "dirty rank exceeds fixed capacity");
     if (rank >= kCapacity)
       return false;
+    return markUnchecked(rank);
+  }
+
+  // Hot-path mark without bounds checking. Generated simulators call this
+  // with compile-time-constant partition ids.
+  bool markUnchecked(std::size_t rank) noexcept {
     const std::size_t word = rank / kWordBits;
     const std::uint64_t mask = std::uint64_t{1} << (rank % kWordBits);
     const bool inserted = (words_[word] & mask) == 0;
