@@ -122,16 +122,6 @@ static llvm::cl::opt<std::string> cppSplitMode(
     llvm::cl::desc("C++ out-dir split mode: module|none"),
     llvm::cl::init("module"));
 
-static llvm::cl::opt<bool> cppPch(
-    "cpp-pch",
-    llvm::cl::desc("Record device module hpp for CMake precompiled headers (requires --cpp-split=module)"),
-    llvm::cl::init(false));
-
-static llvm::cl::opt<bool> cppCompileBudget(
-    "cpp-compile-budget",
-    llvm::cl::desc("Enforce predicted C++ compile cost budgets (PYC991-993)"),
-    llvm::cl::init(true));
-
 static llvm::cl::opt<unsigned> cppShardThresholdLines(
     "cpp-shard-threshold-lines",
     llvm::cl::desc("Shard oversized C++ module sources when generated line count exceeds this threshold"),
@@ -1920,8 +1910,6 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
                                              llvm::ArrayRef<std::string> compileDefines,
                                              std::optional<std::string> toolchainRoot,
                                              llvm::StringRef topHeader,
-                                             llvm::StringRef outDirAbs,
-                                             bool enableDevicePch,
                                              const llvm::json::Object &profileSummary) {
   llvm::json::Object manifest;
   manifest["version"] = 3;
@@ -1999,17 +1987,6 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
   }
   manifest["top_header"] = topHeader.str();
   manifest["profile_summary"] = llvm::json::Object(profileSummary);
-  if (enableDevicePch) {
-    std::string expectedHeader = (targetName + ".hpp").str();
-    if (topHeader == expectedHeader) {
-      llvm::SmallString<256> headerAbs(outDirAbs);
-      llvm::sys::path::append(headerAbs, topHeader);
-      llvm::json::Array pchJson;
-      pchJson.push_back(headerAbs.str().str());
-      manifest["precompile_headers"] = std::move(pchJson);
-      manifest["precompile_headers_mode"] = "device_hpp";
-    }
-  }
 
   std::string hashInput;
   hashInput.reserve(256);
@@ -2386,18 +2363,6 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: direct output mode requires a non-empty output path\n";
     return 1;
   }
-  if (cppPch && emitKind != "cpp") {
-    llvm::errs() << "error: --cpp-pch requires --emit=cpp\n";
-    return 1;
-  }
-  if (cppPch && outDir.empty()) {
-    llvm::errs() << "error: --cpp-pch requires --out-dir\n";
-    return 1;
-  }
-  if (cppPch && cppSplitMode != "module") {
-    llvm::errs() << "error: --cpp-pch requires --cpp-split=module\n";
-    return 1;
-  }
   const llvm::StringRef observeNamedNorm = llvm::StringRef(observeNamed);
   if (observeNamedNorm != "demand" && observeNamedNorm != "all") {
     llvm::errs() << "error: unknown --observe-named: " << observeNamed
@@ -2604,9 +2569,6 @@ int main(int argc, char **argv) {
         static_cast<int64_t>(effectiveCanonicalizeBudget) * 4096);
   }
 
-  const unsigned cppCombChunkNodes = cppShardMaxAstNodes > 0 ? cppShardMaxAstNodes
-                                                           : pyc::CppEmitterOptions::kDefaultCombChunkNodes;
-
   // Cleanup + optimization pipeline tuned for netlist-style emission.
   PassManager pm(&ctx);
   std::unique_ptr<PassTimingCollector> passTimingStorage;
@@ -2702,9 +2664,6 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
-  if (emitKind == "cpp")
-    pm.addPass(
-        pyc::createCppPlacementPass(cppCombChunkNodes, traceCodegenPlanPath));
   pm.addNestedPass<func::FuncOp>(pyc::createCollectCompileStatsPass());
   const auto tPassStart = Clock::now();
   if (failed(pm.run(*module))) {
@@ -2764,11 +2723,7 @@ int main(int argc, char **argv) {
     return writeCompileStatsJson(statsPath, compileStats);
   };
 
-  pyc::CppPlacementSummary placementTotals;
-  if (emitKind == "cpp")
-    placementTotals = pyc::accumulateModulePlacementSummary(*module);
-
-  auto buildProfileSummary = [&](const pyc::CppPlacementSummary &placementSummary) -> llvm::json::Object {
+  auto buildProfileSummary = [&]() -> llvm::json::Object {
     llvm::json::Object obj;
     obj["build_profile"] = buildProfileNorm;
     obj["hierarchy_policy"] = hierarchyPolicy.getValue();
@@ -2784,20 +2739,7 @@ int main(int argc, char **argv) {
     obj["cpp_shard_threshold_lines"] = static_cast<int64_t>(cppShardThresholdLines);
     obj["cpp_shard_threshold_bytes"] = static_cast<int64_t>(cppShardThresholdBytes);
     obj["cpp_shard_max_ast_nodes"] = static_cast<int64_t>(cppShardMaxAstNodes);
-    obj["cpp_pch"] = cppPch.getValue();
     obj["profile_pass_timing"] = collectPassTiming;
-    {
-      llvm::json::Object placement;
-      placement["struct_members"] = static_cast<int64_t>(placementSummary.structMembers);
-      placement["local_in_method"] = static_cast<int64_t>(placementSummary.localInMethod);
-      placement["probe_pinned_struct"] = static_cast<int64_t>(placementSummary.probePinnedStruct);
-      placement["cross_part_promoted"] = static_cast<int64_t>(placementSummary.crossPartPromoted);
-      placement["scheduled_cross_method"] =
-          static_cast<int64_t>(placementSummary.scheduledCrossMethod);
-      placement["scheduled_cut_weight"] =
-          static_cast<int64_t>(placementSummary.scheduledCutWeight);
-      obj["cpp_placement"] = std::move(placement);
-    }
     return obj;
   };
 
@@ -3231,8 +3173,7 @@ int main(int argc, char **argv) {
       }
 
       if (splitModule) {
-        if (cppCompileBudget &&
-            failed(enforceCppCompileBudgets(*module, cppManifestSources)))
+        if (failed(enforceCppCompileBudgets(*module, cppManifestSources)))
           return 1;
         llvm::SmallString<256> manifestPathStorage;
         if (!cppManifestPath.empty()) {
@@ -3244,19 +3185,13 @@ int main(int argc, char **argv) {
         std::vector<std::string> includeDirs = {std::string(outDir)};
         std::vector<std::string> compileDefines;
         std::string topHeaderName = top + ".hpp";
-        llvm::json::Object manifestProfile = buildProfileSummary(placementTotals);
+        llvm::json::Object manifestProfile = buildProfileSummary();
         manifestProfile["pycc_peak_rss_bytes"] = static_cast<int64_t>(getPeakRssBytes());
         manifestProfile["pass_time_ms"] = static_cast<int64_t>(passMs);
         auto toolchainRoot = findToolchainRoot(argv[0]);
-        llvm::SmallString<256> outDirAbs(outDir);
-        if (std::error_code ec = llvm::sys::fs::make_absolute(outDirAbs)) {
-          llvm::errs() << "error: cannot resolve absolute path for --out-dir " << outDir << ": "
-                       << ec.message() << "\n";
-          return 1;
-        }
         if (failed(writeCppCompileManifest(manifestPathStorage, top, cppManifestSources,
                                            includeDirs, compileDefines, toolchainRoot, topHeaderName,
-                                           outDirAbs, cppPch.getValue(), manifestProfile)))
+                                           manifestProfile)))
           return 1;
       }
 
