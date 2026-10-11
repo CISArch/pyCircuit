@@ -555,8 +555,16 @@ struct CombLocalState {
 // escape), and it carries no external observation identity (pyc.name / probe /
 // trace) that requires a stable struct address.
 static bool carriesObservationIdentity(Operation *def) {
-  if (def->getAttrOfType<StringAttr>("pyc.name") ||
-      def->getAttr("pyc.debug_keep") || def->getAttr("pyc.observable"))
+  if (auto nameAttr = def->getAttrOfType<StringAttr>("pyc.name")) {
+    // Undeclared names (observe_lazy) are lookup-only; they do not need a
+    // stable struct address and may become method-local.
+    if (auto lazy = def->getAttrOfType<BoolAttr>("pyc.observe_lazy");
+        !lazy || !lazy.getValue())
+      return true;
+  } else if (def->getAttr("pyc.debug_keep") || def->getAttr("pyc.observable")) {
+    return true;
+  }
+  if (def->getAttr("pyc.lazy_probe_wires"))
     return true;
   for (NamedAttribute attr : def->getAttrs()) {
     llvm::StringRef n = attr.getName().strref();
@@ -572,6 +580,11 @@ static bool isLocalizableCombValue(Value v, pyc::CombOp comb,
   if (!def || def->getParentOfType<pyc::CombOp>() != comb)
     return false;
   if (!methodOps.count(def))
+    return false;
+  // State-holding ops and instances always live on the struct.
+  if (isa<pyc::RegOp, pyc::DelayLineOp, pyc::DelayTapOp, pyc::InstanceOp,
+          pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
+          pyc::AsyncFifoOp, pyc::CdcSyncOp>(def))
     return false;
   if (carriesObservationIdentity(def))
     return false;
