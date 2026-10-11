@@ -122,6 +122,21 @@ static llvm::cl::opt<std::string> cppSplitMode(
     llvm::cl::desc("C++ out-dir split mode: module|none"),
     llvm::cl::init("module"));
 
+// Kept as accepted (no-op) options: the Davinci baseline driver passes them
+// unconditionally (build_pycircuit_module.py, since 2026-08). The placement
+// machinery they used to toggle was removed from this branch; budgets are
+// still enforced by enforceCppCompileBudgets below.
+static llvm::cl::opt<bool> cppPch(
+    "cpp-pch",
+    llvm::cl::desc("Accepted for driver compatibility; PCH recording was removed on this branch"),
+    llvm::cl::init(false),
+    llvm::cl::Hidden);
+
+static llvm::cl::opt<bool> cppCompileBudget(
+    "cpp-compile-budget",
+    llvm::cl::desc("Enforce predicted C++ compile cost budgets (PYC991-993)"),
+    llvm::cl::init(true));
+
 static llvm::cl::opt<unsigned> cppShardThresholdLines(
     "cpp-shard-threshold-lines",
     llvm::cl::desc("Shard oversized C++ module sources when generated line count exceeds this threshold"),
@@ -3173,7 +3188,8 @@ int main(int argc, char **argv) {
       }
 
       if (splitModule) {
-        if (failed(enforceCppCompileBudgets(*module, cppManifestSources)))
+        if (cppCompileBudget &&
+            failed(enforceCppCompileBudgets(*module, cppManifestSources)))
           return 1;
         llvm::SmallString<256> manifestPathStorage;
         if (!cppManifestPath.empty()) {
