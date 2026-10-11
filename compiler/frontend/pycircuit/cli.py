@@ -2315,9 +2315,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "frontend_contract": FRONTEND_CONTRACT,
     }
     build_flags_hash = _canonical_hash(build_flags)
-    cpp_build_flags_hash = build_flags_hash
     same_flags = str(cache.get("build_flags_hash", "")) == build_flags_hash
-    cpp_same_flags = str(cache.get("cpp_build_flags_hash", "")) == cpp_build_flags_hash
+    cpp_same_flags = same_flags
 
     design_key = "__design_pyc"
     old_hashes = dict(cache.get("module_hashes", {}))
@@ -2693,8 +2692,6 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "pycc": str(pycc),
             "build_flags": build_flags,
             "build_flags_hash": build_flags_hash,
-            "cpp_build_flags": cpp_build_flags,
-            "cpp_build_flags_hash": cpp_build_flags_hash,
             "jit_cache_key": jit_key,
             "jit_cache_inputs": jit_inputs,
             "last_pycc_jobs": int(len(pycc_jobs)),
