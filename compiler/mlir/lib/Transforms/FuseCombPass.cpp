@@ -409,27 +409,22 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
 
     // 4. Merge phases (paper Section IV). External-path legality test plus
     // ordering-barrier check before every merge.
-    // Phase A: single-parent partitions merge into their parent.
+    // Phase A: single-parent partitions merge into their parent. The input
+    // map is computed once per sweep; merging p into q only relabels p's
+    // entries, and roots are re-resolved before every use, so one pass can
+    // apply every still-valid single-parent merge before rebuilding.
     bool progressed = true;
     while (progressed && partCount > 1) {
       progressed = false;
       auto inputs = buildInputPartitions();
-      fprintf(stderr, "[PA] parts=%u\n", partCount);
-      for (auto &[p, ins] : inputs) {
-        if (findRoot(p) != p)
-          continue;
-        fprintf(stderr, "[PA] part %u (size %u) inputs:", p, usize[p]);
-        for (int ip : ins)
-          fprintf(stderr, " %u", ip);
-        fprintf(stderr, "\n");
-      }
       for (auto &[p, ins] : inputs) {
         if (ins.size() != 1 || findRoot(p) != p)
           continue;
-        int q = *ins.begin();
-        if (findRoot(q) != q)
+        int q = findRoot(static_cast<unsigned>(*ins.begin()));
+        if (q == static_cast<int>(p) || findRoot(static_cast<unsigned>(q)) != q)
           continue;
-        if (!mergeLegal(p, q))
+        if (!mergeLegal(static_cast<unsigned>(p),
+                        static_cast<unsigned>(q)))
           continue;
         unionPartitions(p, q);
         progressed = true;
@@ -438,7 +433,9 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       }
     }
     // Phases B/C: small + small sibling (by cut edges), then small + any
-    // sibling (by common-input fraction).
+    // sibling (by common-input fraction). One adjacency rebuild per sweep;
+    // roots are re-resolved inside the sweep so merges within a sweep stay
+    // consistent.
     for (int phase = 0; phase < 2 && partCount > 1; ++phase) {
       bool anyMerge = true;
       while (anyMerge && partCount > 1) {
@@ -477,18 +474,11 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
           if (best >= 0) {
             unionPartitions(p, best);
             anyMerge = true;
-            break;
           }
         }
       }
     }
 
-    {
-      fprintf(stderr, "[GR] final groups:\n");
-      for (unsigned v = 0; v < n; ++v)
-        fprintf(stderr, "[GR] node %u (%s) -> part %d\n", v,
-                ops[v]->getName().getStringRef().str().c_str(), findRoot(v));
-    }
     // 5. Guard: the partition graph must be acyclic; collapse residual SCCs
     // (forced barrier unions can only shrink partitions, but stay safe).
     collapseResidualCycles();
