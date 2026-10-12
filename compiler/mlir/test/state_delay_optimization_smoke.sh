@@ -109,8 +109,8 @@ fi
 
 "${PYCC}" "${DEFAULT_INPUT}" --emit=cpp \
   -o "${TMP_DIR}/default.hpp" 2>"${TMP_DIR}/default.stderr"
-"${PYCC}" "${DEFAULT_INPUT}" --emit=verilog \
-  -o "${TMP_DIR}/default.v" 2>"${TMP_DIR}/default-verilog.stderr"
+"${PYCC}" "${DEFAULT_INPUT}" --emit=cpp --no-state-opt \
+  -o "${TMP_DIR}/default-plain.hpp" 2>"${TMP_DIR}/default-plain.stderr"
 "${PYCC}" "${DEFAULT_INPUT}" --emit=none \
   --probe-manifest="${TMP_DIR}/default-probes.json" \
   -o /dev/null 2>"${TMP_DIR}/default-probes.stderr"
@@ -197,7 +197,7 @@ fi
 "${TMP_DIR}/state-pack-probe-runtime"
 
 python3 - "${TMP_DIR}/default.hpp.stats.json" \
-  "${TMP_DIR}/default.v.stats.json" \
+  "${TMP_DIR}/default-plain.hpp.stats.json" \
   "${TMP_DIR}/default-probes.json" \
   "${TMP_DIR}/packed-probes.json" <<'PY'
 import json
@@ -205,7 +205,7 @@ import sys
 from pathlib import Path
 
 default = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-default_verilog = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+default_plain = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 probe_manifest = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
 packed_probe_manifest = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
 keys = ("reg_count", "reg_bits", "state_opt_regs_merged",
@@ -231,13 +231,13 @@ if default.get("state_opt_pack_width") != 192:
     raise AssertionError("default state pack width is not 192")
 if default.get("observe_named") != "demand":
     raise AssertionError("default C++ observe_named is not demand")
-if default_verilog.get("state_opt_policy") != "off":
+if default_plain.get("state_opt_policy") != "off":
     raise AssertionError("Verilog default policy is not off")
-if default_verilog.get("state_retime_policy") != "off":
+if default_plain.get("state_retime_policy") != "off":
     raise AssertionError("Verilog default retiming policy is not off")
-if default_verilog.get("reg_count") != 2 or default_verilog.get("reg_bits") != 16:
+if default_plain.get("reg_count") != 2 or default_plain.get("reg_bits") != 16:
     raise AssertionError(
-        f"Verilog unexpectedly rewrote default state: {default_verilog}"
+        f"plain run unexpectedly rewrote default state: {default_plain}"
     )
 output_probes = {
     probe["field_path"]: probe

@@ -209,6 +209,11 @@ static llvm::cl::opt<unsigned> stateRetimeMaxStages(
     llvm::cl::desc("Maximum registers per retimed region (0 is unlimited)"),
     llvm::cl::init(0));
 
+static llvm::cl::opt<bool> noStateOpt(
+    "no-state-opt",
+    llvm::cl::desc("Disable the structural state optimization pipeline (keep the plain netlist)"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<unsigned> stateRetimeMaxExtraCombOps(
     "state-retime-max-extra-comb-ops",
     llvm::cl::desc("Maximum duplicated combinational operations from retiming"),
@@ -1157,7 +1162,6 @@ static std::optional<std::string> findToolchainRoot(const char *argv0) {
 static LogicalResult emitPrimitivesFile(llvm::StringRef outPath, llvm::StringRef primDir, bool targetFpga) {
   static const char *kFiles[] = {
       "pyc_reg.v",
-      "pyc_delay_line.v",
       "pyc_fifo.v",
       "pyc_byte_mem.v",
       "pyc_sync_mem.v",
@@ -2663,7 +2667,7 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
   // State merge, retiming, and packing stay on the C++ emit path only so
   // Verilog keeps the pre-optimization netlist.
-  const bool enableStateDelayOptimization = (emitKind == "cpp");
+  const bool enableStateDelayOptimization = (emitKind == "cpp") && !noStateOpt;
   if (enableStateDelayOptimization) {
     // Unified structural state optimization: equivalent-state merge rounds
     // (with in-pass canonicalize/CSE between them), retiming, direct-chain

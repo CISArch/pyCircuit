@@ -44,7 +44,9 @@ b@4 ─────────────────────────�
 - 端口行为、周期数、reset/enable/init 和功能数据流仍必须等价。
 
 只有 `--emit=cpp`（或 `-cpp`）跑完整状态优化（structural 合并 + pipeline retiming）。
-`--emit=verilog` 与 `--emit=none` 保持优化前的寄存器网表。仍可调的预算是：
+`--emit=verilog` 与 `--emit=none` 保持优化前的寄存器网表；Verilog 后端不认识
+`pyc.delay_line`/`pyc.delay_tap`，若 IR 中出现会明确报错（delay lines 为 C++ 专属）。
+仍可调的预算是：
 
 ```text
 --state-pack-width=192
@@ -316,7 +318,7 @@ return %side, %q2
 
 `pyc.delay_tap` 是只读视图，不拥有第二份状态。其 verifier 要求 source 必须是
 `pyc.delay_line`，tap depth 在 `1..line.depth`，并且类型一致。C++ ring 从同一个
-history array 读取 tap；Verilog 从同一组 stages 的只读 history bus 取 slice。这样
+history array 读取 tap；Verilog 后端不支持 delay-line（见 11.2）。这样
 旁路值和末端值都保持原来的周期关系，状态存储仍只有一份。
 
 默认模式不会忽略真实 state dependency、写回 fanout、组合环或跨 block 边界。
@@ -607,17 +609,11 @@ unsigned head = 0;
 调度降为 O(1)。reset 必须填充全部历史位置，仍为 O(depth)。scalar/vector 分别使用
 `pyc_delay_line<Width, Depth>` 和 `pyc_vec_delay_line<T, Depth>`。
 
-### 11.2 Verilog delay-line：真实 shift register
+### 11.2 Verilog：不支持 delay-line
 
-[`VerilogEmitter.cpp`](../compiler/mlir/lib/Emit/VerilogEmitter.cpp) 生成：
-
-```verilog
-pyc_delay_line #(.WIDTH(8), .DEPTH(128)) delay_inst (...);
-```
-
-[`pyc_delay_line.v`](../runtime/verilog/pyc_delay_line.v) 使用寄存器数组、同步 reset
-循环和 enabled shift。Verilog 不采用 C++ ring index，避免给硬件增加地址状态和
-mux。vector delay-line 按 scalar leaf 展开共享控制的实例。
+Verilog 后端保持未优化网表契约，**不实现** delay-line lowering：IR 中出现
+`pyc.delay_line` / `pyc.delay_tap` 时 emitter 以明确诊断拒绝
+（delay lines 为 C++ 专属；如需 Verilog 对照请用 `--no-state-opt` 关闭状态优化）。
 
 ### 11.3 Packed state 的 probe/trace
 
@@ -773,7 +769,7 @@ python3 compiler/mlir/test/check_state_retime_models.py
 | Pipeline | [`pycc.cpp`](../compiler/mlir/tools/pycc.cpp) | 默认策略、pass 顺序、CLI 和统计汇总 |
 | Gates | [`CheckClockDomainsPass.cpp`](../compiler/mlir/lib/Transforms/CheckClockDomainsPass.cpp)、[`CheckCombCyclesPass.cpp`](../compiler/mlir/lib/Transforms/CheckCombCyclesPass.cpp)、[`CheckLogicDepthPass.cpp`](../compiler/mlir/lib/Transforms/CheckLogicDepthPass.cpp) | 把 delay-line 视为时序边界并执行 legality 检查 |
 | C++ | [`CppEmitter.cpp`](../compiler/mlir/lib/Emit/CppEmitter.cpp)、[`pyc_primitives.hpp`](../runtime/cpp/pyc_primitives.hpp)、[`pyc_probe_registry.hpp`](../runtime/cpp/pyc_probe_registry.hpp)、[`pyc_trace_bin.hpp`](../runtime/cpp/pyc_trace_bin.hpp) | ring runtime、packed slice probe 和 trace |
-| Verilog | [`VerilogEmitter.cpp`](../compiler/mlir/lib/Emit/VerilogEmitter.cpp)、[`pyc_delay_line.v`](../runtime/verilog/pyc_delay_line.v) | 可综合 delay-line lowering |
+| Verilog | [`VerilogEmitter.cpp`](../compiler/mlir/lib/Emit/VerilogEmitter.cpp) | 不支持 delay-line（明确报错） |
 | Tests | [`state_delay_optimization_smoke.sh`](../compiler/mlir/test/state_delay_optimization_smoke.sh)、[`delay_line_diagnostics_smoke.sh`](../compiler/mlir/test/delay_line_diagnostics_smoke.sh)、[`check_state_delay_tap_models.py`](../compiler/mlir/test/check_state_delay_tap_models.py)、[`check_state_retime_models.py`](../compiler/mlir/test/check_state_retime_models.py) | 默认策略、delay tap、retiming 和运行时 probe |
 
 ## 17. 当前没有实现的优化
