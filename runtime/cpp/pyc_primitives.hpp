@@ -115,19 +115,18 @@ public:
 private:
   // Samples the enabled edge. The compare runs here because both d/init and
   // q are stable at compute time (commit follows without an interleaved
-  // eval); the wide sample is captured only when the visible value moves.
+  // eval); qNext always captures the sampled next-state so probe readers that
+  // observe it while `pending` is set see this edge's value even on holds.
   inline void posedge_compute_inner() {
     bool r = rst.toBool();
     bool e = en.toBool();
     pending = r | e;
     if (r) {
+      qNext = init;
       changed = q != init;
-      if (changed)
-        qNext = init;
     } else if (e) {
+      qNext = d;
       changed = q != d;
-      if (changed)
-        qNext = d;
     }
   }
 
@@ -298,13 +297,11 @@ private:
     bool e = en.toBool();
     pending = r | e;
     if (r) {
+      qNext = init;
       changed = q != init;
-      if (changed)
-        qNext = init;
     } else if (e) {
+      qNext = d;
       changed = q != d;
-      if (changed)
-        qNext = d;
     }
   }
 
