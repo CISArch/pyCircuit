@@ -1007,21 +1007,25 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       comb->setAttr("pyc.lazy_probe_wires",
                     ArrayAttr::get(comb.getContext(), lazyWires));
 
-    // Replace uses outside the run with comb results. A sequential unit's
-    // `next` operand cannot read the comb result directly: the unit must
-    // also dominate the region (its `q` feeds the region), so the direct
-    // edge would close a placement cycle. Route such uses through a fresh
-    // wire declared before the unit and driven by an assign after the
-    // region — the declare-early/assign-late cell the frontend itself uses
-    // for register feedback.
+    // Replace uses outside the run with comb results. A sequential unit
+    // cannot read the comb result directly for any of its sampled operands
+    // (`next`, `en`, `init`): the unit must also dominate the region (its
+    // `q` feeds the region), so the direct edge would close a placement
+    // cycle. Route such uses through a fresh wire declared before the unit
+    // and driven by an assign after the region — the
+    // declare-early/assign-late cell the frontend itself uses for register
+    // feedback.
     for (auto [out, res] : llvm::zip(outputs, comb.getResults())) {
       OpBuilder::InsertionGuard guard(builder);
       for (OpOperand &use : llvm::make_early_inc_range(out.getUses())) {
         if (!graphMode || runSet.contains(use.getOwner()))
           continue;
         Operation *user = use.getOwner();
-        if (!isa<pyc::RegOp, pyc::DelayLineOp>(user) ||
-            user->getOperand(3) != out)
+        if (!isa<pyc::RegOp, pyc::DelayLineOp>(user) || use.get() != out)
+          continue;
+        // Only the sampled data/control operands (en, next, init) relay
+        // through a wire; clock and reset must stay directly bound.
+        if (use.getOperandNumber() < 2)
           continue;
         OpBuilder wireBuilder(user);
         auto wire = wireBuilder.create<pyc::WireOp>(user->getLoc(), out.getType());
@@ -1080,7 +1084,11 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
             addEdge(dstOp, op); // wire declared before its driver
           for (OpOperand &use : dstOp->getResult(0).getUses())
             if (use.getOwner() != op && pos.count(use.getOwner()))
-              addEdge(op, use.getOwner()); // readers follow the write
+              if (!isa<pyc::RegOp, pyc::DelayLineOp>(use.getOwner()))
+                addEdge(op, use.getOwner()); // readers follow the write
+              // Sequential readers bind by reference in the emitter and
+              // sample at posedge; an assign→reg edge here would close the
+              // relay-wire cycle reg→comb→assign→reg.
         }
         continue;
       }
@@ -1125,11 +1133,14 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
           ready.push_back(nxt);
     }
     if (out.size() != opsInOrder.size()) {
+      // Residual cycle (wire/assign/sequential relay triangles). Appending
+      // the stuck ops in original block order maximizes def-before-use;
+      // dominance validation downstream still rejects a genuinely broken
+      // layout.
       llvm::DenseSet<Operation *> emitted(out.begin(), out.end());
       for (Operation *op : opsInOrder)
         if (!emitted.contains(op))
-          fprintf(stderr, "[REORDER] stuck %s (indeg=%u)\n",
-                  op->getName().getStringRef().str().c_str(), indeg[op]);
+          out.push_back(op);
     }
     if (out.size() != opsInOrder.size())
       return; // cyclic (should not happen); keep current order
