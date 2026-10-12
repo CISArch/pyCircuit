@@ -1046,32 +1046,55 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
         use.set(wire.getResult());
         wireDriverOf[wire.getResult()] = wireAssign;
       }
-      // Units may read the result through a pure alias chain (named probe
-      // aliases like `...__next`). The alias stays a plain op, but the
-      // unit's operand must still relay through a wire to keep dominance.
-      if (graphMode)
-        for (OpOperand &use : llvm::make_early_inc_range(out.getUses())) {
-        Operation *aliasOp = use.getOwner();
-        if (!isa<pyc::AliasOp>(aliasOp) || runSet.contains(aliasOp))
-          continue;
-        for (OpOperand &aliasUse :
-             llvm::make_early_inc_range(aliasOp->getResult(0).getUses())) {
-          Operation *unit = aliasUse.getOwner();
-          if (!isScheduledUnit(unit) || runSet.contains(unit))
-            continue;
-          if (aliasUse.getOperandNumber() < 2)
-            continue;
-          OpBuilder wireBuilder(unit);
-          auto wire =
-              wireBuilder.create<pyc::WireOp>(unit->getLoc(), out.getType());
-          builder.setInsertionPointAfter(comb.getOperation());
-          auto wireAssign = builder.create<pyc::AssignOp>(
-              comb.getLoc(), wire.getResult(), res);
-          aliasUse.set(wire.getResult());
-          wireDriverOf[wire.getResult()] = wireAssign;
-        }
-      }
       out.replaceUsesWithIf(res, [&](OpOperand &use) { return !runSet.contains(use.getOwner()); });
+      // Pure aliases retargeted onto `res` must not sit before the comb
+      // (dominance); aliases are observation-only, so moving them after
+      // the region is semantics-preserving.
+      for (OpOperand &use : llvm::make_early_inc_range(res.getUses())) {
+        Operation *reader = use.getOwner();
+        if (!isa<pyc::AliasOp>(reader) || runSet.contains(reader))
+          continue;
+        if (reader->isBeforeInBlock(comb.getOperation()))
+          reader->moveAfter(comb.getOperation());
+      }
+      // replaceUsesWithIf may have retargeted a scheduled unit's operand
+      // (or an alias feeding one) onto `res` AFTER the direct-use sweep
+      // above ran. Rescan the new uses of `res` and relay any scheduled
+      // unit data operand, whether direct or behind one pure alias.
+      if (!graphMode)
+        continue;
+      for (OpOperand &use : llvm::make_early_inc_range(res.getUses())) {
+        Operation *unit = use.getOwner();
+        Operation *viaAlias = nullptr;
+        if (auto aliasOp = dyn_cast<pyc::AliasOp>(unit)) {
+          // One-level alias: inspect its users instead.
+          for (OpOperand &aliasUse :
+               llvm::make_early_inc_range(aliasOp->getResult(0).getUses())) {
+            Operation *u2 = aliasUse.getOwner();
+            if (!isScheduledUnit(u2) || aliasUse.getOperandNumber() < 2)
+              continue;
+            OpBuilder wireBuilder(u2);
+            auto wire =
+                wireBuilder.create<pyc::WireOp>(u2->getLoc(), res.getType());
+            builder.setInsertionPointAfter(comb.getOperation());
+            auto wireAssign = builder.create<pyc::AssignOp>(
+                comb.getLoc(), wire.getResult(), res);
+            aliasUse.set(wire.getResult());
+            wireDriverOf[wire.getResult()] = wireAssign;
+          }
+          continue;
+        }
+        if (!isScheduledUnit(unit) || use.getOperandNumber() < 2)
+          continue;
+        OpBuilder wireBuilder(unit);
+        auto wire = wireBuilder.create<pyc::WireOp>(unit->getLoc(), res.getType());
+        builder.setInsertionPointAfter(comb.getOperation());
+        auto wireAssign = builder.create<pyc::AssignOp>(
+            comb.getLoc(), wire.getResult(), res);
+        use.set(wire.getResult());
+        wireDriverOf[wire.getResult()] = wireAssign;
+        (void)viaAlias;
+      }
     }
 
     for (Operation *op : llvm::reverse(run))
@@ -1135,9 +1158,21 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       }
       if (isa<pyc::RegOp, pyc::DelayLineOp>(op)) {
         // Sequential units are evaluation sources: `q` holds the previous
-        // commit and `next` is only sampled at commit time, so they never
-        // wait on same-tick producers (the emitter gives them their own
-        // slots). Their operands impose no ordering edges here.
+        // commit and `next` is only sampled at commit time, so they impose
+        // no EVALUATION-order edges on other ops. Their own data operands
+        // (en/next/init and memory data ports) still need the def before
+        // the unit in the block (plain SSA dominance); wire operands
+        // already dominate via their early declaration and are skipped so
+        // relay-wire placement cycles do not come back.
+        for (OpOperand &operand : op->getOpOperands()) {
+          if (operand.getOperandNumber() < 2)
+            continue;
+          Operation *def = operand.get().getDefiningOp();
+          if (!def || isa<pyc::WireOp>(def))
+            continue;
+          if (pos.count(def))
+            addEdge(def, op);
+        }
         continue;
       }
       for (Value operand : op->getOperands()) {
