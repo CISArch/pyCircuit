@@ -356,7 +356,10 @@ def parse_flat_report(path: str) -> list[tuple[str, int]]:
     for line in open(path, errors="replace"):
         m = FLAT_RE.match(line.rstrip("\n"))
         if m:
-            rows.append((m.group("sym").strip(), int(m.group("n"))))
+            # perf report 会补齐空列(如 IPC 列 " -      -"),按 2+ 空格切掉尾部列
+            sym = re.split(r"\s{2,}", m.group("sym").strip())[0].strip()
+            if sym:
+                rows.append((sym, int(m.group("n"))))
     return rows
 
 

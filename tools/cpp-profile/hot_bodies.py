@@ -59,7 +59,8 @@ def main() -> int:
     index, sizes = build_index(args.gen_dir)
 
     rows = []
-    for row in summary["aggregate"]["top_self"][: args.top]:
+    ranked = summary["aggregate"].get("top_self_trace_mean") or summary["aggregate"]["top_self"]
+    for row in ranked[: args.top]:
         sym = row["symbol"]
         parts = re.sub(r"\(.*$", "", sym).split("::")
         hit = index.get((parts[-2], parts[-1])) if len(parts) >= 3 else None
@@ -67,7 +68,7 @@ def main() -> int:
             {
                 "symbol": sym,
                 "pct": row["pct"],
-                "samples": row["samples"],
+                "samples": row.get("samples"),
                 "defined_in": hit[0] if hit else None,
                 "body_lines": hit[1] if hit else None,
                 "file_lines": sizes.get(hit[0]) if hit else None,
