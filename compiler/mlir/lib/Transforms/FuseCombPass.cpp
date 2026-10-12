@@ -63,6 +63,16 @@ static bool isFusableCombOp(Operation *op) {
              arith::SelectOp>(op);
 }
 
+// Units whose evaluation is scheduled by the change-driven scheduler. They
+// bind their inputs by reference and sample them at their own evaluation
+// point, so block placement edges into them are unnecessary (and only
+// manufacture cycles through relay wires).
+static bool isScheduledUnit(Operation *op) {
+  return isa<pyc::RegOp, pyc::DelayLineOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
+             pyc::ByteMemOp, pyc::FifoOp, pyc::AsyncFifoOp, pyc::CdcSyncOp,
+             pyc::InstanceOp>(op);
+}
+
 struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseCombPass)
 
@@ -1007,24 +1017,25 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       comb->setAttr("pyc.lazy_probe_wires",
                     ArrayAttr::get(comb.getContext(), lazyWires));
 
-    // Replace uses outside the run with comb results. A sequential unit
-    // cannot read the comb result directly for any of its sampled operands
-    // (`next`, `en`, `init`): the unit must also dominate the region (its
-    // `q` feeds the region), so the direct edge would close a placement
-    // cycle. Route such uses through a fresh wire declared before the unit
-    // and driven by an assign after the region — the
-    // declare-early/assign-late cell the frontend itself uses for register
-    // feedback.
+    // Replace uses outside the run with comb results. A scheduled unit
+    // (reg, delay-line, memory, fifo, instance) cannot read the comb result
+    // directly: the unit must also dominate the region (its state feeds the
+    // region), so the direct edge would close a placement cycle. Route such
+    // uses through a fresh wire declared before the unit and driven by an
+    // assign after the region — the declare-early/assign-late cell the
+    // frontend itself uses for register feedback. The use may hide behind a
+    // pure alias of the result; follow the chain so named probes keep
+    // working while the unit reads the wire.
     for (auto [out, res] : llvm::zip(outputs, comb.getResults())) {
       OpBuilder::InsertionGuard guard(builder);
       for (OpOperand &use : llvm::make_early_inc_range(out.getUses())) {
         if (!graphMode || runSet.contains(use.getOwner()))
           continue;
         Operation *user = use.getOwner();
-        if (!isa<pyc::RegOp, pyc::DelayLineOp>(user) || use.get() != out)
+        if (!isScheduledUnit(user) || use.get() != out)
           continue;
-        // Only the sampled data/control operands (en, next, init) relay
-        // through a wire; clock and reset must stay directly bound.
+        // Only the sampled data/control operands relay through a wire;
+        // clock and reset ports must stay directly bound.
         if (use.getOperandNumber() < 2)
           continue;
         OpBuilder wireBuilder(user);
@@ -1034,6 +1045,31 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
             comb.getLoc(), wire.getResult(), res);
         use.set(wire.getResult());
         wireDriverOf[wire.getResult()] = wireAssign;
+      }
+      // Units may read the result through a pure alias chain (named probe
+      // aliases like `...__next`). The alias stays a plain op, but the
+      // unit's operand must still relay through a wire to keep dominance.
+      if (graphMode)
+        for (OpOperand &use : llvm::make_early_inc_range(out.getUses())) {
+        Operation *aliasOp = use.getOwner();
+        if (!isa<pyc::AliasOp>(aliasOp) || runSet.contains(aliasOp))
+          continue;
+        for (OpOperand &aliasUse :
+             llvm::make_early_inc_range(aliasOp->getResult(0).getUses())) {
+          Operation *unit = aliasUse.getOwner();
+          if (!isScheduledUnit(unit) || runSet.contains(unit))
+            continue;
+          if (aliasUse.getOperandNumber() < 2)
+            continue;
+          OpBuilder wireBuilder(unit);
+          auto wire =
+              wireBuilder.create<pyc::WireOp>(unit->getLoc(), out.getType());
+          builder.setInsertionPointAfter(comb.getOperation());
+          auto wireAssign = builder.create<pyc::AssignOp>(
+              comb.getLoc(), wire.getResult(), res);
+          aliasUse.set(wire.getResult());
+          wireDriverOf[wire.getResult()] = wireAssign;
+        }
       }
       out.replaceUsesWithIf(res, [&](OpOperand &use) { return !runSet.contains(use.getOwner()); });
     }
@@ -1084,11 +1120,16 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
             addEdge(dstOp, op); // wire declared before its driver
           for (OpOperand &use : dstOp->getResult(0).getUses())
             if (use.getOwner() != op && pos.count(use.getOwner()))
-              if (!isa<pyc::RegOp, pyc::DelayLineOp>(use.getOwner()))
+              if (!isa<pyc::RegOp, pyc::DelayLineOp, pyc::SyncMemOp,
+                       pyc::SyncMemDPOp, pyc::ByteMemOp, pyc::FifoOp,
+                       pyc::AsyncFifoOp, pyc::CdcSyncOp, pyc::InstanceOp>(
+                      use.getOwner()))
                 addEdge(op, use.getOwner()); // readers follow the write
-              // Sequential readers bind by reference in the emitter and
-              // sample at posedge; an assign→reg edge here would close the
-              // relay-wire cycle reg→comb→assign→reg.
+              // Scheduled units (regs, memories, fifos, instances) take
+              // their inputs through the change-driven schedule and bind by
+              // reference; assign->unit edges here only manufacture
+              // placement cycles (reg->comb->assign->reg,
+              // comb->assign->mem->comb).
         }
         continue;
       }
@@ -1106,7 +1147,12 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
           if (isa<pyc::WireOp>(def)) {
             auto it = wireDriverOf.find(operand);
             if (it != wireDriverOf.end() && pos.count(it->second))
-              addEdge(it->second, op);
+              // Scheduled units bind wire cells by reference and read them
+              // at their scheduled evaluation point; only the declaration
+              // must dominate. The assign edge would re-create the
+              // comb→assign→wire→unit→comb placement cycle.
+              if (!isScheduledUnit(op))
+                addEdge(it->second, op);
           }
         }
       }
@@ -1133,14 +1179,57 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
           ready.push_back(nxt);
     }
     if (out.size() != opsInOrder.size()) {
-      // Residual cycle (wire/assign/sequential relay triangles). Appending
-      // the stuck ops in original block order maximizes def-before-use;
-      // dominance validation downstream still rejects a genuinely broken
-      // layout.
+      // Residual cycle (wire/assign/sequential relay triangles). Append the
+      // stuck ops by relaxing, one at a time, the single incoming edge of
+      // the earliest stuck op (its producer stays later under original
+      // order, so the edge is a cycle back edge). Downstream dominance
+      // validation still rejects a genuinely broken layout.
       llvm::DenseSet<Operation *> emitted(out.begin(), out.end());
-      for (Operation *op : opsInOrder)
-        if (!emitted.contains(op))
-          out.push_back(op);
+      while (out.size() < opsInOrder.size()) {
+        Operation *pick = nullptr;
+        for (Operation *op : opsInOrder) {
+          if (emitted.contains(op) || indeg[op] == 0)
+            continue;
+          pick = op; // first stuck op in original order
+          break;
+        }
+        if (!pick)
+          break;
+        out.push_back(pick);
+        emitted.insert(pick);
+        // Do not propagate through the relaxed incoming edges: treat pick's
+        // remaining in-degrees as satisfied.
+        indeg[pick] = 0;
+        auto sit = succsOf.find(pick);
+        if (sit == succsOf.end())
+          continue;
+        for (Operation *nxt : sit->second) {
+          if (emitted.contains(nxt))
+            continue;
+          if (--indeg[nxt] == 0) {
+            // re-run ready sweep incrementally
+            llvm::SmallVector<Operation *, 16> localReady{ nxt };
+            while (!localReady.empty()) {
+              unsigned best = 0;
+              for (unsigned i = 1; i < localReady.size(); ++i)
+                if (pos[localReady[i]] < pos[localReady[best]])
+                  best = i;
+              Operation *op2 = localReady[best];
+              localReady.erase(localReady.begin() + best);
+              if (emitted.contains(op2))
+                continue;
+              out.push_back(op2);
+              emitted.insert(op2);
+              auto it3 = succsOf.find(op2);
+              if (it3 == succsOf.end())
+                continue;
+              for (Operation *n3 : it3->second)
+                if (!emitted.contains(n3) && --indeg[n3] == 0)
+                  localReady.push_back(n3);
+            }
+          }
+        }
+      }
     }
     if (out.size() != opsInOrder.size())
       return; // cyclic (should not happen); keep current order
