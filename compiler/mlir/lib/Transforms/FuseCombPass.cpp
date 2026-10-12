@@ -81,6 +81,10 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       : smallPartitionThreshold(smallPartitionThreshold) {}
   FuseCombPass(uint64_t smallPartitionThreshold, unsigned runCap)
       : smallPartitionThreshold(smallPartitionThreshold), runCap(runCap) {}
+  FuseCombPass(uint64_t smallPartitionThreshold, unsigned runCap,
+               bool conesOnly)
+      : smallPartitionThreshold(smallPartitionThreshold), runCap(runCap),
+        conesOnly(conesOnly) {}
 
   StringRef getArgument() const override { return "pyc-fuse-comb"; }
   StringRef getDescription() const override {
@@ -109,6 +113,9 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
   // the dirty-partition skip granularity fine: unchanged tail pieces are
   // skipped instead of re-evaluating a multi-thousand-op body.
   unsigned runCap = 0;
+  // Keep only the MFFC bootstrap cones (single-head, fanout-free) and skip
+  // every merge phase. Diagnostic mode for measuring merge-phase value.
+  bool conesOnly = false;
 
   // Scratch state for the ESSENT-partition mode (per function).
   llvm::SmallVector<Operation *> ops;
@@ -417,12 +424,28 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       }
     }
 
+    // Cones-only: materialize the MFFC bootstrap cones into the union-find
+    // and stop. Each cone is a single-head fanout-free partition; the
+    // bootstrap already rejected barrier-violating members via coneAllows,
+    // so the unions only need the direct legality check.
+    if (conesOnly) {
+      for (auto &cone : cones) {
+        if (cone.size() < 2)
+          continue;
+        unsigned first = cone.front();
+        for (unsigned i = 1; i < cone.size(); ++i)
+          if (mergeLegal(first, cone[i]))
+            unionPartitions(first, cone[i]);
+      }
+    }
+
     // 4. Merge phases (paper Section IV). External-path legality test plus
     // ordering-barrier check before every merge.
     // Phase A: single-parent partitions merge into their parent. The input
     // map is computed once per sweep; merging p into q only relabels p's
     // entries, and roots are re-resolved before every use, so one pass can
     // apply every still-valid single-parent merge before rebuilding.
+    if (!conesOnly) {
     bool progressed = true;
     while (progressed && partCount > 1) {
       progressed = false;
@@ -489,6 +512,7 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       }
     }
 
+    }
     // 5. Guard: the partition graph must be acyclic; collapse residual SCCs
     // (forced barrier unions can only shrink partitions, but stay safe).
     collapseResidualCycles();
@@ -1287,6 +1311,13 @@ createFuseCombPass(uint64_t smallPartitionThreshold) {
 std::unique_ptr<mlir::Pass>
 createFuseCombPass(uint64_t smallPartitionThreshold, unsigned runCap) {
   return std::make_unique<FuseCombPass>(smallPartitionThreshold, runCap);
+}
+
+std::unique_ptr<mlir::Pass> createFuseCombPass(uint64_t smallPartitionThreshold,
+                                               unsigned runCap,
+                                               bool conesOnly) {
+  return std::make_unique<FuseCombPass>(smallPartitionThreshold, runCap,
+                                        conesOnly);
 }
 
 static PassRegistration<FuseCombPass> pass;

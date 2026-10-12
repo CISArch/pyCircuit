@@ -22,6 +22,10 @@ createFuseCombPass(uint64_t smallPartitionThreshold);
 /// every `runCap` ops so dirty-partition skipping keeps a fine granularity.
 std::unique_ptr<::mlir::Pass> createFuseCombPass(uint64_t smallPartitionThreshold,
                                                 unsigned runCap);
+/// Graph mode restricted to the MFFC bootstrap cones (no merge phases).
+std::unique_ptr<::mlir::Pass> createFuseCombPass(uint64_t smallPartitionThreshold,
+                                                unsigned runCap,
+                                                bool conesOnly);
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
 std::unique_ptr<::mlir::Pass>
 createRetimePipelinesPass(unsigned maxStages = 0,

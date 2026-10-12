@@ -211,6 +211,13 @@ static llvm::cl::opt<unsigned> combPartitionSize(
                    "graph partitioning mode (0 = textual runs, recommended)"),
     llvm::cl::init(0));
 
+static llvm::cl::opt<bool> combConesOnly(
+    "comb-cones-only",
+    llvm::cl::desc("Graph mode without merge phases: keep only the MFFC "
+                   "bootstrap cones (single-head fanout-free partitions). "
+                   "Requires --comb-partition-size>0; diagnostic"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<unsigned> combRunCap(
     "comb-run-cap",
     llvm::cl::desc("Max ops per fused comb region in textual fuse mode "
@@ -2713,7 +2720,8 @@ int main(int argc, char **argv) {
       // downstream pyc-comb-partition pass must not re-merge across
       // ordering barriers.
       pm.addNestedPass<func::FuncOp>(
-          pyc::createFuseCombPass(combPartitionSize));
+          pyc::createFuseCombPass(combPartitionSize, /*runCap=*/0,
+                                  combConesOnly));
     else if (combRunCap > 0)
       pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass(0, combRunCap));
     else

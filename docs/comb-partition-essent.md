@@ -91,9 +91,17 @@ CPU-time A/B) shows graph mode is a net loss on this workload:
 | `8` | fails (residual dominance) | — | — | — |
 | `16` | fails (residual dominance) | — | — | — |
 | `64` | ok | 25 | 0.88 s | 0.32x |
+| `1` + `--comb-cones-only` | ok | 14121 | 3.87 s | 0.07x |
 
 Functional results are bit-identical in every case that compiles
 (`cycles`/`pe0_busy_cycles`/`max_raw_pc` unchanged).
+
+Removing the merge phases entirely (`--comb-cones-only`, i.e. only the MFFC
+bootstrap cones) is the worst configuration of all: cluster0 ends up with
+14121 single-head cones — the fanout-free cone condition ("all successors
+already inside the cone") almost never holds on this high-fanout design, so
+the cones degenerate to one op each — and the run is 14.3x slower than textual
+fusion. Cone-only partitioning is not a viable direction here.
 
 Both ends of the sweep lose: coarse partitions (25) collapse skip granularity,
 while fine graph partitions (4828) multiply boundary snapshot compares and
