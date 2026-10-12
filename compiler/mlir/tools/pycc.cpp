@@ -3,6 +3,7 @@
 #include "pyc/Emit/CppEmitter.h"
 #include "pyc/Emit/VerilogEmitter.h"
 #include "pyc/Support/PassIRDumper.h"
+#include "pyc/Transforms/CombPartition.h"
 #include "pyc/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -198,6 +199,31 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     "cpp-only-preserve-ops",
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
+
+// Measured recommendation: 0 (textual fusion). Graph mode is a net loss on
+// high-activity designs — on DavinciTop (v5_superscalar_v5_core) it is 3-4x
+// slower than textual fusion at every threshold that compiles, because
+// coarsening collapses dirty-skip granularity while graph boundaries add
+// snapshot compares (see docs/comb-partition-essent.md).
+static llvm::cl::opt<unsigned> combPartitionSize(
+    "comb-partition-size",
+    llvm::cl::desc("ESSENT comb partition threshold; >0 switches fuse-comb to "
+                   "graph partitioning mode (0 = textual runs, recommended)"),
+    llvm::cl::init(0));
+
+static llvm::cl::opt<bool> combConesOnly(
+    "comb-cones-only",
+    llvm::cl::desc("Graph mode without merge phases: keep only the MFFC "
+                   "bootstrap cones (single-head fanout-free partitions). "
+                   "Requires --comb-partition-size>0; diagnostic"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<unsigned> combRunCap(
+    "comb-run-cap",
+    llvm::cl::desc("Max ops per fused comb region in textual fuse mode "
+                   "(0 = unlimited); smaller regions keep dirty-partition "
+                   "skipping fine-grained"),
+    llvm::cl::init(0));
 
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
@@ -2442,11 +2468,11 @@ int main(int argc, char **argv) {
   mlir::func::registerInlinerExtension(registry);
 
   MLIRContext ctx(registry);
-#ifdef _WIN32
-  // MSYS2/MinGW builds can hit non-deterministic crashes when running nested
-  // pass pipelines with multithreading enabled. Bring-up prefers robustness.
+// MSYS2/MinGW builds can hit non-deterministic crashes when running nested
+  // pass pipelines with multithreading enabled. Bring-up prefers robustness;
+  // the same nondeterminism was observed on Linux with nested func passes
+  // (FuseCombPass graph mode), so threading stays off on all platforms.
   ctx.disableMultithreading();
-#endif
   ctx.loadAllAvailableDialects();
 
   const auto tParseStart = Clock::now();
@@ -2692,8 +2718,19 @@ int main(int argc, char **argv) {
     pm.addPass(pyc::createApplyObservationDemandPass(
         probePlanPath, traceCodegenPlanPath));
   const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
-  if (enableFuseComb)
-    pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+  if (enableFuseComb) {
+    if (combPartitionSize > 0)
+      // Graph mode: fuse creates one pyc.comb per ESSENT partition; the
+      // downstream pyc-comb-partition pass must not re-merge across
+      // ordering barriers.
+      pm.addNestedPass<func::FuncOp>(
+          pyc::createFuseCombPass(combPartitionSize, /*runCap=*/0,
+                                  combConesOnly));
+    else if (combRunCap > 0)
+      pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass(0, combRunCap));
+    else
+      pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+  }
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());
   addRemoveDeadValuesPassIfSupported(pm);
@@ -2703,6 +2740,9 @@ int main(int argc, char **argv) {
   // still sees those dependencies, so one check after fusion is sufficient.
   pm.addPass(pyc::createCheckCombCyclesPass());
   pm.addPass(pyc::createChangeDrivenSchedulePass());
+  if (combPartitionSize > 0 && !enableFuseComb)
+    pm.addNestedPass<func::FuncOp>(
+        pyc::createCombPartitionPass(combPartitionSize));
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
