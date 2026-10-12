@@ -73,6 +73,19 @@ static bool isScheduledUnit(Operation *op) {
              pyc::InstanceOp>(op);
 }
 
+// Index of the first sampled (data/control) operand on a scheduled unit —
+// operands below this are the unit's fixed clock/reset ports and must stay
+// directly bound (never relayed through a declare-early/assign-late wire).
+// `AsyncFifoOp` keeps a second clock/reset pair at operands 2 and 3, while
+// `InstanceOp` has no fixed clock slots at all (its ports are variadic).
+static unsigned firstSampledOperand(Operation *unit) {
+  if (isa<pyc::AsyncFifoOp>(unit))
+    return 4;
+  if (isa<pyc::InstanceOp>(unit))
+    return 0;
+  return 2;
+}
+
 struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseCombPass)
 
@@ -1024,52 +1037,48 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     // uses through a fresh wire declared before the unit and driven by an
     // assign after the region — the declare-early/assign-late cell the
     // frontend itself uses for register feedback. The use may hide behind a
-    // pure alias of the result; follow the chain so named probes keep
-    // working while the unit reads the wire.
+    // pure alias chain of the result (e.g. nested `.named()` / `...__next`
+    // probes), so follow it with the same bounded depth the rest of this
+    // pass uses for transparent-alias handling.
     for (auto [out, res] : llvm::zip(outputs, comb.getResults())) {
       OpBuilder::InsertionGuard guard(builder);
-      for (OpOperand &use : llvm::make_early_inc_range(out.getUses())) {
-        if (!graphMode || runSet.contains(use.getOwner()))
-          continue;
-        Operation *user = use.getOwner();
-        if (!isScheduledUnit(user) || use.get() != out)
-          continue;
-        // Only the sampled data/control operands relay through a wire;
-        // clock and reset ports must stay directly bound.
-        if (use.getOperandNumber() < 2)
-          continue;
-        OpBuilder wireBuilder(user);
-        auto wire = wireBuilder.create<pyc::WireOp>(user->getLoc(), out.getType());
+      if (!graphMode) {
+        out.replaceUsesWithIf(res, [&](OpOperand &use) {
+          return !runSet.contains(use.getOwner());
+        });
+        continue;
+      }
+      auto relayUnitOperand = [&](OpOperand &use) {
+        Operation *unit = use.getOwner();
+        OpBuilder wireBuilder(unit);
+        auto wire =
+            wireBuilder.create<pyc::WireOp>(unit->getLoc(), out.getType());
         builder.setInsertionPointAfter(comb.getOperation());
         auto wireAssign = builder.create<pyc::AssignOp>(
             comb.getLoc(), wire.getResult(), res);
         use.set(wire.getResult());
         wireDriverOf[wire.getResult()] = wireAssign;
-      }
-      // Units may read the result through a pure alias chain (named probe
-      // aliases like `...__next`). The alias stays a plain op, but the
-      // unit's operand must still relay through a wire to keep dominance.
-      if (graphMode)
-        for (OpOperand &use : llvm::make_early_inc_range(out.getUses())) {
-        Operation *aliasOp = use.getOwner();
-        if (!isa<pyc::AliasOp>(aliasOp) || runSet.contains(aliasOp))
-          continue;
-        for (OpOperand &aliasUse :
-             llvm::make_early_inc_range(aliasOp->getResult(0).getUses())) {
-          Operation *unit = aliasUse.getOwner();
-          if (!isScheduledUnit(unit) || runSet.contains(unit))
-            continue;
-          if (aliasUse.getOperandNumber() < 2)
-            continue;
-          OpBuilder wireBuilder(unit);
-          auto wire =
-              wireBuilder.create<pyc::WireOp>(unit->getLoc(), out.getType());
-          builder.setInsertionPointAfter(comb.getOperation());
-          auto wireAssign = builder.create<pyc::AssignOp>(
-              comb.getLoc(), wire.getResult(), res);
-          aliasUse.set(wire.getResult());
-          wireDriverOf[wire.getResult()] = wireAssign;
+      };
+      llvm::SmallVector<Value, 4> frontier{out};
+      for (unsigned hop = 0; hop <= 64 && !frontier.empty(); ++hop) {
+        llvm::SmallVector<Value, 4> next;
+        for (Value src : frontier) {
+          for (OpOperand &use : llvm::make_early_inc_range(src.getUses())) {
+            Operation *user = use.getOwner();
+            if (runSet.contains(user))
+              continue;
+            if (auto aliasOp = dyn_cast<pyc::AliasOp>(user)) {
+              next.push_back(aliasOp->getResult(0));
+              continue;
+            }
+            if (!isScheduledUnit(user))
+              continue;
+            if (use.getOperandNumber() < firstSampledOperand(user))
+              continue;
+            relayUnitOperand(use);
+          }
         }
+        frontier = std::move(next);
       }
       out.replaceUsesWithIf(res, [&](OpOperand &use) { return !runSet.contains(use.getOwner()); });
     }
