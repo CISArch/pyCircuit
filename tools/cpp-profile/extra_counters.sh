@@ -8,6 +8,8 @@ set -uo pipefail
 ROOT=${ROOT:-/home/ldz/pycircuit-workspace/logs/cpp-perf-profiling}
 RUNNER=${RUNNER:-$ROOT/cpp/pycircuit_trace_runner}
 DRAIN=${DRAIN:-512}
+# 与 flat pass 同口径:限周期保证墙钟可控(计数器比率与周期数无关)
+export V5_TRACE_MAX_CYCLES=${V5_TRACE_MAX_CYCLES:-4000}
 EVENTS=${EVENTS:-cycles:u,instructions:u,branch-instructions:u,branch-misses:u,\
 L1-icache-load-misses:u,L1-dcache-load-misses:u,LLC-load-misses:u,\
 dTLB-load-misses:u,iTLB-load-misses:u,stalled-cycles-frontend:u,stalled-cycles-backend:u}

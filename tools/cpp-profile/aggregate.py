@@ -34,39 +34,38 @@ def read_json(path, default=None):
 
 
 def parse_perf_stat(path):
-    """解析 perf stat -o 输出,返回 {event: value} 以及派生指标。"""
+    """解析 perf stat -o 输出,返回原始计数器 + 派生指标(IPC/缺失率)。"""
     if not os.path.isfile(path):
         return {}
     text = open(path, errors="replace").read()
-    out = {}
+    raw = {}
     for line in text.splitlines():
-        m = re.match(r"^\s*([\d,]+(?:\.\d+)?)\s+(\S+)\s*(#.*)?$", line)
+        m = re.match(
+            r"^\s*([\d,]+(?:\.\d+)?)\s+([a-zA-Z][\w:./\-]*)\s*(?:#.*)?(?:\([\d.]+%\))?\s*$",
+            line,
+        )
         if not m:
             continue
-        raw, event = m.group(1), m.group(2)
-        comment = (m.group(3) or "").lstrip("# ").strip()
+        event = m.group(2)
+        if event in {"seconds", "elapsed"}:
+            continue
         try:
-            val = float(raw.replace(",", ""))
+            raw[event] = float(m.group(1).replace(",", ""))
         except ValueError:
             continue
-        if event.startswith("#") or not re.match(r"^[a-z0-9\-_:/]+$", event):
-            continue
-        out[event] = val
-        if comment and "insn per cycle" in comment:
-            try:
-                out["ipc"] = float(comment.split()[0])
-            except ValueError:
-                pass
-        if comment and "of all branches" in comment:
-            try:
-                out["branch_miss_pct"] = float(comment.split("%")[0].split()[-1])
-            except ValueError:
-                pass
-        if comment and "of all cache refs" in comment:
-            try:
-                out["cache_miss_pct"] = float(comment.split("%")[0].split()[-1])
-            except ValueError:
-                pass
+    out = dict(raw)
+    cyc = raw.get("cycles:u") or raw.get("cycles")
+    ins = raw.get("instructions:u") or raw.get("instructions")
+    if cyc and ins:
+        out["ipc"] = round(ins / cyc, 4)
+    cref = raw.get("cache-references:u") or raw.get("cache-references")
+    cmiss = raw.get("cache-misses:u") or raw.get("cache-misses")
+    if cref and cmiss:
+        out["cache_miss_pct"] = round(100.0 * cmiss / cref, 2)
+    bref = raw.get("branch-instructions:u") or raw.get("branch-instructions")
+    bmiss = raw.get("branch-misses:u") or raw.get("branch-misses")
+    if bref and bmiss:
+        out["branch_miss_pct"] = round(100.0 * bmiss / bref, 2)
     return out
 
 
@@ -93,16 +92,28 @@ def main() -> int:
         if not os.path.isdir(run):
             continue
         script = os.path.join(run, "perf.script.raw")
+        if not os.path.isfile(script) and os.path.isfile(script + ".gz"):
+            script += ".gz"
         timed = read_json(os.path.join(run, "replay-timed.json"), {}) or {}
+        if not timed:
+            timed = read_json(os.path.join(run, "replay-flat.json"), {}) or {}
         conv = read_json(os.path.join(run, "conversion.json"), {}) or {}
         stat = parse_perf_stat(os.path.join(run, "perf.stat.txt"))
+        kind = "callstack"
         if not os.path.isfile(script):
-            continue
-        samples = [s for s in parse_perf_script(script) if is_model_sample(s)]
-        if not samples:
-            continue
-        rep = build_report(samples, top=25)
-        all_samples.append((name, samples))
+            flat = os.path.join(run, "report-flat.json")
+            if not os.path.isfile(flat):
+                continue
+            rep = read_json(flat, {}) or {}
+            kind = "flat"
+            samples = []
+        else:
+            samples = [s for s in parse_perf_script(script) if is_model_sample(s)]
+            if not samples:
+                continue
+            rep = build_report(samples, top=25)
+        if samples:
+            all_samples.append((name, samples))
         total_samples += rep["samples"]
         for row in rep["self_top"]:
             agg_self[row["symbol"]] += row["samples"]
@@ -126,6 +137,7 @@ def main() -> int:
                 "elapsed_ms": elapsed_ms,
                 "cycles_per_s": round(cycles / (elapsed_ms / 1000.0)) if cycles and elapsed_ms else None,
                 "samples": rep["samples"],
+                "profile_kind": kind,
                 "category_self_pct": {
                     k: round(100.0 * v / rep["samples"], 2)
                     for k, v in rep["category_self"].items()
@@ -144,6 +156,14 @@ def main() -> int:
         )
 
     traces.sort(key=lambda t: -(t["cycles_per_s"] or 0))
+
+    # 逐 trace 百分比的“中位数”——避免被样本量最大的 trace 主导,给出更公平的全景
+    cat_names = sorted({k for t in traces for k in t["category_self_pct"]})
+    cat_median = {}
+    for k in cat_names:
+        vals = [t["category_self_pct"][k] for t in traces if k in t["category_self_pct"]]
+        if vals:
+            cat_median[k] = round(statistics.median(vals), 2)
     cps = [t["cycles_per_s"] for t in traces if t.get("cycles_per_s")]
     summary = {
         "traces": traces,
@@ -162,6 +182,7 @@ def main() -> int:
             }
             if total_samples
             else {},
+            "category_self_pct_median": cat_median,
             "top_self": [
                 {"symbol": k, "samples": v, "pct": round(100.0 * v / total_samples, 2)}
                 for k, v in sorted(agg_self.items(), key=lambda kv: -kv[1])[:40]

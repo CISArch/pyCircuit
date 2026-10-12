@@ -17,6 +17,8 @@ perf script 文本按默认格式解析:样本行
 from __future__ import annotations
 
 import argparse
+import gzip
+import time
 import html
 import json
 import re
@@ -40,8 +42,12 @@ FRAME_RE = re.compile(
 
 
 def parse_perf_script(path: str):
-    """yield (comm, pid, time_s, [frames]) ,frames 顺序为 叶->根。"""
-    with open(path, "r", errors="replace") as fh:
+    """yield (comm, pid, time_s, [frames]) ,frames 顺序为 叶->根。
+
+    支持 .gz(驱动会压缩 perf script 原文以省空间)。
+    """
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", errors="replace") as fh:
         cur = None
         for line in fh:
             if not line.strip():
@@ -155,6 +161,18 @@ def trace_packet(timestamp_ns: int | None, payload: bytes, seq_flags: int,
     return pb_bytes(1, out)  # Trace.packet
 
 
+def clock_snapshot_packet(mono_ns: int, boot_ns: int, realtime_ns: int) -> bytes:
+    """TracePacket.clock_snapshot —— 把样本用的 MONOTONIC(3) 映射到 trace 时间基。
+
+    Perfetto 要求:任何使用非默认 clock_id 的时间戳,都必须先有 ClockSnapshot,
+    否则报文会被判为 clock_sync_failure 并整包丢弃。
+    """
+    clocks = b""
+    for cid, ts in ((3, mono_ns), (6, boot_ns), (1, realtime_ns)):
+        clocks += pb_bytes(1, pb_varint(1, cid) + pb_varint(2, ts))
+    return pb_bytes(6, clocks)   # TracePacket.clock_snapshot = 6
+
+
 def descriptor_packet_process(uuid: int, pid: int, name: str) -> bytes:
     desc = pb_varint(1, uuid) + pb_str(2, name)
     proc = pb_varint(1, pid) + pb_str(6, name)
@@ -194,28 +212,40 @@ def write_pftrace(samples, out_path: str, process_name: str = "pycircuit-trace-r
     out = bytearray()
     pid = samples[0]["pid"] if samples else 1
     proc_uuid = 1
-    thread_uuids: dict[int, int] = {}
-    for tid in sorted({s["tid"] for s in samples}):
-        thread_uuids[tid] = 1000 + tid
+    # 轨道按“进程名”聚合:同一 trace 反复跑会产生多个 pid,按 tid 建轨道会切成一堆
+    # 碎片轨道;按 comm 聚合后一个 trace 只留 1-2 条有意义的轨道。
+    comms = sorted({s["comm"] for s in samples})
+    track_of = {s["comm"] for s in samples}
+    thread_uuids: dict[str, int] = {c: 1000 + i for i, c in enumerate(comms)}
+
+    # 0) 时钟映射(必须在任何带时间戳的报文之前)
+    out += trace_packet(
+        None,
+        clock_snapshot_packet(
+            int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1e9),
+            int(time.clock_gettime(time.CLOCK_BOOTTIME) * 1e9),
+            time.time_ns(),
+        ),
+        SEQ_INCREMENTAL_STATE_CLEARED,
+    )
 
     # 1) 描述符 + 驻留数据(整条 sequence 的初始状态一次给全)
     first_payload = b""
     first_payload += pb_bytes(60, descriptor_packet_process(proc_uuid, pid, process_name))
-    for tid, uuid in thread_uuids.items():
+    for c in comms:
         first_payload += pb_bytes(
-            60, descriptor_packet_thread(uuid, pid, tid, f"cpu-sim tid={tid}")
+            60, descriptor_packet_thread(thread_uuids[c], pid, 1000 + comms.index(c), c)
         )
     first_payload += pb_bytes(12, interned_event_names(pairs))
-    out += trace_packet(None, first_payload, SEQ_INCREMENTAL_STATE_CLEARED)
+    out += trace_packet(None, first_payload, SEQ_NEEDS_INCREMENTAL_STATE)
 
     # 2) 采样 -> BEGIN/END 切片(栈间差分,保证嵌套一致)
-    state: dict[int, list[str]] = defaultdict(list)
-    prev_ts: dict[int, int] = {}
-    started: dict[int, int] = {}
+    state: dict[str, list[str]] = defaultdict(list)
+    prev_ts: dict[str, int] = {}
     seq_flags = SEQ_NEEDS_INCREMENTAL_STATE
 
     for s in samples:
-        tid = s["tid"]
+        tid = s["comm"]
         ts = int(round(s["time"] * 1e9))
         stack = stack_of(s)          # 叶 -> 根
         want = list(reversed(stack))  # 根 -> 叶
@@ -263,7 +293,7 @@ def write_pftrace(samples, out_path: str, process_name: str = "pycircuit-trace-r
         "packets": out.count(b""),  # 占位,真实统计见下
         "event_names": len(pairs),
         "samples": len(samples),
-        "threads": len(thread_uuids),
+        "tracks": len(thread_uuids),
         "bytes": len(out),
     }
 
@@ -272,33 +302,35 @@ def write_chrome_json(samples, out_path: str, process_name: str = "trace-runner"
     """Chrome Trace Event Format JSON —— Perfetto UI 亦可直接打开。"""
     samples = sorted(samples, key=lambda s: s["time"])
     events = []
-    state: dict[int, list[str]] = defaultdict(list)
+    state: dict[str, list[str]] = defaultdict(list)
     base = samples[0]["time"] if samples else 0.0
+    comms = sorted({s["comm"] for s in samples})
+    comm_id = {c: i + 1 for i, c in enumerate(comms)}
 
     def ts(s):
         return (s["time"] - base) * 1e6  # us
 
     for s in samples:
-        tid = s["tid"]
+        tid = comm_id[s["comm"]]
         want = list(reversed(stack_of(s)))
-        cur = state[tid]
+        cur = state[s["comm"]]
         common = 0
         while common < len(cur) and common < len(want) and cur[common] == want[common]:
             common += 1
         for depth in range(len(cur) - 1, common - 1, -1):
-            events.append({"ph": "E", "ts": ts(s), "tid": tid, "pid": s["pid"]})
+            events.append({"ph": "E", "ts": ts(s), "tid": tid, "pid": 1})
         for depth in range(common, len(want)):
             events.append(
                 {
                     "ph": "B",
                     "ts": ts(s),
                     "tid": tid,
-                    "pid": s["pid"],
+                    "pid": 1,
                     "name": want[depth],
                     "cat": "sampled",
                 }
             )
-        state[tid] = want
+        state[s["comm"]] = want
 
     payload = {
         "traceEvents": events,
@@ -311,6 +343,54 @@ def write_chrome_json(samples, out_path: str, process_name: str = "trace-runner"
 
 
 # ----------------------------------------------------------------------------
+# perf report(扁平,无调用栈)解析 —— 用于“全 trace 覆盖”的轻量 pass
+# ----------------------------------------------------------------------------
+FLAT_RE = re.compile(
+    r"^\s*(?P<pct>[\d.]+)%\s+(?P<n>\d+)\s+\[.\]\s+(?P<sym>.+?)\s*$"
+)
+
+
+def parse_flat_report(path: str) -> list[tuple[str, int]]:
+    """解析 `perf report --stdio --sort symbol --show-nr-samples` 输出。"""
+    rows = []
+    for line in open(path, errors="replace"):
+        m = FLAT_RE.match(line.rstrip("\n"))
+        if m:
+            rows.append((m.group("sym").strip(), int(m.group("n"))))
+    return rows
+
+
+def build_flat_report(rows, top: int = 60) -> dict:
+    self_n: dict[str, int] = defaultdict(int)
+    for sym, n in rows:
+        self_n[sym] += n
+    total = sum(self_n.values())
+    cat_self: dict[str, int] = defaultdict(int)
+    mod_self: dict[str, int] = defaultdict(int)
+    for k, v in self_n.items():
+        cat_self[classify(k)] += v
+        mod_self[module_of(k)] += v
+    return {
+        "samples": total,
+        "source": "flat(perf report --sort symbol)",
+        "self_top": [
+            {
+                "symbol": k,
+                "samples": v,
+                "pct": round(100.0 * v / total, 2) if total else 0.0,
+                "category": classify(k),
+                "dso": "",
+            }
+            for k, v in sorted(self_n.items(), key=lambda kv: -kv[1])[:top]
+        ],
+        "inclusive_top": [],
+        "category_self": dict(sorted(cat_self.items(), key=lambda kv: -kv[1])),
+        "category_inclusive": {},
+        "module_self": dict(sorted(mod_self.items(), key=lambda kv: -kv[1])[:20]),
+    }
+
+
+# ----------------------------------------------------------------------------
 # 聚合报告
 # ----------------------------------------------------------------------------
 # 生成代码的命名规律:
@@ -320,17 +400,32 @@ def write_chrome_json(samples, out_path: str, process_name: str = "trace-runner"
 #   tick_*                                 -> tick 其它
 # 顺序敏感:tick_commit/tick_compute 必须先于泛化的 tick 判断。
 def classify(sym: str) -> str:
-    s = sym.lower()
-    if "tick_commit" in s or "commit" in s and "tick" in s:
+    """把符号名归到执行相位。
+
+    两种命名风格都要处理:
+      (a) ELF 符号(完整限定名,如 pyc::gen::v5_core_pe_cluster0::eval_comb_pass);
+      (b) perf --inline 展开的内联帧(只有短名,如 operator== / posedge_compute_inner)。
+    顺序敏感:tick_commit/tick_compute 必须先于泛化的 tick 判断。
+    """
+    s = sym.lower().strip()
+    if "tick_commit" in s or ("commit" in s and "tick" in s):
         return "tick-commit"
-    if "tick_compute" in s:
+    if "tick_compute" in s or "posedge_compute" in s:
         return "tick-compute"
-    if "eval_comb" in s or "comb_pass" in s or "comb_part" in s:
+    if "eval_comb" in s or "comb_pass" in s or "comb_part" in s or s.startswith("comb"):
         return "comb"
     if "eval" in s:
         return "eval-other"
     if "tick" in s:
         return "tick-other"
+    # 内联展开可见的运行时算子(Bits/位集)
+    runtime_names = {
+        "operator==", "operator!=", "operator<", "operator>", "tobool", "setword",
+        "getword", "masktop", "maskbottom", "maskextend", "copybits", "slice",
+        "extract", "concat", "zeroextend", "signextend", "sext", "zext",
+    }
+    if s in runtime_names or s.startswith("mux<") or s.startswith("bits"):
+        return "runtime-bits"
     if "bits" in s or "words" in s or "dirtybitset" in s or "operator" in s or "bitset" in s:
         return "runtime-bits"
     if "memcpy" in s or "memmove" in s or "memset" in s or "malloc" in s or "free" in s:
@@ -338,6 +433,14 @@ def classify(sym: str) -> str:
     if "ld-linux" in s or "dso" in s or "libc" in s:
         return "startup"
     return "other"
+
+
+def module_of(sym: str) -> str:
+    """从符号里取生成模块名(pyc::gen::<module>::...)。"""
+    parts = sym.split("::")
+    if len(parts) >= 3 and parts[0] == "pyc" and parts[1] == "gen":
+        return parts[2]
+    return parts[0] if parts else "?"
 
 
 MODEL_HINT = ("pyc::gen::", "v5_", "pyc::runtime", "pycircuit")
@@ -378,8 +481,10 @@ def build_report(samples, top: int = 40) -> dict:
 
     cat_self: dict[str, int] = defaultdict(int)
     cat_incl: dict[str, int] = defaultdict(int)
+    mod_self: dict[str, int] = defaultdict(int)
     for k, v in self_n.items():
         cat_self[classify(k)] += v
+        mod_self[module_of(k)] += v
     for k, v in incl_n.items():
         cat_incl[classify(k)] += v
 
@@ -388,6 +493,7 @@ def build_report(samples, top: int = 40) -> dict:
         "self_top": table(self_n),
         "inclusive_top": table(incl_n),
         "category_self": dict(sorted(cat_self.items(), key=lambda kv: -kv[1])),
+        "module_self": dict(sorted(mod_self.items(), key=lambda kv: -kv[1])[:20]),
         "category_inclusive": dict(sorted(cat_incl.items(), key=lambda kv: -kv[1])),
     }
 
@@ -410,28 +516,43 @@ def write_flame_svg(samples, out_path: str, title: str = "flamegraph", width: in
     max_depth = max(len(k) for k in frames)
     row_h = 16
     height = (max_depth + 1) * row_h + 30
-    rects = []
-    for path, count in sorted(frames.items(), key=lambda kv: (len(kv[0]), kv[0])):
-        w = max(1.0, width * count / total)
+
+    # 兄弟分组,按 count 降序排布(O(n log n),避免逐个求前缀宽度的 O(n^2))
+    children: dict[tuple, list[tuple]] = defaultdict(list)
+    for path in frames:
+        children[path[:-1]].append(path)   # 根节点的父是空元组 ()
+    for parent in children:
+        children[parent].sort(key=lambda p: (-frames[p], p))
+
+    rects: list[str] = []
+
+    def layout(path: tuple, x0: float, span: float) -> None:
+        count = frames[path]
+        self_w = max(1.0, width * count / total)
         y = height - 20 - len(path) * row_h
-        x = 0.0
-        # 位置:按前序宽度累加(近似;同一父下顺序稳定)
-        prefix = 0.0
-        for depth in range(1, len(path)):
-            partial = tuple(path[:depth])
-            prefix += sum(
-                max(1.0, width * c / total)
-                for p, c in frames.items()
-                if len(p) == depth and p[: depth - 1] == partial[: depth - 1] and p < partial
-            )
-        x = prefix
-        color = f"hsl({(hash(path[-1]) % 60) + 10},70%,{(45 + len(path) * 4) % 30 + 50}%)"
-        label = html.escape(path[-1])[:60]
+        color = f"hsl({(abs(hash(path[-1])) % 60) + 10},70%,{(45 + len(path) * 4) % 30 + 50}%)"
+        label = html.escape(path[-1])[:70]
         rects.append(
-            f"<g><rect x='{x:.1f}' y='{y}' width='{w:.1f}' height='{row_h - 1}' fill='{color}'>"
+            f"<g><rect x='{x0:.1f}' y='{y}' width='{self_w:.1f}' height='{row_h - 1}' fill='{color}'>"
             f"<title>{label}: {count} samples ({100.0*count/total:.2f}%)</title></rect>"
-            f"<text x='{x + 3:.1f}' y='{y + 11}' font-size='10' fill='#111'>{label}</text></g>"
+            f"<text x='{x0 + 3:.1f}' y='{y + 11}' font-size='10' fill='#111'>{label}</text></g>"
         )
+        kids = children.get(path)
+        if not kids:
+            return
+        kid_total = sum(frames[k] for k in kids)
+        x = x0
+        for kid in kids:
+            kw = span * frames[kid] / kid_total
+            layout(kid, x, kw)
+            x += kw
+
+    root_total = sum(frames[c] for c in children.get((), []))
+    x = 0.0
+    for kid in children.get((), []):
+        kw = width * frames[kid] / root_total
+        layout(kid, x, kw)
+        x += kw
     svg = (
         f"<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}'>"
         f"<rect width='100%' height='100%' fill='#f7f7f7'/>"
@@ -461,6 +582,11 @@ def main() -> int:
     p.add_argument("out")
     p.add_argument("--top", type=int, default=40)
 
+    p = sub.add_parser("flat")
+    p.add_argument("perf_report_txt")
+    p.add_argument("out")
+    p.add_argument("--top", type=int, default=60)
+
     p = sub.add_parser("flame")
     p.add_argument("perf_script")
     p.add_argument("out")
@@ -473,6 +599,11 @@ def main() -> int:
         info = write_chrome_json(parse_perf_script(args.perf_script), args.out)
     elif args.cmd == "report":
         rep = build_report(list(parse_perf_script(args.perf_script)), args.top)
+        with open(args.out, "w") as fh:
+            json.dump(rep, fh, indent=2)
+        info = {"samples": rep["samples"], "categories": rep["category_self"]}
+    elif args.cmd == "flat":
+        rep = build_flat_report(parse_flat_report(args.perf_report_txt), args.top)
         with open(args.out, "w") as fh:
             json.dump(rep, fh, indent=2)
         info = {"samples": rep["samples"], "categories": rep["category_self"]}

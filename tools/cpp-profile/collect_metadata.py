@@ -174,13 +174,19 @@ def main() -> int:
             if not os.path.isdir(run):
                 continue
             rec = {"variant": base, "trace": name}
-            for f in ("replay-timed.json", "replay.json", "conversion.json",
-                      "perf.stat.txt", "perf-record.log"):
+            for f in ("replay-timed.json", "replay.json", "replay-flat.json",
+                      "conversion.json", "perf.stat.txt", "perf.stat2.txt",
+                      "perf-record.log", "perf-flat-record.log"):
                 p = os.path.join(run, f)
                 if os.path.isfile(p):
                     rec[f] = (json.load(open(p)) if f.endswith(".json")
                               else open(p, errors="replace").read()[-2000:])
             rep = os.path.join(run, "report.json")
+            if not os.path.isfile(rep):
+                rep = os.path.join(run, "report-flat.json")
+                rec["profile_kind"] = "flat"
+            else:
+                rec["profile_kind"] = "callstack"
             if os.path.isfile(rep):
                 r = json.load(open(rep))
                 rec["samples"] = r.get("samples")

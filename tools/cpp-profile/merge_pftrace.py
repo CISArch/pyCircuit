@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prof_tools import (  # noqa: E402
     CLOCK_MONOTONIC,
+    clock_snapshot_packet,
     SEQ_INCREMENTAL_STATE_CLEARED,
     SEQ_NEEDS_INCREMENTAL_STATE,
     TYPE_SLICE_BEGIN,
@@ -41,6 +43,8 @@ def main() -> int:
     groups = []  # (label, [samples], base_ts_ns)
     for d in dirs:
         script = os.path.join(d, "perf.script.raw")
+        if not os.path.isfile(script) and os.path.isfile(script + ".gz"):
+            script += ".gz"
         if not os.path.isfile(script):
             continue
         label = os.path.basename(d.rstrip("/"))
@@ -64,6 +68,15 @@ def main() -> int:
     pairs = [(iid, nm) for nm, iid in names.items()]
 
     out = bytearray()
+    out += trace_packet(
+        None,
+        clock_snapshot_packet(
+            int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1e9),
+            int(time.clock_gettime(time.CLOCK_BOOTTIME) * 1e9),
+            time.time_ns(),
+        ),
+        SEQ_INCREMENTAL_STATE_CLEARED,
+    )
     # 描述符:每个 trace 一个进程 + 每个 (trace, tid) 一个线程
     first = b""
     for idx, (label, samples) in enumerate(groups, start=1):
@@ -79,7 +92,7 @@ def main() -> int:
                 60, descriptor_packet_thread(uuid, idx * 10_000, tid, f"{label} tid={tid}")
             )
     first += pb_bytes(12, interned_event_names(pairs))
-    out += trace_packet(None, first, SEQ_INCREMENTAL_STATE_CLEARED)
+    out += trace_packet(None, first, SEQ_NEEDS_INCREMENTAL_STATE)
 
     seq_flags = SEQ_NEEDS_INCREMENTAL_STATE
     cursor = 0
