@@ -169,15 +169,24 @@ def main() -> int:
     A("")
 
     # ---- 热点函数 ----
-    A("## 热点函数 Top(跨全部 trace 汇总)")
+    A("## 热点函数 Top(34 条 trace 等权平均)")
     A("")
-    A("| self% | 样本 | 生成代码位置 | 函数体行数 | 符号 |")
+    A("> 每条 trace 先算自身 self 占比,再对 34 条取算术平均 —— 避免采样数多的 trace 主导排名。")
+    A("")
+    A("| self%(等权) | 出现 trace 数 | 生成代码位置 | 函数体行数 | 符号 |")
     A("|---:|---:|---|---:|---|")
-    for r in agg["top_self"][:22]:
+    for r in (agg.get("top_self_trace_mean") or [])[:22]:
         hb = hot_by_sym.get(r["symbol"], {})
         loc = hb.get("defined_in") or "-"
         body = hb.get("body_lines") or "-"
-        A(f"| {r['pct']}% | {r['samples']} | `{loc}` | {body} | `{r['symbol']}` |")
+        A(f"| {r['pct']}% | {r.get('traces', '-')} | `{loc}` | {body} | `{r['symbol']}` |")
+    A("")
+    A("样本加权口径(供对照,受各 trace 采样数影响):")
+    A("")
+    A("| self%(样本加权) | 符号 |")
+    A("|---:|---|")
+    for r in agg["top_self"][:10]:
+        A(f"| {r['pct']}% | `{r['symbol']}` |")
     A("")
 
     # ---- 巨型函数 ----

@@ -22,7 +22,16 @@ from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from prof_tools import build_report, parse_perf_script, write_flame_svg, is_model_sample  # noqa: E402
+from prof_tools import (  # noqa: E402
+    build_report,
+    classify,
+    is_model_sample,
+    module_of,
+    parse_flat_report,
+    parse_perf_script,
+    stack_of,
+    write_flame_svg,
+)
 
 
 def read_json(path, default=None):
@@ -86,6 +95,7 @@ def main() -> int:
     agg_cat_by_trace = defaultdict(lambda: defaultdict(int))
     total_samples = 0
     per_trace_self = defaultdict(lambda: defaultdict(int))
+    per_trace_pct = defaultdict(list)   # symbol -> 各 trace 内的占比(等权平均用)
 
     for name in sorted(os.listdir(runs_dir)):
         run = os.path.join(runs_dir, name)
@@ -100,32 +110,54 @@ def main() -> int:
         conv = read_json(os.path.join(run, "conversion.json"), {}) or {}
         stat = parse_perf_stat(os.path.join(run, "perf.stat.txt"))
         kind = "callstack"
+        full_self = defaultdict(int)      # 全量符号 self 计数(不用 top-N 截断)
+        nsamples = 0
         if not os.path.isfile(script):
             flat = os.path.join(run, "report-flat.json")
+            frows = os.path.join(run, "perf.flat.txt")
             if not os.path.isfile(flat):
                 continue
             rep = read_json(flat, {}) or {}
             kind = "flat"
             samples = []
+            if os.path.isfile(frows):
+                for sym, n in parse_flat_report(frows):
+                    full_self[sym] += n
+            else:
+                for row in rep.get("self_top", []):
+                    full_self[row["symbol"]] += row["samples"]
+            nsamples = sum(full_self.values()) or rep.get("samples", 0)
         else:
             samples = [s for s in parse_perf_script(script) if is_model_sample(s)]
             if not samples:
                 continue
             rep = build_report(samples, top=25)
+            for smp in samples:
+                st = stack_of(smp)
+                if st:
+                    full_self[st[0]] += 1
+            nsamples = len(samples)
         if samples:
             all_samples.append((name, samples))
-        total_samples += rep["samples"]
-        for row in rep["self_top"]:
-            agg_self[row["symbol"]] += row["samples"]
+        total_samples += nsamples or rep["samples"]
+        for sym, n in full_self.items():
+            agg_self[sym] += n
         for row in rep["inclusive_top"]:
             agg_incl[row["symbol"]] += row["samples"]
-        for k, v in rep["category_self"].items():
-            agg_cat_self[k] += v
-            agg_cat_by_trace[k][name] += v
+        trace_cat = defaultdict(int)
+        trace_mod = defaultdict(int)
+        for sym, n in full_self.items():
+            c = classify(sym)
+            trace_cat[c] += n
+            trace_mod[module_of(sym)] += n
+            agg_cat_self[c] += n
+            agg_cat_by_trace[c][name] += n
         for k, v in rep["category_inclusive"].items():
             agg_cat_incl[k] += v
-        for row in rep["self_top"]:
-            per_trace_self[name][row["symbol"]] += row["samples"]
+        for sym, n in full_self.items():
+            per_trace_self[name][sym] += n
+            if nsamples:
+                per_trace_pct[sym].append(100.0 * n / nsamples)
 
         cycles = timed.get("cycles")
         elapsed_ms = timed.get("elapsed_ms")
@@ -139,10 +171,27 @@ def main() -> int:
                 "samples": rep["samples"],
                 "profile_kind": kind,
                 "category_self_pct": {
-                    k: round(100.0 * v / rep["samples"], 2)
-                    for k, v in rep["category_self"].items()
-                },
-                "top_self": rep["self_top"][:10],
+                    k: round(100.0 * v / nsamples, 2)
+                    for k, v in sorted(trace_cat.items(), key=lambda kv: -kv[1])
+                }
+                if nsamples
+                else {},
+                "module_self_pct": {
+                    k: round(100.0 * v / nsamples, 2)
+                    for k, v in sorted(trace_mod.items(), key=lambda kv: -kv[1])[:12]
+                }
+                if nsamples
+                else {},
+                "top_self": [
+                    {
+                        "symbol": k,
+                        "samples": v,
+                        "pct": round(100.0 * v / nsamples, 2) if nsamples else 0.0,
+                        "category": classify(k),
+                        "dso": "",
+                    }
+                    for k, v in sorted(full_self.items(), key=lambda kv: -kv[1])[:10]
+                ],
                 "perf_stat": stat,
                 "ipc": stat.get("ipc"),
                 "cache_miss_pct": stat.get("cache_miss_pct"),
@@ -189,6 +238,17 @@ def main() -> int:
             ]
             if total_samples
             else [],
+            # 等权(逐 trace 平均)排名:不受各 trace 采样数差异影响,是“热点”主口径
+            "top_self_trace_mean": [
+                {
+                    "symbol": k,
+                    "pct": round(statistics.mean(v), 2),
+                    "traces": len(v),
+                }
+                for k, v in sorted(
+                    per_trace_pct.items(), key=lambda kv: -statistics.mean(kv[1])
+                )[:40]
+            ],
             "top_inclusive": [
                 {"symbol": k, "samples": v, "pct": round(100.0 * v / total_samples, 2)}
                 for k, v in sorted(agg_incl.items(), key=lambda kv: -kv[1])[:40]
