@@ -200,10 +200,15 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
 
+// Measured recommendation: 0 (textual fusion). Graph mode is a net loss on
+// high-activity designs — on DavinciTop (v5_superscalar_v5_core) it is 3-4x
+// slower than textual fusion at every threshold that compiles, because
+// coarsening collapses dirty-skip granularity while graph boundaries add
+// snapshot compares (see docs/comb-partition-essent.md).
 static llvm::cl::opt<unsigned> combPartitionSize(
     "comb-partition-size",
     llvm::cl::desc("ESSENT comb partition threshold; >0 switches fuse-comb to "
-                   "graph partitioning mode (0 = textual runs)"),
+                   "graph partitioning mode (0 = textual runs, recommended)"),
     llvm::cl::init(0));
 
 static llvm::cl::opt<unsigned> combRunCap(
