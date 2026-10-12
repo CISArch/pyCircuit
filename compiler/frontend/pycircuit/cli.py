@@ -2195,8 +2195,9 @@ def _derive_trace_codegen_plan(
     """Project selected internal named values onto their defining modules.
 
     The trace DSL remains the sole selection authority.  This smaller plan is
-    consumed only by C++ placement so selected comb locals have stable storage
-    for VCD sampling; ports already have stable member storage.
+    consumed by pyc-apply-observation-demand so trace-selected names stay
+    eager (stable storage) for VCD sampling; ports already have stable
+    member storage.
     """
 
     selected = (
