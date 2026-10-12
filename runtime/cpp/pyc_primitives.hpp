@@ -101,8 +101,10 @@ public:
   }
 
   // Applies a pending edge and reports whether the visible register output changed.
+  // The visible copy is skipped when the sampled value equals the current one.
   inline bool tick_commit() {
     if (__builtin_expect(pending, 0)) {
+      const bool changed = q != qNext;
       pending = false;
       if (!changed)
         return false;
@@ -113,22 +115,14 @@ public:
   }
 
 private:
-  // Samples the enabled edge. The compare runs here because both d/init and
-  // q are stable at compute time (commit follows without an interleaved
-  // eval); the wide sample is captured only when the visible value moves.
   inline void posedge_compute_inner() {
     bool r = rst.toBool();
     bool e = en.toBool();
     pending = r | e;
-    if (r) {
-      changed = q != init;
-      if (changed)
-        qNext = init;
-    } else if (e) {
-      changed = q != d;
-      if (changed)
-        qNext = d;
-    }
+    if (r)
+      qNext = init;
+    else
+      qNext = d;
   }
 
 public:
@@ -142,7 +136,6 @@ public:
 
   bool clkPrev = false;
   bool pending = false;
-  bool changed = false;
   Wire<Width> qNext{};
 };
 
@@ -281,8 +274,10 @@ public:
   }
 
   // Applies a pending edge and reports whether the visible vector output changed.
+  // The visible copy is skipped when the sampled value equals the current one.
   inline bool tick_commit() {
     if (__builtin_expect(pending, 0)) {
+      const bool changed = q != qNext;
       pending = false;
       if (!changed)
         return false;
@@ -297,15 +292,10 @@ private:
     bool r = rst.toBool();
     bool e = en.toBool();
     pending = r | e;
-    if (r) {
-      changed = q != init;
-      if (changed)
-        qNext = init;
-    } else if (e) {
-      changed = q != d;
-      if (changed)
-        qNext = d;
-    }
+    if (r)
+      qNext = init;
+    else
+      qNext = d;
   }
 
 public:
@@ -317,7 +307,6 @@ public:
   T &q;
   bool clkPrev = false;
   bool pending = false;
-  bool changed = false;
   T qNext{};
 };
 
