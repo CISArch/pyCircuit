@@ -1633,10 +1633,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  pyc::cpp::DirtyBitset<" << schedule->partitionCount
        << "> _pyc_comb_dirty{};\n";
     os << "  inline bool _pyc_comb_take_active(unsigned id) {\n";
-    os << "    return _pyc_comb_dirty.take(id);\n";
+    os << "    return _pyc_comb_dirty.takeUnchecked(id);\n";
     os << "  }\n";
     os << "  inline bool _pyc_comb_is_active(unsigned id) const {\n";
-    os << "    return _pyc_comb_dirty.test(id);\n";
+    os << "    return _pyc_comb_dirty.testUnchecked(id);\n";
     os << "  }\n";
     os << "  inline void _pyc_mark_comb_dirty(unsigned id) {\n";
     os << "    _pyc_comb_dirty.markUnchecked(id);\n";
