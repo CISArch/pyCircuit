@@ -79,6 +79,10 @@ struct CppEmitterOptions {
   // downstream C++ TU cost even after file sharding.
   unsigned combChunkNodes = kDefaultCombChunkNodes;
   std::string probePlanPath{};
+  // Emit the fast-edge negedge branch as module-wide bookkeeping instead of a
+  // per-register negedge_update() sweep. Only valid when every register uses
+  // the same clock and commit() always consumes pending (tick-fuse mode).
+  bool fuseNegedgeReset = false;
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,

@@ -122,6 +122,12 @@ static llvm::cl::opt<std::string> cppSplitMode(
     llvm::cl::desc("C++ out-dir split mode: module|none"),
     llvm::cl::init("module"));
 
+static llvm::cl::opt<bool> cppFuseNegedge(
+    "cpp-fuse-negedge",
+    llvm::cl::desc("Tick-fuse mode: replace the per-register negedge_update() "
+                   "sweep with module-wide bookkeeping (same-clock designs)"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> cppPch(
     "cpp-pch",
     llvm::cl::desc("Record device module hpp for CMake precompiled headers (requires --cpp-split=module)"),
@@ -2952,6 +2958,7 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
+      cppEmitOpts.fuseNegedgeReset = cppFuseNegedge;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;

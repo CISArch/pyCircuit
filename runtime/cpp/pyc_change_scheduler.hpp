@@ -32,6 +32,18 @@ public:
     return inserted;
   }
 
+  // Bulk-mark a precomputed 64-bit word mask. Generated simulators group
+  // compile-time-constant partition ids by word so one OR replaces N
+  // read-modify-write cycles. Returns true if any bit transitioned clean→dirty.
+  bool markMaskUnchecked(std::size_t word, std::uint64_t mask) noexcept {
+    assert(word < kWords && "dirty word exceeds fixed capacity");
+    if (word >= kWords || mask == 0)
+      return false;
+    const bool inserted = (words_[word] & mask) != mask;
+    words_[word] |= mask;
+    return inserted;
+  }
+
   bool test(std::size_t rank) const noexcept {
     assert(rank < kCapacity && "dirty rank exceeds fixed capacity");
     if (rank >= kCapacity)
