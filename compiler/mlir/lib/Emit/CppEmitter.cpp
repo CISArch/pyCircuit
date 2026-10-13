@@ -2463,6 +2463,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   if (fastEdge) {
     os << "  bool _pyc_clk_prev = false;\n";
     os << "  bool _pyc_seq_armed = false;\n";
+    // Fall-commit gate: when tick_commit runs after only a falling edge (no
+    // preceding rise/unchanged tick_compute on this module), every local
+    // reg/delay-line has pending==0, so the walk is a no-op. tick_compute
+    // arms the flag; tick_commit consumes it.
+    if (opts.fallCommitGate)
+      os << "  bool _pyc_commit_needed = false;\n";
   }
   for (auto delay : delayLines) {
     unsigned w = bitWidth(delay.getQ().getType());
@@ -4217,6 +4223,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (failed(emitTapUpdates("        ")))
       return failure();
     os << "        _pyc_seq_armed = true;\n";
+    if (opts.fallCommitGate)
+      os << "        _pyc_commit_needed = true;\n";
     os << "      } else if (_pyc_fall) {\n";
     os << "        if (_pyc_seq_armed) {\n";
     for (int64_t loopId : phasedRegLoopIds) {
@@ -4238,6 +4246,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     emitEdgeCall("tick_compute", "        ");
     if (failed(emitTapUpdates("        ")))
       return failure();
+    if (opts.fallCommitGate)
+      os << "        _pyc_commit_needed = true;\n";
     os << "      }\n";
     os << "    }\n";
   } else {
@@ -4351,6 +4361,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                            (indent + "  ").str());
     os << indent << "}\n";
   };
+  // fall-commit-gate: on a falling edge the local reg/delay walk is
+  // provably empty (the rising tick_commit consumed every pending bit and
+  // _pyc_seq_armed), so wrap only this module's local walk in a flag check.
+  const bool gateLocalCommit = fastEdge && opts.fallCommitGate;
+  if (gateLocalCommit) {
+    os << "    if (_pyc_commit_needed) {\n";
+    os << "      _pyc_commit_needed = false;\n";
+  }
   // A clean 64-lane dirty word skips all of its per-lane wake checks.
   auto openLaneWord = [&](unsigned lane, const std::string &cond) {
     if (lane & 63)
@@ -4445,6 +4463,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       emitCommitWake(advanced, tap.getTap());
     }
   }
+  if (gateLocalCommit)
+    os << "    }\n";
   for (auto fifo : fifos) {
     std::string key = nt.get(fifo.getInReady()) + "_inst";
     std::string changed = "_pyc_commit_changed_" + key;
