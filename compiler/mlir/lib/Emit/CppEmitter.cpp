@@ -1573,6 +1573,74 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
        << "_qNext{};\n";
 
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
+  // --- Tick-fuse (compute/commit merge) classification -------------------
+  // A reg is direct-write-safe iff its d (next) value does not depend —
+  // through the value graph — on any state output of this module:
+  //   reg q, delay-line q/tap, submodule instance outputs, fifo/mem/cdc
+  // outputs. Those values only update after their own commit; reading them
+  // in another element's compute is an ordering hazard that requires the
+  // two-phase protocol. Safe sources are comb wires (fixed by the caller's
+  // eval()), pure ops over them, and top-level ports (block args).
+  llvm::DenseSet<Value> stateOutputs;
+  for (auto r : regs)
+    stateOutputs.insert(r.getQ());
+  for (auto delay : delayLines)
+    stateOutputs.insert(delay.getQ());
+  for (auto tap : delayTaps)
+    stateOutputs.insert(tap.getTap());
+  for (auto fifo : fifos) {
+    stateOutputs.insert(fifo.getInReady());
+    stateOutputs.insert(fifo.getOutValid());
+    stateOutputs.insert(fifo.getOutData());
+  }
+  for (auto mem : byteMems)
+    stateOutputs.insert(mem.getRdata());
+  for (auto mem : syncMems)
+    stateOutputs.insert(mem.getRdata());
+  for (auto mem : syncMemDPs) {
+    stateOutputs.insert(mem.getRdata0());
+    stateOutputs.insert(mem.getRdata1());
+  }
+  for (auto fifo : asyncFifos) {
+    stateOutputs.insert(fifo.getInReady());
+    stateOutputs.insert(fifo.getOutValid());
+    stateOutputs.insert(fifo.getOutData());
+  }
+  for (auto sync : cdcSyncs)
+    stateOutputs.insert(sync.getOut());
+  for (auto inst : instances)
+    for (Value out : inst.getResults())
+      stateOutputs.insert(out);
+
+  // DFS a value's defining subgraph; stop at comb-region boundaries (a
+  // CombOp's inputs were evaluated before the region ran, so anything behind
+  // it is a stable snapshot for this edge).
+  auto dependsOnState = [&](Value root) -> bool {
+    llvm::SmallSet<Operation *, 32> visited;
+    llvm::SmallVector<Value> work{root};
+    while (!work.empty()) {
+      Value v = work.pop_back_val();
+      if (stateOutputs.count(v))
+        return true;
+      Operation *def = v.getDefiningOp();
+      if (!def)
+        continue; // block arg = top port, stable external input
+      if (isa<pyc::CombOp>(def))
+        continue; // comb boundary: inputs evaluated pre-edge
+      if (!visited.insert(def).second)
+        continue;
+      for (Value operand : def->getOperands())
+        work.push_back(operand);
+    }
+    return false;
+  };
+
+  llvm::SmallVector<pyc::RegOp> fusedRegs;  // direct-write in tick_compute
+  llvm::SmallVector<pyc::RegOp> phasedRegs; // keep two-phase
+  for (auto r : regs) {
+    bool safe = !dependsOnState(r.getNext());
+    (safe ? fusedRegs : phasedRegs).push_back(r);
+  }
   auto delayKey = [&](pyc::DelayLineOp delay) { return nt.get(delay.getQ()); };
   auto delayTapKey = [&](pyc::DelayTapOp tap) { return nt.get(tap.getTap()); };
   auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
@@ -3728,6 +3796,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << "    // Local sequential primitives.\n";
   auto emitEdgeCall = [&](const char *method, llvm::StringRef indent) {
+    // Fused regs no longer run the two-phase protocol; they are direct-written
+    // right after this edge block (see tick-fuse emission below). Only phased
+    // regs and delay lines keep edge calls.
+    for (auto r : phasedRegs)
+      os << indent << nt.get(r.getQ()) << "_inst->" << method << "();\n";
+    for (auto delay : delayLines)
+      os << indent << nt.get(delay.getQ()) << "_inst->" << method << "();\n";
+  };
+  auto emitEdgeCallAll = [&](const char *method, llvm::StringRef indent) {
+    // All regs incl. fused ones (used by the non-fast-edge generic path).
     for (auto r : regs)
       os << indent << nt.get(r.getQ()) << "_inst->" << method << "();\n";
     for (auto delay : delayLines)
@@ -3780,6 +3858,25 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (failed(emitTapUpdates("        ")))
       return failure();
     os << "      }\n";
+    if (!fusedRegs.empty()) {
+      // Tick-fuse direct write: these regs' d values are comb-wire snapshots
+      // fixed by the caller's eval() before this edge, so sampling and
+      // publishing collapse into one compare+store per reg. Changed regs wake
+      // their comb fanout immediately (same as tick_commit would). Emitted
+      // inside the edge block so _pyc_rise gates it.
+      for (auto r : fusedRegs) {
+        std::string key = nt.get(r.getQ()) + "_inst";
+        std::string changed = "_pyc_fused_changed_" + nt.get(r.getQ());
+        os << "      if (_pyc_rise) {\n";
+        os << "        const bool " << changed << " = " << key
+           << "->direct_commit(" << nt.get(r.getNext()) << ");\n";
+        os << "        if (" << changed << ") {\n";
+        emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt,
+                               "          ");
+        os << "        }\n";
+        os << "      }\n";
+      }
+    }
     os << "    }\n";
   } else {
     for (auto r : regs) {
@@ -3860,7 +3957,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                            (indent + "  ").str());
     os << indent << "}\n";
   };
-  for (auto r : regs) {
+  for (auto r : phasedRegs) {
     std::string key = nt.get(r.getQ()) + "_inst";
     std::string changed = "_pyc_commit_changed_" + key;
     os << "    const bool " << changed << " = " << key

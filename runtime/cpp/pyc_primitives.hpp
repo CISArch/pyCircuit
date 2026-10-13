@@ -93,6 +93,23 @@ public:
     posedge_compute_inner();
   }
 
+  // Tick-fuse single-phase update: sample rst/en/d and publish q in one step.
+  // Only valid for registers whose d is a comb-wire snapshot fixed before the
+  // edge (no reg->reg / submodule-output dependency), and only when the caller
+  // guarantees a rising edge just occurred. Returns whether q changed.
+  inline bool direct_commit(const Wire<Width> &d) {
+    clkPrev = true;
+    bool r = rst.toBool();
+    bool e = en.toBool();
+    if (!(r | e))
+      return false;
+    const Wire<Width> &nxt = r ? init : d;
+    const bool changed = q != nxt;
+    if (changed)
+      q = nxt;
+    return changed;
+  }
+
   // Negedge bookkeeping — just reset clkPrev so next posedge is detected.
   // Avoids running the full tick_compute logic on the falling edge.
   inline void negedge_update() {
@@ -263,6 +280,21 @@ public:
   inline void posedge_tick_compute() {
     clkPrev = true;
     posedge_compute_inner();
+  }
+
+  // Tick-fuse single-phase update (vector variant). Same contract as the
+  // scalar direct_commit above: d must be a pre-edge comb snapshot.
+  inline bool direct_commit(const T &d) {
+    clkPrev = true;
+    bool r = rst.toBool();
+    bool e = en.toBool();
+    if (!(r | e))
+      return false;
+    const T &nxt = r ? init : d;
+    const bool changed = q != nxt;
+    if (changed)
+      q = nxt;
+    return changed;
   }
 
   inline void negedge_update() {
