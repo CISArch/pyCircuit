@@ -450,6 +450,12 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     while (progressed && partCount > 1) {
       progressed = false;
       auto inputs = buildInputPartitions();
+      // Deterministic order: DenseMap iteration order is pointer-hash
+      // derived and varies between runs, and the union sequence changes
+      // the final partitioning (observed as a probabilistic dominance
+      // verifier failure in region emission). Collect the candidate
+      // merges and apply them in ascending partition id instead.
+      llvm::SmallVector<std::pair<int, int>> merges;
       for (auto &[p, ins] : inputs) {
         if (ins.size() != 1 || findRoot(p) != p)
           continue;
@@ -459,7 +465,21 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
         if (!mergeLegal(static_cast<unsigned>(p),
                         static_cast<unsigned>(q)))
           continue;
-        unionPartitions(p, q);
+        merges.emplace_back(p, q);
+      }
+      llvm::sort(merges, [](const auto &a, const auto &b) {
+        return a.first < b.first;
+      });
+      for (auto &[p, q] : merges) {
+        if (findRoot(static_cast<unsigned>(p)) != p)
+          continue;
+        int rq = findRoot(static_cast<unsigned>(q));
+        if (rq == p || findRoot(static_cast<unsigned>(rq)) != rq)
+          continue;
+        if (!mergeLegal(static_cast<unsigned>(p),
+                        static_cast<unsigned>(rq)))
+          continue;
+        unionPartitions(p, rq);
         progressed = true;
         if (partCount <= 1)
           break;
@@ -485,7 +505,16 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
           int best = -1;
           uint64_t bestCut = 0;
           double bestCommon = -1.0;
-          for (auto &[q, cut] : it->second) {
+          // Deterministic order: sort the adjacency entries by neighbor id
+          // (DenseMap iteration order is pointer-hash derived and varies
+          // between runs; the argmax below must not depend on it).
+          llvm::SmallVector<std::pair<int, unsigned>> neighbors;
+          for (auto &[q, cut] : it->second)
+            neighbors.emplace_back(q, cut);
+          llvm::sort(neighbors, [](const auto &a, const auto &b) {
+            return a.first < b.first;
+          });
+          for (auto &[q, cut] : neighbors) {
             int rq = findRoot(q);
             if (rq == p)
               continue;
@@ -526,10 +555,18 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     llvm::DenseMap<int, llvm::SmallVector<Operation *>> groups;
     for (unsigned v = 0; v < n; ++v)
       groups[findRoot(v)].push_back(ops[v]);
-    for (auto &entry : groups) {
+    // Deterministic order: emit regions in ascending partition id
+    // (DenseMap iteration order is pointer-hash derived; the region
+    // creation order must not depend on it).
+    llvm::SmallVector<int> groupIds;
+    for (auto &entry : groups)
+      groupIds.push_back(entry.first);
+    llvm::sort(groupIds);
+    for (int gid : groupIds) {
+      auto &members0 = groups[gid];
       llvm::SmallVector<Operation *> members;
-      for (Operation *op : entry.second)
-        if (entry.second.size() >= 2)
+      for (Operation *op : members0)
+        if (members0.size() >= 2)
           if (!isa<pyc::WireOp>(op))
             members.push_back(op);
       if (members.size() >= 2)
@@ -539,7 +576,20 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     // assign (the consumer cone now reads the region-internal value): the
     // wire+assign pair degenerates to a named alias of the comb result,
     // which keeps the probe name addressable without the storage cell.
-    for (auto &[wireRes, assign] : llvm::make_early_inc_range(wireDriverOf)) {
+    // Deterministic order: sort the wire results by their position in the
+    // block (DenseMap iteration order is pointer-hash derived); each entry
+    // erases ops, so position order keeps the sweep stable.
+    llvm::SmallVector<std::pair<Value, Operation *>> wireEntries;
+    for (auto &entry : wireDriverOf)
+      wireEntries.emplace_back(entry.first, entry.second);
+    llvm::sort(wireEntries, [](const auto &a, const auto &b) {
+      Operation *wa = a.first.getDefiningOp();
+      Operation *wb = b.first.getDefiningOp();
+      if (wa && wb && wa->getBlock() == wb->getBlock())
+        return wa->isBeforeInBlock(wb);
+      return wa < wb;
+    });
+    for (auto &[wireRes, assign] : wireEntries) {
       bool onlyWriterReads = true;
       for (OpOperand &use : wireRes.getUses())
         if (use.getOwner() != assign) {
