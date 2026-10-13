@@ -211,6 +211,20 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
 
+// Gate the generated tick_commit's local reg/delay-line walk behind a
+// module-level _pyc_commit_needed flag: single-clock (fastEdge) modules set it
+// on rising/unchanged tick_compute and skip the walk on a falling edge, where
+// every local reg/delay-line already has pending==0 (their pending is set only
+// by posedge_tick_compute / tick_compute and cleared by tick_commit). Clocked
+// fifo/mem/cdc primitives and sub-module recursion keep the unconditional
+// walk: they own their edge state. A/B switch; measured before flipping any
+// default.
+static llvm::cl::opt<bool> cppFallCommitGate(
+    "cpp-fall-commit-gate",
+    llvm::cl::desc("Skip tick_commit's local reg/delay-line walk on falling edges "
+                   "(single-clock modules; A/B switch)"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
@@ -2750,6 +2764,7 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
+      cppEmitOpts.fallCommitGate = cppFallCommitGate;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -3110,6 +3125,7 @@ int main(int argc, char **argv) {
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
+    cppEmitOpts.fallCommitGate = cppFallCommitGate;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))
