@@ -221,7 +221,7 @@ pyCircuit/
 ──  层次符号集校验 → 打印 stats → 发射  ──
 ```
 
-fuse 条件：`--sim-mode=cpp-only` 且 `--cpp-only-preserve-ops` 时关闭（保留 op 粒度供细粒度调度）。
+fuse 条件：默认（`--comb-partition-size=0` 且未开 `--comb-textual-fuse`）不融合，组合算子保持 op 粒度逐算子发射；文本序融合需显式 `--comb-textual-fuse`，graph 分区需 `--comb-partition-size>0`；`--sim-mode=cpp-only` 且 `--cpp-only-preserve-ops` 时一律关闭。
 
 ### 5.2 主要 CLI 标志
 
@@ -236,6 +236,7 @@ fuse 条件：`--sim-mode=cpp-only` 且 `--cpp-only-preserve-ops` 时关闭（�
 | `--include-primitives` | `true` | 单文件是否内嵌原语 `include` |
 | `--unroll-vector` | off | IR 级向量标量化 |
 | `--sim-mode` / `--cpp-only-preserve-ops` | `default` / off | C++-only 模式与 op 粒度保留 |
+| `--comb-partition-size` / `--comb-textual-fuse` | `0` / off | `0`=不融合（逐算子发射，默认）；`--comb-textual-fuse`=文本序融合（旧 cp=0 行为）；`>0`=ESSENT graph 分区 |
 | `--inline-policy` | `default` | `off` \| `threshold:N` |
 | `--hierarchy-policy` | `strict` | `strict`（符号集不得变）\| `instantiate`（警告） |
 | `--build-profile` | `release` | `dev-fast` 降低 canonicalize 预算、减小 C++ 分片阈值 |

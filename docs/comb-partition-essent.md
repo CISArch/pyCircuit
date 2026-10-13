@@ -69,23 +69,28 @@ exactly — the default pipeline is unchanged bit-for-bit.
 
 ```bash
 pycc design.py --emit=cpp --comb-partition-size=64   # coarseness target
-pycc design.py --emit=cpp                            # partitioning off
+pycc design.py --emit=cpp                            # no comb fusion (default)
+pycc design.py --emit=cpp --comb-textual-fuse        # legacy textual runs
 ```
 
-`--comb-partition-size=0` (default, and the recommended value) disables the
-pass. As in ESSENT, a single coarseness parameter controls the tradeoff between
-skip granularity and per-partition check overhead; results are independent of
-the value chosen (only performance changes).
+`--comb-partition-size=0` (default) means **no comb fusion at all**: fusible
+comb ops stay individual top-level ops and both emitters evaluate them per-op.
+The legacy textual-run fusion (previously the implicit cp=0 behavior) is now
+opt-in via `--comb-textual-fuse`. As in ESSENT, a single coarseness parameter
+controls the tradeoff between skip granularity and per-partition check
+overhead; results are independent of the value chosen (only performance
+changes).
 
 ### Measured: keep the default `0`
 
 The coarseness sweep on the DavinciTop design (`v5_superscalar_v5_core`,
 `examples_intermediate_gemm` trace, same MLIR, same replay flow, interleaved
-CPU-time A/B) shows graph mode is a net loss on this workload:
+CPU-time A/B) shows graph mode is a net loss on this workload (measured when
+`0` still meant textual fusion; per-op emission is the successor default):
 
 | `--comb-partition-size` | emit | cluster0 partitions | wall time | vs `0` |
 |---|---|---|---|---|
-| `0` (textual fusion, default) | ok | 926 | 0.26 s | 1.00x |
+| `0` (textual fusion, then-default) | ok | 926 | 0.26 s | 1.00x |
 | `1` | fails (residual dominance) | — | — | — |
 | `4` | ok | 4828 | 1.15 s | 0.23x |
 | `8` | fails (residual dominance) | — | — | — |

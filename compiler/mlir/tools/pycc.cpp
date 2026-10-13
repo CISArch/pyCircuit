@@ -200,16 +200,30 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
 
-// Measured recommendation: 0 (textual fusion). Graph mode is a net loss on
-// high-activity designs — on DavinciTop (v5_superscalar_v5_core) it is 3-4x
-// slower than textual fusion at every threshold that compiles, because
-// coarsening collapses dirty-skip granularity while graph boundaries add
-// snapshot compares (see docs/comb-partition-essent.md).
+// --comb-partition-size selects the comb fusion strategy:
+//   0 (default): no comb fusion at all — fusible comb ops stay individual
+//     top-level ops and both emitters fall back to per-op evaluation.
+//   --comb-textual-fuse: legacy textual runs (consecutive ops merge into one
+//     pyc.comb per run); this used to be the cp=0 behavior.
+//   >0: ESSENT graph partitioning. Measured on DavinciTop (v5_superscalar_v5_
+//   core) graph mode is 3-4x slower than textual fusion at every threshold
+//   that compiles, because coarsening collapses dirty-skip granularity while
+//   graph boundaries add snapshot compares (see docs/comb-partition-essent.md).
 static llvm::cl::opt<unsigned> combPartitionSize(
     "comb-partition-size",
     llvm::cl::desc("ESSENT comb partition threshold; >0 switches fuse-comb to "
-                   "graph partitioning mode (0 = textual runs, recommended)"),
+                   "graph partitioning mode (0 = no comb fusion, per-op "
+                   "emission)"),
     llvm::cl::init(0));
+
+// Opt-in to the legacy textual fusion (the old cp=0 behavior): consecutive
+// fusible comb ops merge into one pyc.comb region per run. Ignored when
+// --comb-partition-size>0.
+static llvm::cl::opt<bool> combTextualFuse(
+    "comb-textual-fuse",
+    llvm::cl::desc("Textual fuse mode: merge consecutive fusible comb ops "
+                   "into per-run pyc.comb regions (legacy cp=0 behavior)"),
+    llvm::cl::init(false));
 
 static llvm::cl::opt<bool> combConesOnly(
     "comb-cones-only",
@@ -221,8 +235,8 @@ static llvm::cl::opt<bool> combConesOnly(
 static llvm::cl::opt<unsigned> combRunCap(
     "comb-run-cap",
     llvm::cl::desc("Max ops per fused comb region in textual fuse mode "
-                   "(0 = unlimited); smaller regions keep dirty-partition "
-                   "skipping fine-grained"),
+                   "(0 = unlimited; smaller regions keep dirty-partition "
+                   "skipping fine-grained). Textual mode only"),
     llvm::cl::init(0));
 
 static llvm::cl::opt<bool> unrollVector(
@@ -2722,10 +2736,16 @@ int main(int argc, char **argv) {
       pm.addNestedPass<func::FuncOp>(
           pyc::createFuseCombPass(combPartitionSize, /*runCap=*/0,
                                   combConesOnly));
-    else if (combRunCap > 0)
-      pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass(0, combRunCap));
-    else
-      pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+    else if (combTextualFuse) {
+      // Legacy textual runs: the old cp=0 behavior, now explicit opt-in.
+      if (combRunCap > 0)
+        pm.addNestedPass<func::FuncOp>(
+            pyc::createFuseCombPass(0, combRunCap));
+      else
+        pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+    }
+    // else (default cp=0): no comb fusion at all — fusible comb ops stay
+    // individual top-level ops and the emitters evaluate them per-op.
   }
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());
