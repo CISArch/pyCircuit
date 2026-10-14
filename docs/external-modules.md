@@ -35,10 +35,6 @@ files = ["ext/dct8.v"]   # 相对示例根目录
 type = "source"          # source（推荐）：源文件直接进仿真器链接
 files = ["ext/dct8.cpp"]
 header = "ext_dct8.hpp"  # 用户类：端口成员 + eval()（见 §1.3）
-
-[backends.golden]        # 可选：Python 参考模型（自检用）
-type = "python"
-entry = "ext.dct8_ref:dct8"
 ```
 
 ### 1.2 MLIR 形态
@@ -118,7 +114,7 @@ def build(m, domain):
 
 `designs/examples/ext_dct8/`：`ext_dct8.py`（设计）、`ext/ext_dct8.toml`
 （清单）、`ext/dct8.v` + `ext/dct8.cpp`（同一参考算法的双语言实现）、
-`ext/dct8_ref.py`（golden）、`tb_ext_dct8.py`（4 向量 expect 校验）。
+`tb_ext_dct8.py`（4 向量 expect 校验，期望值内嵌于 tb）。
 
 ```bash
 # C++ 后端（链接用户 dct8.cpp，直呼 ABI）
