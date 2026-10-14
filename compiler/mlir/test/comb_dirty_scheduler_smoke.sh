@@ -88,7 +88,9 @@ grep -q '_pyc_change_schedule_rank{{0u, 1u, 1u, 2u, 0u}}' \
 grep -q '_pyc_change_schedule_slot{{0u, 1u, 2u, 3u, 4u}}' \
   "${dirty_cpp}"
 grep -q 'DirtyBitset<' "${dirty_cpp}"
-grep -q 'std::array<unsigned, 2> _pyc_direct_fanout_.*{{1u, 2u}}' \
+# Fanout wakes emit as (word, mask) pairs ORed through DirtyBitset::markWordUnchecked;
+# comb_1 fans out to combs {1, 2} = word 0, mask 0x6.
+grep -q 'std::array<std::pair<unsigned, std::uint64_t>, 1> _pyc_direct_fanout_.*{{0u, 0x6ull}}' \
   "${dirty_cpp}"
 test "$(grep -c '_pyc_direct_fanout_' "${dirty_cpp}")" -eq 6
 
@@ -102,10 +104,9 @@ if grep -q '_pyc_comb_1_input_0' "${state_cpp}"; then
   echo "fail: dirty comb still polls register Q instead of commit fanout" >&2
   exit 1
 fi
-grep -q '_pyc_direct_fanout_pyc_reg_4{{1u}}' "${state_cpp}"
 grep -q '_pyc_commit_changed_pyc_reg_4_inst' "${state_cpp}"
 grep -q 'if (_pyc_commit_changed_pyc_reg_4_inst)' "${state_cpp}"
-grep -q '_pyc_mark_comb_dirty(_pyc_consumer)' "${state_cpp}"
+grep -q '_pyc_comb_dirty.markWordUnchecked' "${state_cpp}"
 "${CXX}" -std=c++17 -O0 \
   -I"${state_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
   "${STATE_DRIVER}" \
@@ -120,7 +121,7 @@ mkdir -p "${instance_dir}"
   -o "${instance_dir}/comb_dirty_instance.cpp" "${common[@]}"
 instance_cpp="${instance_dir}/comb_dirty_instance.cpp"
 grep -q '_pyc_direct_fanout_' "${instance_cpp}"
-grep -q '_pyc_mark_comb_dirty' "${instance_cpp}"
+grep -q '_pyc_comb_dirty.markWordUnchecked' "${instance_cpp}"
 "${CXX}" -std=c++17 -O0 \
   -I"${instance_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
   "${INSTANCE_DRIVER}" -o "${OUT}/run_instance"
@@ -142,7 +143,7 @@ for required in \
   'kReadData0Changed' \
   'kReadData1Changed' \
   '_pyc_commit_changed_' \
-  '_pyc_mark_comb_dirty'; do
+  '_pyc_comb_dirty.markWordUnchecked'; do
   if ! grep -q "${required}" "${primitive_cpp}"; then
     echo "fail: primitive dirty source missing ${required}" >&2
     exit 1
