@@ -1314,29 +1314,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   Block &top = f.getBody().front();
 
   std::string structName = sanitizeId(f.getSymName());
-  // File-scope C ABI declarations for external modules referenced by this
-  // function (docs/external-modules.md); definitions live in the user's
-  // [backends.cpp] artifact linked alongside the generated model.
-  {
-    ModuleOp abiMod = f->getParentOfType<ModuleOp>();
-    llvm::StringMap<bool> extAbiSeen;
-    if (abiMod) {
-      f.walk([&](pyc::InstanceOp inst) {
-        auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
-        if (!calleeAttr)
-          return;
-        auto ext = abiMod.lookupSymbol<pyc::ExtModuleOp>(calleeAttr.getValue());
-        if (!ext)
-          return;
-        std::string prefix = sanitizeId(ext.getSymName());
-        if (extAbiSeen.contains(prefix))
-          return;
-        extAbiSeen[prefix] = true;
-        os << "extern \"C\" void " << prefix
-           << "_eval(void* state, std::uint64_t* outs, const std::uint64_t* ins, std::uint64_t cycle);\n";
-      });
-    }
-  }
   os << "struct " << structName << " {\n";
   os << "  static constexpr const char *_pyc_change_schedule_schema = \""
      << kChangeScheduleSchema << "\";\n";
@@ -1546,14 +1523,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     std::vector<std::string> inPorts;
     std::vector<std::string> outPorts;
     std::vector<char> clockOnlyIn;
+    std::string childTypeName; // generated struct or user ext class
 
     bool isExt() const { return ext != nullptr; }
-    llvm::StringRef extKind() const {
-      if (!ext)
-        return llvm::StringRef();
-      auto a = ext->getAttrOfType<StringAttr>("ext_kind");
-      return a ? a.getValue() : llvm::StringRef();
-    }
     std::string extPrefix() const {
       if (!ext)
         return std::string();
@@ -1639,18 +1611,20 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
               argumentIsClockOnly(callee, i, mod, clockOnlyMemo) ? 1 : 0;
       }
 
+      std::string childTypeName = ext ? sanitizeId(ext.getSymName())
+                                      : sanitizeId(callee.getSymName());
       unsigned idx = static_cast<unsigned>(instInfos.size());
       instIndex.try_emplace(inst.getOperation(), idx);
       instInfos.push_back(InstInfo{inst, callee, ext, std::move(member), std::move(seg),
                                    std::move(inPorts), std::move(outPorts),
-                                   std::move(clockOnlyIn)});
+                                   std::move(clockOnlyIn), std::move(childTypeName)});
     }
 
     llvm::DenseMap<Operation *, SeqStateKind> seqMemo{};
     instHasSequentialCallee.reserve(instInfos.size());
     for (const auto &ii : instInfos) {
       if (ii.isExt())
-        instHasSequentialCallee.push_back(ii.extKind() == "seq");
+        instHasSequentialCallee.push_back(false);
       else
         instHasSequentialCallee.push_back(functionHasSequentialState(ii.callee, mod, seqMemo));
     }
@@ -1687,19 +1661,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	  if (!instInfos.empty()) {
 	    os << "  // Sub-modules.\n";
 	    for (const auto &ii : instInfos) {
-	      if (ii.isExt()) {
-	        // External module (docs/external-modules.md): no child SimObject.
-	        // The C ABI context is a small state holder per instance; the
-	        // user's <prefix>_eval/_reset implementation lives in the linked
-	        // artifact (source or dynlib) from the ext module manifest.
-	        os << "  pyc::cpp::ExtCallCtx " << ii.member << "_ctx{}; // ext: "
-	           << ii.extPrefix() << "\n";
-	        continue;
-	      }
-	      auto callee = ii.callee;
 	      // Decision 0012: Parent SimObjects own children via unique_ptr.
-	      os << "  std::unique_ptr<" << sanitizeId(callee.getSymName()) << "> " << ii.member
-	         << " = std::make_unique<" << sanitizeId(callee.getSymName()) << ">();\n";
+	      // External modules (docs/external-modules.md) bind a user-provided
+	      // class named after the ext symbol — same ownership shape.
+	      os << "  std::unique_ptr<" << ii.childTypeName << "> " << ii.member
+	         << " = std::make_unique<" << ii.childTypeName << ">();\n";
 	    }
 	    os << "\n";
 
@@ -1822,13 +1788,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	    os << "      full += \".\";\n";
       os << "      full += seg;\n";
       os << "      std::string inst_path = pyc::cpp::shortenInstancePath(full);\n";
-      os << "      if (enabledInst(inst_path) && child) child->pyc_trace_vcd(tb, full, enabledInst, enabledSig);\n";
+      os << "      pyc::cpp::ext_trace_child(child, tb, full, enabledInst, enabledSig);\n";
       os << "    };\n";
-      for (const auto &ii : instInfos) {
-        if (ii.isExt())
-          continue; // external black box has no generated probe surface
+      for (const auto &ii : instInfos)
         os << "    trace_child(" << ii.member << ", \"" << ii.seg << "\");\n";
-      }
     }
 	  os << "  }\n\n";
 
@@ -2049,13 +2012,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	    os << "      std::string p = prefix;\n";
 	    os << "      p += \".\";\n";
 	    os << "      p += seg;\n";
-	    os << "      if (child) child->pyc_register_probes(reg, p);\n";
+	    os << "      pyc::cpp::ext_register_child(child, reg, p);\n";
 	    os << "    };\n";
-	    for (const auto &ii : instInfos) {
-	      if (ii.isExt())
-	        continue; // external black box has no generated probe surface
+	    for (const auto &ii : instInfos)
 	      os << "    reg_child(" << ii.member << ", \"" << ii.seg << "\");\n";
-	    }
 	  }
       auto probeAliases = probeAliasesForTop(probePlans, f.getSymName());
       if (!probeAliases.empty()) {
@@ -2310,7 +2270,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   os << "\n";
 
   os << "  bool _pyc_sim_fast_enable = false;\n";
-  os << "  std::uint64_t _pyc_cycle = 0;\n";
   os << "\n";
   os << "  static bool _pyc_parse_bool_env(const char *name, bool dflt = false) {\n";
   os << "    const char *v = std::getenv(name);\n";
@@ -2706,36 +2665,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 
   auto emitInstanceEvalHelperDefinition = [&](const InstInfo &ii, llvm::StringRef helperName) {
     auto inst = ii.op;
-    if (ii.isExt()) {
-      // External module: direct C ABI call (docs/external-modules.md).
-      // comb  -> <prefix>_eval(nullptr, outs, ins, cycle); same-cycle result.
-      // seq   -> <prefix>_eval(&ctx.state, outs, ins, cycle); result is
-      //          published through the declared latency by the scheduler.
-      std::string prefix = ii.extPrefix();
-      bool isSeq = ii.extKind() == "seq";
-      os << "  inline bool " << helperName << "() {\n";
-      os << "    bool _pyc_inst_changed = false;\n";
-      for (unsigned i = 0; i < inst.getNumOperands(); ++i)
-        os << "    " << ii.member << "_ctx.ins[" << i << "] = static_cast<std::uint64_t>("
-           << nt.get(inst.getOperand(i)) << ".value());\n";
-      os << "    " << prefix << "_eval(" << (isSeq ? "&" + ii.member + "_ctx" : "nullptr")
-         << ", " << ii.member << "_ctx.outs.data(), " << ii.member << "_ctx.ins.data(), _pyc_cycle);\n";
-      for (unsigned i = 0; i < inst.getNumResults(); ++i) {
-        Value result = inst.getResult(i);
-        os << "    {\n";
-        os << "      auto _pyc_ext_out = pyc::cpp::Wire<" << bitWidth(result.getType())
-           << ">(" << ii.member << "_ctx.outs[" << i << "]);\n";
-        os << "      if (" << nt.get(result) << " != _pyc_ext_out) {\n";
-        os << "        " << nt.get(result) << " = _pyc_ext_out;\n";
-        os << "        _pyc_inst_changed = true;\n";
-        emitMetadataCombFanout(result, os, *schedule, combIndex, nt);
-        os << "      }\n";
-        os << "    }\n";
-      }
-      os << "    return _pyc_inst_changed;\n";
-      os << "  }\n\n";
-      return;
-    }
     bool usePackedCache = usePackedInstanceEvalCache(ii);
     os << "  inline bool " << helperName << "() {\n";
     os << "    bool _pyc_inst_changed = false;\n";
@@ -3536,7 +3465,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
 
   os << "  void eval() {\n";
-  os << "    ++_pyc_cycle;\n";
   if (hasFullTopo) {
     if (!topoEvalMethods.empty()) {
       for (const std::string &methodName : topoEvalMethods)
@@ -3607,31 +3535,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     for (unsigned i = begin; i < end && i < instInfos.size(); ++i) {
       const auto &ii = instInfos[i];
       auto inst = ii.op;
-      if (ii.isExt()) {
-        // External seq module: inputs are latched into ctx and _eval is
-        // invoked in the tick phase; the comb path skips it (results were
-        // published there from ctx.outs). See docs/external-modules.md.
-        if (ii.extKind() != "seq")
-          continue;
-        emitStateTickCompute(
-            ii.member, inst->getOperands(), "    ",
-            [&](llvm::StringRef indent) {
-              for (unsigned j = 0; j < inst.getNumOperands(); ++j)
-                os << indent << ii.member << "_ctx.ins[" << j << "] = static_cast<std::uint64_t>("
-                   << nt.get(inst.getOperand(j)) << ".value());\n";
-              os << indent << ii.extPrefix() << "_eval(&" << ii.member
-                 << "_ctx, " << ii.member << "_ctx.outs.data(), " << ii.member
-                 << "_ctx.ins.data(), _pyc_cycle);\n";
-            });
-        continue;
-      }
       emitStateTickCompute(
           ii.member, inst->getOperands(), "    ",
           [&](llvm::StringRef indent) {
             for (unsigned j = 0; j < inst.getNumOperands(); ++j)
               os << indent << ii.member << "->" << ii.inPorts[j] << " = "
                  << nt.get(inst.getOperand(j)) << ";\n";
-            os << indent << ii.member << "->tick_compute();\n";
+            os << indent << "pyc::cpp::ext_tick_compute(*" << ii.member << ");\n";
           });
     }
     os << "  }\n\n";
@@ -3641,10 +3551,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  inline void tick_commit_part_" << partIdx << "() {\n";
     // Sub-modules.
     for (unsigned i = begin; i < end && i < instInfos.size(); ++i) {
-      const auto &ii = instInfos[i];
-      if (ii.isExt())
-        continue;
-      os << "    " << ii.member << "->tick_commit();\n";
+      os << "    pyc::cpp::ext_tick_commit(*" << instInfos[i].member << ");\n";
     }
     os << "  }\n\n";
   };
@@ -4027,6 +3934,31 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   os << "#include <cpp/pyc_change_scheduler.hpp>\n";
   os << "#include <cpp/pyc_ext.hpp>\n\n";
 
+
+  // User-provided class headers for external modules (docs/external-modules.md):
+  // one header per distinct ext symbol, resolved via include_dirs from the build.
+  {
+    llvm::StringMap<bool> extHdrSeen;
+    for (auto f0 : module.getOps<func::FuncOp>()) {
+      if (f0.isDeclaration())
+        continue;
+      f0.walk([&](pyc::InstanceOp inst) {
+        auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
+        if (!calleeAttr)
+          return;
+        auto ext = module.lookupSymbol<pyc::ExtModuleOp>(calleeAttr.getValue());
+        if (!ext)
+          return;
+        std::string prefix = sanitizeId(ext.getSymName());
+        if (extHdrSeen.contains(prefix))
+          return;
+        extHdrSeen[prefix] = true;
+        os << "#include \"" << prefix << ".hpp\"\n";
+      });
+    }
+    if (!extHdrSeen.empty())
+      os << "\n";
+  }
 
   os << "namespace pyc::gen {\n\n";
 

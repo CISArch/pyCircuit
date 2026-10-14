@@ -1312,7 +1312,6 @@ struct SplitMethodDef {
 
 struct SplitModuleResult {
   std::string headerBody;
-  std::string prelude;
   std::vector<SplitMethodDef> methods;
 };
 
@@ -1837,10 +1836,6 @@ static std::optional<SplitModuleResult> splitEmittedModule(llvm::StringRef emitt
 
   llvm::StringRef body = emitted.substr(open + 1, close - open - 1);
   SplitModuleResult out;
-  // Preserve file-scope text before the struct (e.g. extern "C" ABI
-  // declarations for external modules, docs/external-modules.md) so it lands
-  // in the split header ahead of the namespace.
-  out.prelude = emitted.substr(0, structPos).str();
   out.headerBody.reserve(body.size() / 2);
   out.headerBody.append("struct ");
   out.headerBody.append(structName.str());
@@ -2975,10 +2970,6 @@ int main(int argc, char **argv) {
           auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
           if (!calleeAttr)
             return;
-          // External black-box callees have no generated child header
-          // (docs/external-modules.md); do not emit an include for them.
-          if (module->lookupSymbol<pyc::ExtModuleOp>(calleeAttr.getValue()))
-            return;
           v.push_back(calleeAttr.getValue().str());
         });
         std::sort(v.begin(), v.end());
@@ -3053,8 +3044,6 @@ int main(int argc, char **argv) {
           writeHeaderPreamble(hos, moduleName);
           for (const std::string &dep : deps[f.getSymName()])
             hos << "#include \"" << dep << ".hpp\"\n";
-          if (!split->prelude.empty())
-            hos << "\n" << split->prelude << "\n";
           hos << "\nnamespace pyc::gen {\n\n";
           hos << split->headerBody << "\n";
           hos << "} // namespace pyc::gen\n";

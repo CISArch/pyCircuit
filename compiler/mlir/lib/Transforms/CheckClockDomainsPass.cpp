@@ -449,15 +449,11 @@ public:
           return out;
         }
         auto sym = SymbolTable::lookupSymbolIn(module_, calleeAttr.getValue());
-        if (auto ext = dyn_cast_or_null<pyc::ExtModuleOp>(sym)) {
-          // External black-box boundary (docs/external-modules.md): a comb ext
-          // result inherits the union of its operand clock domains; a seq ext
-          // result is clocked by the declared clock port, which is not
-          // resolvable through this boundary, so it contributes no domain and
-          // downstream domain mixing is checked at its inputs instead.
-          if (ext.getExtKind() == "comb")
-            for (Value in : inst.getInputs())
-              out |= domain(in);
+        if (dyn_cast_or_null<pyc::ExtModuleOp>(sym)) {
+          // External black-box boundary (docs/external-modules.md): the
+          // result inherits the union of its operand clock domains.
+          for (Value in : inst.getInputs())
+            out |= domain(in);
           return out;
         }
         auto callee = dyn_cast_or_null<func::FuncOp>(sym);

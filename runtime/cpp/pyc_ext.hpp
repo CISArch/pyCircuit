@@ -1,43 +1,93 @@
 #pragma once
-// pyCircuit external-module C ABI contract (docs/external-modules.md).
+// pyCircuit external-module C++ binding contract (docs/external-modules.md).
 //
-// A user-provided black-box model is linked into the generated simulator as
-// plain C symbols named <prefix>_eval (and optionally <prefix>_reset).
+// The C++ backend binds a user-provided class named after the ext symbol:
+//   struct <name> {
+//     pyc::cpp::Wire<W> <port>;   // one member per manifest port
+//     void eval();                // required — same-cycle (combinational) view
+//     void tick_compute();        // optional: both present => the instance is
+//     void tick_commit();         // scheduled into the tick phase (stateful)
+//   };
+// Optional capability hooks (same signatures as generated SimObjects):
+//   template <class TbT, class EnabledInstT, class EnabledSigT>
+//   void pyc_trace_vcd(TbT&, const std::string&, EnabledInstT&&, EnabledSigT&&);
+//   void pyc_register_probes(pyc::cpp::ProbeRegistry&, const std::string&);
 //
-//   comb module (ext_kind="comb", latency=0, pure=true):
-//     void <prefix>_eval(void *state, uint64_t *outs, const uint64_t *ins,
-//                        uint64_t cycle);
-//     state is always nullptr; the result is same-cycle.
-//
-//   seq module (ext_kind="seq", latency>=1):
-//     size_t <prefix>_state_size();          // bytes of per-instance state
-//     void   <prefix>_reset(void *state, const uint64_t *init);
-//     void   <prefix>_eval(void *state, uint64_t *outs, const uint64_t *ins,
-//                         uint64_t cycle);
-//     eval is invoked once per simulated cycle in the tick phase; the module
-//     advances its own internal pipeline state. The declared latency tells
-//     the change-driven scheduler when the outputs become live.
-//
-// Widths: every port is flattened to its bit width and transported in 64-bit
-// words, little-endian (word 0 holds bits [63:0]). Values narrower than 64
-// bits are zero-extended; wider values occupy ceil(w/64) consecutive words.
+// Generated code calls the optional hooks through the helpers below, which
+// degrade to no-ops when the user class does not provide them (C++17).
 
-#include <array>
-#include <cstddef>
 #include <cstdint>
+#include <string>
+#include <type_traits>
 
 namespace pyc::cpp {
 
-// Per-instance host-side context for an external module instance. ins/outs
-// are generously sized for the prototype port limit (16 ports x 4 words).
-inline constexpr unsigned kExtMaxPorts = 16;
-inline constexpr unsigned kExtWordsPerPort = 4;
+// --- tick capability -------------------------------------------------------
+template <typename T, typename = void>
+struct has_tick : std::false_type {};
+template <typename T>
+struct has_tick<T, std::void_t<decltype(std::declval<T &>().tick_compute(),
+                                        std::declval<T &>().tick_commit())>>
+    : std::true_type {};
 
-struct ExtCallCtx {
-  std::uint64_t cycle = 0;
-  void *state = nullptr;
-  std::array<std::uint64_t, kExtMaxPorts * kExtWordsPerPort> ins{};
-  std::array<std::uint64_t, kExtMaxPorts * kExtWordsPerPort> outs{};
+template <bool HasTick, typename T>
+inline void tick_compute_impl(T &m, std::true_type) { m.tick_compute(); }
+template <bool HasTick, typename T>
+inline void tick_compute_impl(T &, std::false_type) {}
+template <typename T>
+inline void ext_tick_compute(T &m) {
+  tick_compute_impl<has_tick<T>::value>(m, has_tick<T>{});
+}
+
+template <bool HasTick, typename T>
+inline void tick_commit_impl(T &m, std::true_type) { m.tick_commit(); }
+template <bool HasTick, typename T>
+inline void tick_commit_impl(T &, std::false_type) {}
+template <typename T>
+inline void ext_tick_commit(T &m) {
+  tick_commit_impl<has_tick<T>::value>(m, has_tick<T>{});
+}
+
+// --- trace/probe capability (detected via expression SFINAE) ---------------
+template <typename T, typename TbT, typename EI, typename ES, typename = void>
+struct has_trace : std::false_type {};
+template <typename T, typename TbT, typename EI, typename ES>
+struct has_trace<T, TbT, EI, ES,
+                 std::void_t<decltype(std::declval<T &>().pyc_trace_vcd(
+                     std::declval<TbT &>(), std::declval<const std::string &>(),
+                     std::declval<EI>(), std::declval<ES>()))>> : std::true_type {
 };
+
+template <typename T, typename R, typename P, typename = void>
+struct has_probe : std::false_type {};
+template <typename T, typename R, typename P>
+struct has_probe<T, R, P,
+                 std::void_t<decltype(std::declval<T &>().pyc_register_probes(
+                     std::declval<R &>(), std::declval<const std::string &>()))>>
+    : std::true_type {};
+
+template <typename T, typename TbT, typename EI, typename ES>
+inline void ext_trace_child(T &child, TbT &tb, const std::string &full, EI &&ei, ES &&es) {
+  trace_dispatch(child, tb, full, ei, es,
+                 has_trace<T, TbT, EI, ES>{});
+}
+template <typename T, typename TbT, typename EI, typename ES>
+inline void trace_dispatch(T &child, TbT &tb, const std::string &full, EI &&ei, ES &&es,
+                           std::true_type) {
+  child.pyc_trace_vcd(tb, full, ei, es);
+}
+template <typename T, typename TbT, typename EI, typename ES>
+inline void trace_dispatch(T &, TbT &, const std::string &, EI &&, ES &&, std::false_type) {}
+
+template <typename T, typename R>
+inline void ext_register_child(T &child, R &reg, const std::string &prefix) {
+  probe_dispatch(child, reg, prefix, has_probe<T, R, std::string>{});
+}
+template <typename T, typename R>
+inline void probe_dispatch(T &child, R &reg, const std::string &prefix, std::true_type) {
+  child.pyc_register_probes(reg, prefix);
+}
+template <typename T, typename R>
+inline void probe_dispatch(T &, R &, const std::string &, std::false_type) {}
 
 } // namespace pyc::cpp

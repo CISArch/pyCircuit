@@ -178,13 +178,18 @@ def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object
     return jit_params
 
 
-def _collect_ext_module_cpp_sources_multi(roots: list[Path]) -> list[Path]:
-    """Locate extmod.toml manifests under the given roots and return the
-    [backends.cpp] source files they reference (docs/external-modules.md)."""
+def _collect_ext_module_cpp_sources_multi(roots: list[Path]) -> tuple[list[Path], list[Path]]:
+    """Locate external-module manifests under the given roots.
+
+    Returns (cpp_sources, header_dirs): the [backends.cpp] source files to link
+    into the simulator and the directories holding the user class headers so
+    `#include "<sym>.hpp"` resolves (docs/external-modules.md).
+    """
     import tomllib as _tomllib
 
     seen: set[Path] = set()
     out: list[Path] = []
+    header_dirs: list[Path] = []
     for root in roots:
         if not root.is_dir():
             continue
@@ -196,6 +201,13 @@ def _collect_ext_module_cpp_sources_multi(roots: list[Path]) -> list[Path]:
                 continue
             backends = data.get("backends") or {}
             cpp = backends.get("cpp") or {}
+            if not isinstance(cpp, dict):
+                continue
+            header = cpp.get("header")
+            if header:
+                hd = (manifest.parent / str(header)).resolve().parent
+                if hd.is_dir() and hd not in header_dirs:
+                    header_dirs.append(hd)
             if str(cpp.get("type", "source")) != "source":
                 continue
             for rel in cpp.get("files", []) or []:
@@ -207,7 +219,7 @@ def _collect_ext_module_cpp_sources_multi(roots: list[Path]) -> list[Path]:
                 if p.is_file() and p not in seen:
                     seen.add(p)
                     out.append(p)
-    return out
+    return out, header_dirs
 
 
 def _propagate_ext_module_decls(circuit: Any, design: "Design") -> None:
@@ -2618,9 +2630,13 @@ def _cmd_build(args: argparse.Namespace) -> int:
         tb_arg = getattr(args, "python_file", None)
         if tb_arg:
             ext_roots.append(Path(str(tb_arg)).resolve().parent)
-        ext_cpp_sources = _collect_ext_module_cpp_sources_multi(ext_roots)
+        ext_cpp_sources, ext_header_dirs = _collect_ext_module_cpp_sources_multi(ext_roots)
         if ext_cpp_sources:
             build_manifest["ext_sources"] = [str(p) for p in ext_cpp_sources]
+        for d in ext_header_dirs:
+            sd = str(d)
+            if sd not in include_dirs:
+                include_dirs.append(sd)
         if args.cpp_pch:
             # Collect device hpp headers flagged for PCH across all module manifests.
             seen: set[str] = set()

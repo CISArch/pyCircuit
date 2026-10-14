@@ -1285,29 +1285,6 @@ LogicalResult InstanceOp::verify() {
 }
 
 LogicalResult ExtModuleOp::verify() {
-  llvm::StringRef kind = getExtKind();
-  if (kind != "comb" && kind != "seq")
-    return emitOpError("ext_kind must be \"comb\" or \"seq\", got: ") << kind;
-
-  if (getLatency() < 0)
-    return emitOpError("latency must be non-negative");
-  if (kind == "comb") {
-    if (getLatency() != 0)
-      return emitOpError("comb ext_module must have latency = 0, got: ")
-             << getLatency();
-    if (!getPure())
-      return emitOpError("comb ext_module must declare pure = true");
-    if (getClock() || getReset())
-      return emitOpError("comb ext_module must not declare clock/reset");
-  } else {
-    if (getLatency() < 1)
-      return emitOpError("seq ext_module must have latency >= 1");
-    if (!getClock() || !getReset())
-      return emitOpError("seq ext_module requires clock and reset port names");
-    if (getClock()->empty() || getReset()->empty())
-      return emitOpError("clock/reset port names must be non-empty");
-  }
-
   // Port name attributes (if present) must match the signature arity.
   FunctionType ft = getFunctionType();
   if (auto names = getArgNames()) {
@@ -1319,11 +1296,6 @@ LogicalResult ExtModuleOp::verify() {
     if (names->size() != ft.getNumResults())
       return emitOpError("result_names arity must match result count: got ")
              << names->size() << " expected " << ft.getNumResults();
-  }
-  if (auto init = getInit()) {
-    if (init->size() != ft.getNumResults())
-      return emitOpError("init arity must match result count: got ")
-             << init->size() << " expected " << ft.getNumResults();
   }
   if (auto top = getVerilogTop()) {
     if (top->empty())

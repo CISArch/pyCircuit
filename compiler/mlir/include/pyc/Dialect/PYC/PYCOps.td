@@ -413,23 +413,18 @@ def PYC_ExtModuleOp : PYC_Op<"ext_module", [Symbol]> {
 Declares a user-provided black-box module (custom Verilog and/or C++ model)
 participating in the pyc.instance call graph. The symbol carries no body: the
 semantics live in user backend artifacts referenced by the external-module
-manifest, not in the IR. ext_kind is "comb" (latency must be 0, pure must be
-true) or "seq" (latency >= 1, clock/reset port names required). Per Decision
-0134/0135 semantics, an ext_module callee is the only legal combinational
-cut point through an instance boundary: analyses stop here instead of
-traversing into the callee body.
+manifest, not in the IR. The C++ backend binds a user-provided class named
+after the symbol (port members + eval(); optional tick_compute/tick_commit
+moves the instance into the tick phase). Per Decision 0134/0135 semantics,
+an ext_module callee is the only legal combinational cut point through an
+instance boundary: analyses stop here instead of traversing into the callee
+body.
   }];
   let arguments = (ins SymbolNameAttr:$sym_name,
                       TypeAttrOf<FunctionType>:$function_type,
-                      StrAttr:$ext_kind,
-                      I64Attr:$latency,
-                      BoolAttr:$pure,
                       OptionalAttr<StrAttr>:$verilog_top,
                       OptionalAttr<ArrayAttr>:$arg_names,
-                      OptionalAttr<ArrayAttr>:$result_names,
-                      OptionalAttr<StrAttr>:$clock,
-                      OptionalAttr<StrAttr>:$reset,
-                      OptionalAttr<ArrayAttr>:$init);
+                      OptionalAttr<ArrayAttr>:$result_names);
   let hasVerifier = 1;
   let assemblyFormat = "$sym_name attr-dict `:` $function_type";
 }

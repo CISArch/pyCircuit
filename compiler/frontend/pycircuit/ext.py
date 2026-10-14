@@ -3,10 +3,7 @@
 A user model is described by an ``extmod.toml`` manifest:
 
     [module]
-    name = "ext_dct8"
-    kind = "comb"            # comb | seq
-    latency = 0              # comb: 0; seq: >= 1
-    pure = true              # comb modules must be pure
+    name = "ext_dct8"        # symbol name; also the user C++ class name
     verilog_top = "dct8"     # optional: Verilog module name (default: name)
 
     [[ports]]
@@ -23,11 +20,6 @@ A user model is described by an ``extmod.toml`` manifest:
     name = "out"
     dir = "out"
     width = 64
-
-    [module.seq]             # only for kind = "seq"
-    clock = "clk"
-    reset = "rst"
-    init = ["0"]             # one entry per out port
 
 ``declare()`` parses the manifest and registers the ``pyc.ext_module``
 symbol on the Design so ``emit_mlir()`` includes the declaration; the
@@ -60,14 +52,8 @@ class ExtPort:
 @dataclass(frozen=True)
 class ExtModuleDecl:
     name: str
-    kind: str  # "comb" | "seq"
-    latency: int
-    pure: bool
     ports: tuple[ExtPort, ...]
     verilog_top: str | None
-    clock: str | None
-    reset: str | None
-    init: tuple[str, ...]
 
     @property
     def inputs(self) -> tuple[ExtPort, ...]:
@@ -90,11 +76,6 @@ def parse_manifest(path: str | Path) -> ExtModuleDecl:
     name = str(mod.get("name", "")).strip()
     if not name:
         raise DesignError(f"{p}: [module] name must be non-empty")
-    kind = str(mod.get("kind", "")).strip()
-    if kind not in ("comb", "seq"):
-        raise DesignError(f"{p}: [module] kind must be \"comb\" or \"seq\"")
-    latency = int(mod.get("latency", 0))
-    pure = bool(mod.get("pure", kind == "comb"))
     verilog_top = mod.get("verilog_top")
 
     raw_ports = raw.get("ports")
@@ -115,41 +96,10 @@ def parse_manifest(path: str | Path) -> ExtModuleDecl:
         seen.add(pname)
         ports.append(ExtPort(name=pname, dir=pdir, width=pwidth))
 
-    clock = reset = None
-    init: tuple[str, ...] = ()
-    if kind == "comb":
-        if latency != 0:
-            raise DesignError(f"{p}: comb module latency must be 0")
-        if not pure:
-            raise DesignError(f"{p}: comb module must declare pure = true")
-    else:
-        if latency < 1:
-            raise DesignError(f"{p}: seq module latency must be >= 1")
-        seq = mod.get("seq")
-        if not isinstance(seq, dict):
-            raise DesignError(f"{p}: seq module requires a [module.seq] table")
-        clock = str(seq.get("clock", "")).strip() or None
-        reset = str(seq.get("reset", "")).strip() or None
-        if not clock or not reset:
-            raise DesignError(f"{p}: seq module requires clock and reset port names")
-        if clock not in seen or reset not in seen:
-            raise DesignError(f"{p}: seq clock/reset must reference declared ports")
-        raw_init = seq.get("init", [])
-        init = tuple(str(x) for x in raw_init)
-        out_count = sum(1 for x in ports if x.dir == "out")
-        if len(init) != out_count:
-            raise DesignError(f"{p}: seq init arity ({len(init)}) must match out ports ({out_count})")
-
     return ExtModuleDecl(
         name=name,
-        kind=kind,
-        latency=latency,
-        pure=pure,
         ports=tuple(ports),
         verilog_top=str(verilog_top).strip() if verilog_top else None,
-        clock=clock,
-        reset=reset,
-        init=init,
     )
 
 
@@ -163,22 +113,13 @@ def ext_module_mlir(decl: ExtModuleDecl) -> str:
     out_tys = ", ".join(f"i{p.width}" for p in decl.outputs)
     ft = f"({in_tys}) -> ({out_tys})"
 
-    attrs: list[str] = [
-        f"function_type = {ft}",
-        f'ext_kind = {_mlir_str(decl.kind)}',
-        f"latency = {decl.latency}",
-        f"pure = {'true' if decl.pure else 'false'}",
-    ]
+    attrs: list[str] = [f"function_type = {ft}"]
     if decl.verilog_top:
         attrs.append(f"verilog_top = {_mlir_str(decl.verilog_top)}")
     if decl.inputs:
         attrs.append("arg_names = [" + ", ".join(_mlir_str(p.name) for p in decl.inputs) + "]")
     if decl.outputs:
         attrs.append("result_names = [" + ", ".join(_mlir_str(p.name) for p in decl.outputs) + "]")
-    if decl.kind == "seq":
-        attrs.append(f"clock = {_mlir_str(decl.clock)}")
-        attrs.append(f"reset = {_mlir_str(decl.reset)}")
-        attrs.append("init = [" + ", ".join(_mlir_str(x) for x in decl.init) + "]")
     return f"  pyc.ext_module @{decl.name} {{{', '.join(attrs)}}} : {ft}\n"
 
 

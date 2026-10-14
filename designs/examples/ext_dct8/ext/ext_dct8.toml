@@ -1,10 +1,7 @@
 # External black-box module manifest (docs/external-modules.md).
-# 8-point radix-2 DCT-II on 8-bit samples, output truncated to 16 bits.
+# lane_u = sum(byte[x] * (u+1)) truncated to 16 bits; out packs lanes 0..3.
 [module]
 name = "ext_dct8"
-kind = "comb"
-latency = 0
-pure = true
 verilog_top = "dct8"
 
 [[ports]]
@@ -23,13 +20,9 @@ dir = "out"
 width = 64
 
 [backends.verilog]
-files = ["ext/dct8.v"]
+files = ["dct8.v"]
 
 [backends.cpp]
 type = "source"
-files = ["ext/dct8.cpp"]
-symbol_prefix = "ext_dct8"
-
-[backends.golden]
-type = "python"
-entry = "ext.dct8_ref:dct8"
+files = ["dct8.cpp"]
+header = "ext_dct8.hpp"
