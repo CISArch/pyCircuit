@@ -2747,22 +2747,40 @@ int main(int argc, char **argv) {
     // else (default cp=0): no comb fusion at all — fusible comb ops stay
     // individual top-level ops and the emitters evaluate them per-op.
   }
-  pm.addPass(createCanonicalizerPass(canonicalizeCfg));
-  pm.addPass(createCSEPass());
-  addRemoveDeadValuesPassIfSupported(pm);
-  pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadInstancesPass());
-  pm.addPass(createSymbolDCEPass());
+  // PYC_SKIP_LATE=<comma list> disables individual late passes for
+  // debugging (values: canonicalize,cse,deadvalues,deadinst,symdce,
+  // combcycles,cds,placement). No effect when unset.
+  llvm::SmallVector<llvm::StringRef> skipLate;
+  if (const char *skipEnv = getenv("PYC_SKIP_LATE")) {
+    llvm::SmallVector<llvm::StringRef> items;
+    llvm::StringRef(skipEnv).split(items, ',');
+    skipLate = std::move(items);
+  }
+  auto lateSkipped = [&](llvm::StringRef name) {
+    return llvm::is_contained(skipLate, name);
+  };
+  if (!lateSkipped("canonicalize"))
+    pm.addPass(createCanonicalizerPass(canonicalizeCfg));
+  if (!lateSkipped("cse"))
+    pm.addPass(createCSEPass());
+  if (!lateSkipped("deadvalues"))
+    addRemoveDeadValuesPassIfSupported(pm);
+  if (!lateSkipped("deadinst"))
+    pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadInstancesPass());
+  if (!lateSkipped("symdce"))
+    pm.addPass(createSymbolDCEPass());
   // Fusion moves combinational ops into pyc.comb regions. The canonical graph
   // still sees those dependencies, so one check after fusion is sufficient.
   pm.addPass(pyc::createCheckCombCyclesPass());
-  pm.addPass(pyc::createChangeDrivenSchedulePass());
+  if (!lateSkipped("cds"))
+    pm.addPass(pyc::createChangeDrivenSchedulePass());
   if (combPartitionSize > 0 && !enableFuseComb)
     pm.addNestedPass<func::FuncOp>(
         pyc::createCombPartitionPass(combPartitionSize));
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
   pm.addPass(pyc::createCheckLogicDepthPass(logicDepthLimit));
-  if (emitKind == "cpp")
+  if (emitKind == "cpp" && !lateSkipped("placement"))
     pm.addPass(
         pyc::createCppPlacementPass(cppCombChunkNodes, traceCodegenPlanPath));
   pm.addNestedPass<func::FuncOp>(pyc::createCollectCompileStatsPass());

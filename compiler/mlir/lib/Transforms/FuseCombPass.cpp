@@ -102,6 +102,85 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     if (smallPartitionThreshold > 0) {
       for (Block &b : f.getBody())
         fuseBlockByPartition(b);
+      // Safety net: un-fuse any comb whose block operands are placed after
+      // the comb (relay coverage gap in rare partition combinations).
+      // Splice the region body back into the block right after the comb and
+      // route external uses of each comb result to the corresponding moved
+      // value (per the region's terminator operands). Semantics preserved:
+      // the body is a pure clone of the original members in data order.
+      // Iterate: un-fusing one comb can uncover new violations between
+      // remaining combs (cross-partition references), so repeat until clean.
+      for (unsigned round = 0; round < 16; ++round) {
+      llvm::SmallVector<pyc::CombOp> offenders;
+      for (Block &b : f.getBody())
+        for (Operation &op : b)
+          if (auto comb = dyn_cast<pyc::CombOp>(op)) {
+            for (OpOperand &operand : comb.getOperation()->getOpOperands()) {
+              Operation *def = operand.get().getDefiningOp();
+              if (def && def->getBlock() == &b &&
+                  !def->isBeforeInBlock(comb.getOperation())) {
+                offenders.push_back(comb);
+                break;
+              }
+            }
+          }
+      if (offenders.empty())
+        break;
+      for (pyc::CombOp comb : offenders) {
+        Block &b = *comb.getOperation()->getBlock();
+        Block &body = comb.getBody().front();
+        Operation *yield = body.getTerminator();
+        // Map comb result -> moved value (region value that feeds the yield).
+        llvm::DenseMap<Value, Value> resultToMoved;
+        for (auto [i, res] : llvm::enumerate(comb.getResults())) {
+          Value yielded = yield->getOperand(static_cast<unsigned>(i));
+          if (auto ba = dyn_cast<mlir::BlockArgument>(yielded)) {
+            resultToMoved[res] = comb.getOperand(ba.getArgNumber());
+            continue;
+          }
+          resultToMoved[res] = yielded;
+        }
+        // Splice point: after the LAST of (the comb, every external value the
+        // spliced ops consume). Splicing right after the comb can place ops
+        // before other defs they need (e.g. a later comb's result consumed
+        // through the block arg mapping), so advance the insertion point to
+        // cover all external defs referenced from the body.
+        Operation *spliceAfter = comb.getOperation();
+        for (Operation &bop : body) {
+          if (bop.hasTrait<mlir::OpTrait::IsTerminator>())
+            continue;
+          for (Value v : bop.getOperands()) {
+            if (isa<mlir::BlockArgument>(v))
+              continue;
+            Operation *def = v.getDefiningOp();
+            if (def && def->getBlock() == &b && !def->isBeforeInBlock(spliceAfter))
+              spliceAfter = def;
+          }
+        }
+        llvm::SmallVector<Operation *> spliced;
+        for (Operation &bop : llvm::make_early_inc_range(body)) {
+          if (bop.hasTrait<mlir::OpTrait::IsTerminator>())
+            continue;
+          bop.moveAfter(spliceAfter);
+          spliceAfter = &bop;
+          spliced.push_back(&bop);
+        }
+        // First redirect external uses of comb results to the moved values
+        // (now live in the block); then erase the comb.
+        for (auto &[res, moved] : resultToMoved)
+          res.replaceAllUsesWith(moved);
+        for (Operation *s : spliced)
+          for (OpOperand &operand : s->getOpOperands()) {
+            Value v = operand.get();
+            if (auto ba = dyn_cast<mlir::BlockArgument>(v))
+              operand.set(comb.getOperand(ba.getArgNumber()));
+          }
+        comb.erase();
+      }
+      for (Block &b2 : f.getBody())
+        if (!offenders.empty())
+          topologicallyReorderBlock(b2);
+      }
       return;
     }
     for (Block &b : f.getBody())
@@ -956,9 +1035,86 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
         continue;
       anchor = def;
     }
+    // The comb must also be placed after the earliest external use of any
+    // live-out: replacing a use that sits before the comb with the comb's
+    // result would break dominance for that consumer (observed as a
+    // probabilistic "operand #1 does not dominate" verifier failure).
+    llvm::SmallVector<Operation *> lateUsers; // external users, in block order
+    llvm::SmallVector<Operation *> worklist;
+    for (Value out : outputs)
+      for (OpOperand &use : out.getUses()) {
+        Operation *user = use.getOwner();
+        if (runSet.contains(user) || user->getBlock() != &regionBlock)
+          continue;
+        worklist.push_back(user);
+      }
+    llvm::DenseSet<Operation *> seenUsers;
+    for (unsigned wi = 0; wi < worklist.size(); ++wi) {
+      Operation *user = worklist[wi];
+      if (!seenUsers.insert(user).second)
+        continue;
+      lateUsers.push_back(user);
+      // Pure aliases of the live-out forward the value: their own readers
+      // are transitive external users and must also sit after the comb.
+      if (auto aliasOp = dyn_cast<pyc::AliasOp>(user))
+        for (OpOperand &au : aliasOp->getResult(0).getUses()) {
+          Operation *auOwner = au.getOwner();
+          if (!runSet.contains(auOwner) && auOwner->getBlock() == &regionBlock)
+            worklist.push_back(auOwner);
+        }
+    }
+    for (Operation *user : lateUsers)
+      if (user->isBeforeInBlock(anchor))
+        anchor = user;
     OpBuilder builder(anchor);
     builder.setInsertionPointAfter(anchor);
     auto comb = builder.create<pyc::CombOp>(run.front()->getLoc(), outTypes, inputs);
+
+    // Safety: if any op between the comb and its block end references a
+    // comb result that will replace an external use, and that use sits
+    // before the comb, move the comb after the last such use. (The anchor
+    // heuristic above cannot see uses that appear through later rewrites.)
+    {
+      bool moved = true;
+      while (moved) {
+        moved = false;
+        Operation *lastViolation = nullptr;
+        for (Operation &it : regionBlock) {
+          if (&it == comb.getOperation())
+            continue;
+          bool usesComb = false;
+          for (OpResult res : comb.getResults())
+            for (OpOperand &u : res.getUses())
+              if (u.getOwner() == &it)
+                usesComb = true;
+          if (!usesComb)
+            continue;
+          if (!it.isBeforeInBlock(comb.getOperation()))
+            continue;
+          lastViolation = &it; // remember the LATEST offending user
+        }
+        if (lastViolation) {
+          // Move the comb after the last offending user only if every comb
+          // operand still dominates the new position; otherwise leave the
+          // comb in place (the external use cannot be satisfied there
+          // either, and moving would break the comb's own inputs).
+          Operation *newPos = lastViolation;
+          bool safe = true;
+          for (Value in : comb.getOperation()->getOperands()) {
+            Operation *def = in.getDefiningOp();
+            if (def && def->getBlock() == &regionBlock &&
+                newPos->isBeforeInBlock(def)) {
+              safe = false;
+              break;
+            }
+          }
+          if (safe) {
+            comb.getOperation()->moveAfter(newPos);
+            moved = true;
+          }
+        }
+      }
+    }
 
     // Build a single-block region and clone ops into it.
     Region &region = comb.getBody();
