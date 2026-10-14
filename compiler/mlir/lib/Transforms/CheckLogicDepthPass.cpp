@@ -181,12 +181,11 @@ public:
             d = limit + 1;
           } else {
             auto sym = SymbolTable::lookupSymbolIn(module, calleeAttr.getValue());
-            auto callee = dyn_cast_or_null<func::FuncOp>(sym);
-            if (!callee) {
-              inst.emitError("pyc.instance callee is not a func.func symbol: ") << calleeAttr.getValue();
-              failedThisFunc = true;
-              d = limit + 1;
-            } else {
+            if (auto ext = dyn_cast_or_null<pyc::ExtModuleOp>(sym)) {
+              // External black-box boundary: depth stops at the declared
+              // latency (docs/external-modules.md; Decision 0135 cut point).
+              d = 1 + static_cast<int64_t>(ext.getLatency());
+            } else if (auto callee = dyn_cast_or_null<func::FuncOp>(sym)) {
               const FuncCombSummary *sum = combCache.getFuncSummary(callee);
               if (!sum) {
                 // Multi-.pyc build mode emits declaration-only dependency stubs.

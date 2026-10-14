@@ -1,0 +1,7 @@
+{
+  "cpp_modules": [
+    "ext_dct8_top.hpp"
+  ],
+  "top": "ext_dct8_top",
+  "verilog_modules": []
+}

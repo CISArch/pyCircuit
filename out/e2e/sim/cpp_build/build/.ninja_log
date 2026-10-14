@@ -1,0 +1,5 @@
+# ninja log v7
+1	26	1791962596137594186	CMakeFiles/pyc_tb.dir/home/ldz/pycircuit-workspace/pyCircuit-ext-module/designs/examples/ext_dct8/ext/dct8.cpp.o	7a741d87bcd30626
+1	1102	1791962596137828003	CMakeFiles/pyc_tb.dir/home/ldz/pycircuit-workspace/pyCircuit-ext-module/out/e2e/sim/tb/tb_ext_dct8_top.cpp.o	46363ca61b2e25c7
+1	1112	1791962596136066984	CMakeFiles/pyc_tb.dir/home/ldz/pycircuit-workspace/pyCircuit-ext-module/out/e2e/sim/device/cpp/ext_dct8_top/ext_dct8_top.cpp.o	2fa28bdcc6774cd1
+1112	1162	1791962597247078156	pyc_tb	44330a0f6efaecc

@@ -8,6 +8,7 @@ include "mlir/IR/OpBase.td"
 include "mlir/IR/CommonAttrConstraints.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/IR/SymbolInterfaces.td"
 include "pyc/Dialect/PYC/PYCTypes.td"
 
 class PYC_Op<string mnemonic, list<Trait> traits = []> :
@@ -406,8 +407,40 @@ def PYC_CdcSyncOp : PYC_Op<"cdc_sync", [MemoryEffects<[MemRead, MemWrite]>, AllT
   let assemblyFormat = "$clk `,` $rst `,` $in attr-dict `:` type($out)";
 }
 
+def PYC_ExtModuleOp : PYC_Op<"ext_module", [Symbol]> {
+  let summary = "External black-box module declaration";
+  let description = [{
+Declares a user-provided black-box module (custom Verilog and/or C++ model)
+participating in the pyc.instance call graph. The symbol carries no body: the
+semantics live in user backend artifacts referenced by the external-module
+manifest, not in the IR. ext_kind is "comb" (latency must be 0, pure must be
+true) or "seq" (latency >= 1, clock/reset port names required). Per Decision
+0134/0135 semantics, an ext_module callee is the only legal combinational
+cut point through an instance boundary: analyses stop here instead of
+traversing into the callee body.
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                      TypeAttrOf<FunctionType>:$function_type,
+                      StrAttr:$ext_kind,
+                      I64Attr:$latency,
+                      BoolAttr:$pure,
+                      OptionalAttr<StrAttr>:$verilog_top,
+                      OptionalAttr<ArrayAttr>:$arg_names,
+                      OptionalAttr<ArrayAttr>:$result_names,
+                      OptionalAttr<StrAttr>:$clock,
+                      OptionalAttr<StrAttr>:$reset,
+                      OptionalAttr<ArrayAttr>:$init);
+  let hasVerifier = 1;
+  let assemblyFormat = "$sym_name attr-dict `:` $function_type";
+}
+
 def PYC_InstanceOp : PYC_Op<"instance", []> {
   let summary = "Instantiate a sub-module";
+  let description = [{
+Calls a callee symbol. Callees are either func.func (inlined/traversed by
+passes) or pyc.ext_module (opaque boundary: latency-annotated black box whose
+body lives in user backend artifacts).
+  }];
   let arguments = (ins Variadic<AnyType>:$inputs, FlatSymbolRefAttr:$callee, OptionalAttr<StrAttr>:$name);
   let results = (outs Variadic<AnyType>:$outputs);
   let hasVerifier = 1;

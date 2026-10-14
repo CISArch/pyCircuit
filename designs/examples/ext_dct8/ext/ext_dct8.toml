@@ -1,0 +1,35 @@
+# External black-box module manifest (docs/external-modules.md).
+# 8-point radix-2 DCT-II on 8-bit samples, output truncated to 16 bits.
+[module]
+name = "ext_dct8"
+kind = "comb"
+latency = 0
+pure = true
+verilog_top = "dct8"
+
+[[ports]]
+name = "in"
+dir = "in"
+width = 64
+
+[[ports]]
+name = "valid"
+dir = "in"
+width = 1
+
+[[ports]]
+name = "out"
+dir = "out"
+width = 64
+
+[backends.verilog]
+files = ["ext/dct8.v"]
+
+[backends.cpp]
+type = "source"
+files = ["ext/dct8.cpp"]
+symbol_prefix = "ext_dct8"
+
+[backends.golden]
+type = "python"
+entry = "ext.dct8_ref:dct8"

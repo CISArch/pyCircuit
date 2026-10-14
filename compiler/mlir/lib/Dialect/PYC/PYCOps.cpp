@@ -1249,11 +1249,17 @@ LogicalResult InstanceOp::verify() {
     return emitOpError("must be contained in an MLIR module");
 
   Operation *sym = SymbolTable::lookupSymbolIn(module, calleeAttr);
-  auto callee = dyn_cast_or_null<func::FuncOp>(sym);
-  if (!callee)
-    return emitOpError("callee must reference a func.func");
-
-  FunctionType ft = callee.getFunctionType();
+  FunctionType ft;
+  if (auto ext = dyn_cast_or_null<ExtModuleOp>(sym)) {
+    // External black-box callee: compare against the declared signature.
+    ft = ext.getFunctionType();
+  } else if (auto callee = dyn_cast_or_null<func::FuncOp>(sym)) {
+    ft = callee.getFunctionType();
+  } else {
+    return emitOpError("callee must reference a func.func or pyc.ext_module");
+  }
+  if (!ft)
+    return emitOpError("callee has no function type");
   if (ft.getNumInputs() != getNumOperands())
     return emitOpError("operand count does not match callee signature");
   if (ft.getNumResults() != getNumResults())
@@ -1275,6 +1281,54 @@ LogicalResult InstanceOp::verify() {
       return emitOpError("name must be non-empty when provided");
   }
 
+  return success();
+}
+
+LogicalResult ExtModuleOp::verify() {
+  llvm::StringRef kind = getExtKind();
+  if (kind != "comb" && kind != "seq")
+    return emitOpError("ext_kind must be \"comb\" or \"seq\", got: ") << kind;
+
+  if (getLatency() < 0)
+    return emitOpError("latency must be non-negative");
+  if (kind == "comb") {
+    if (getLatency() != 0)
+      return emitOpError("comb ext_module must have latency = 0, got: ")
+             << getLatency();
+    if (!getPure())
+      return emitOpError("comb ext_module must declare pure = true");
+    if (getClock() || getReset())
+      return emitOpError("comb ext_module must not declare clock/reset");
+  } else {
+    if (getLatency() < 1)
+      return emitOpError("seq ext_module must have latency >= 1");
+    if (!getClock() || !getReset())
+      return emitOpError("seq ext_module requires clock and reset port names");
+    if (getClock()->empty() || getReset()->empty())
+      return emitOpError("clock/reset port names must be non-empty");
+  }
+
+  // Port name attributes (if present) must match the signature arity.
+  FunctionType ft = getFunctionType();
+  if (auto names = getArgNames()) {
+    if (names->size() != ft.getNumInputs())
+      return emitOpError("arg_names arity must match input count: got ")
+             << names->size() << " expected " << ft.getNumInputs();
+  }
+  if (auto names = getResultNames()) {
+    if (names->size() != ft.getNumResults())
+      return emitOpError("result_names arity must match result count: got ")
+             << names->size() << " expected " << ft.getNumResults();
+  }
+  if (auto init = getInit()) {
+    if (init->size() != ft.getNumResults())
+      return emitOpError("init arity must match result count: got ")
+             << init->size() << " expected " << ft.getNumResults();
+  }
+  if (auto top = getVerilogTop()) {
+    if (top->empty())
+      return emitOpError("verilog_top must be non-empty when provided");
+  }
   return success();
 }
 

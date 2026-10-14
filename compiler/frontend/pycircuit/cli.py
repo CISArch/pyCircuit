@@ -178,6 +178,45 @@ def _collect_jit_params(build: Any, *, overrides: list[str]) -> dict[str, object
     return jit_params
 
 
+def _collect_ext_module_cpp_sources_multi(roots: list[Path]) -> list[Path]:
+    """Locate extmod.toml manifests under the given roots and return the
+    [backends.cpp] source files they reference (docs/external-modules.md)."""
+    import tomllib as _tomllib
+
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for manifest in sorted(root.rglob("*.toml")):
+            try:
+                with open(manifest, "rb") as f:
+                    data = _tomllib.load(f)
+            except Exception:
+                continue
+            backends = data.get("backends") or {}
+            cpp = backends.get("cpp") or {}
+            if str(cpp.get("type", "source")) != "source":
+                continue
+            for rel in cpp.get("files", []) or []:
+                p = (manifest.parent / str(rel)).resolve()
+                if not p.is_file():
+                    # Also accept paths relative to the example root (one level
+                    # above the manifest directory).
+                    p = (manifest.parent.parent / str(rel)).resolve()
+                if p.is_file() and p not in seen:
+                    seen.add(p)
+                    out.append(p)
+    return out
+
+
+def _propagate_ext_module_decls(circuit: Any, design: "Design") -> None:
+    """Move ext-module declarations registered on a Circuit onto the Design."""
+    decls = getattr(circuit, "_ext_module_decls", None)
+    if decls:
+        design._ext_module_decls = decls  # noqa: SLF001 - intentional extension point
+
+
 def _compile_to_design(build: Any, *, top_name: str, jit_params: dict[str, object]) -> Design:
     """Compile ``build`` to a :class:`Design` (JIT ``@module`` or eager V5 cycle-aware)."""
     if _is_cycle_aware_entrypoint(build):
@@ -186,10 +225,12 @@ def _compile_to_design(build: Any, *, top_name: str, jit_params: dict[str, objec
         circuit = compile_cycle_aware(build, name=top_name, eager=True, hierarchical=True, **jit_params)
         existing = getattr(circuit, "_v5_design", None)
         if isinstance(existing, Design):
+            _propagate_ext_module_decls(circuit, existing)
             return existing
         cm = _make_compiled_module(build, circuit, top_name)
         design = Design(top=top_name)
         design.add(cm)
+        _propagate_ext_module_decls(circuit, design)
         return design
     try:
         design_obj = compile(build, name=top_name, **jit_params)
@@ -2570,6 +2611,16 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "cxx_standard": "c++17",
             "profile": str(args.profile),
         }
+        # External-module user sources (docs/external-modules.md): discover
+        # extmod.toml manifests registered with the design and append the
+        # [backends.cpp] source files to the simulator link.
+        ext_roots = [out_dir]
+        tb_arg = getattr(args, "python_file", None)
+        if tb_arg:
+            ext_roots.append(Path(str(tb_arg)).resolve().parent)
+        ext_cpp_sources = _collect_ext_module_cpp_sources_multi(ext_roots)
+        if ext_cpp_sources:
+            build_manifest["ext_sources"] = [str(p) for p in ext_cpp_sources]
         if args.cpp_pch:
             # Collect device hpp headers flagged for PCH across all module manifests.
             seen: set[str] = set()

@@ -1,0 +1,44 @@
+{
+  "build_flags": {
+    "frontend_contract": "pycircuit",
+    "hierarchy_policy": "strict",
+    "inline_policy": "off",
+    "logic_depth": 32,
+    "profile": "release",
+    "pycc": "/home/ldz/pycircuit-workspace/pyCircuit-ext-module/.pycircuit_out/toolchain/build/bin/pycc",
+    "pycc_build_profile": "release",
+    "target": "cpp",
+    "tb_schedule_mode": "inline"
+  },
+  "build_flags_hash": "2d132a0896f7281f875bf6273800af4272611ce17a4a7c0e6ba3d882a0360e69",
+  "cpp_build_flags": {
+    "cpp_pch": false,
+    "frontend_contract": "pycircuit",
+    "hierarchy_policy": "strict",
+    "inline_policy": "off",
+    "logic_depth": 32,
+    "profile": "release",
+    "pycc": "/home/ldz/pycircuit-workspace/pyCircuit-ext-module/.pycircuit_out/toolchain/build/bin/pycc",
+    "pycc_build_profile": "release",
+    "target": "cpp",
+    "tb_schedule_mode": "inline"
+  },
+  "cpp_build_flags_hash": "9394b93253a8762c202ad8072c45e74a1224319d4f1b78bd2ff75a150ed23b51",
+  "jit_cache_inputs": {
+    "deps_hash": "eb2128fad67522af0911b9a567bfa8c555f0f0a61004076a29f716196314b9ef",
+    "entry_hash": "5efca36e829d20c999e54edb1a480c1bcd90222fb999cd2e609838a7c84b73e2",
+    "frontend_contract": "pycircuit",
+    "jit_params_json": "{}",
+    "top_name": "ext_dct8_top",
+    "version": 1
+  },
+  "jit_cache_key": "7550bb29e19c3d7b46a993630413732d2712e14daa584e5b975985ee645595d3",
+  "last_pycc_jobs": 2,
+  "module_hashes": {
+    "__design_pyc": "25337b2dcc47fe562a534835fe2e19e2d0057321a9f4f36399c6025a552eb954",
+    "cpp:ext_dct8_top": "3eadf87b3f4a4f6b761ed119cde84c1e7698b0ab3dd5d4e28b3750827d6f9228",
+    "tb:tb_ext_dct8_top": "dc3b7d9d6a39e3574d496e22a594c54b8605ef00d09e5a8e9fd32d3ae2cf7fbc",
+    "verilog:ext_dct8_top": "033ddbfe961db2d5197a2d5d2f0eb066c688753a8b9351dc39402bd56b0f85ea"
+  },
+  "pycc": "/home/ldz/pycircuit-workspace/pyCircuit-ext-module/.pycircuit_out/toolchain/build/bin/pycc"
+}

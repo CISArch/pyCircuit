@@ -969,8 +969,11 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
       if (!calleeAttr)
         return inst.emitError("missing required FlatSymbolRefAttr `callee`");
       auto callee = module.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
-      if (!callee)
-        return inst.emitError("callee symbol not found: ") << calleeAttr.getValue();
+      if (!callee) {
+        // External black-box callees (docs/external-modules.md) carry no body;
+        // skip them in the TB payload probe walk.
+        continue;
+      }
       std::string seg = nameAttr.getValue().str();
       if (auto shortAttr = inst->getAttrOfType<StringAttr>("short_name"))
         seg = shortAttr.getValue().str();
@@ -1309,6 +1312,7 @@ struct SplitMethodDef {
 
 struct SplitModuleResult {
   std::string headerBody;
+  std::string prelude;
   std::vector<SplitMethodDef> methods;
 };
 
@@ -1833,6 +1837,10 @@ static std::optional<SplitModuleResult> splitEmittedModule(llvm::StringRef emitt
 
   llvm::StringRef body = emitted.substr(open + 1, close - open - 1);
   SplitModuleResult out;
+  // Preserve file-scope text before the struct (e.g. extern "C" ABI
+  // declarations for external modules, docs/external-modules.md) so it lands
+  // in the split header ahead of the namespace.
+  out.prelude = emitted.substr(0, structPos).str();
   out.headerBody.reserve(body.size() / 2);
   out.headerBody.append("struct ");
   out.headerBody.append(structName.str());
@@ -2967,6 +2975,10 @@ int main(int argc, char **argv) {
           auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
           if (!calleeAttr)
             return;
+          // External black-box callees have no generated child header
+          // (docs/external-modules.md); do not emit an include for them.
+          if (module->lookupSymbol<pyc::ExtModuleOp>(calleeAttr.getValue()))
+            return;
           v.push_back(calleeAttr.getValue().str());
         });
         std::sort(v.begin(), v.end());
@@ -2996,6 +3008,7 @@ int main(int argc, char **argv) {
         os << "#include <type_traits>\n";
         os << "#include <cpp/pyc_sim.hpp>\n";
         os << "#include <cpp/pyc_change_scheduler.hpp>\n";
+        os << "#include <cpp/pyc_ext.hpp>\n";
       };
 
       auto writeSourcePreamble = [&](llvm::raw_ostream &os, llvm::StringRef headerName) {
@@ -3040,6 +3053,8 @@ int main(int argc, char **argv) {
           writeHeaderPreamble(hos, moduleName);
           for (const std::string &dep : deps[f.getSymName()])
             hos << "#include \"" << dep << ".hpp\"\n";
+          if (!split->prelude.empty())
+            hos << "\n" << split->prelude << "\n";
           hos << "\nnamespace pyc::gen {\n\n";
           hos << split->headerBody << "\n";
           hos << "} // namespace pyc::gen\n";

@@ -1,0 +1,62 @@
+{
+  "instance_path_policy": {
+    "keep_head": 2,
+    "keep_tail": 2,
+    "max_chars": 240,
+    "max_segments": 16
+  },
+  "probe_count": 4,
+  "probes": [
+    {
+      "canonical_path": "dut:clk",
+      "dir": "in",
+      "field_path": "clk",
+      "instance_path": "dut",
+      "kind": "comb",
+      "module": "ext_dct8_top",
+      "probe_id": "0xb2184687eb83a51f",
+      "subkind": "wire",
+      "ty": "!pyc.clock",
+      "width_bits": 1
+    },
+    {
+      "canonical_path": "dut:rst",
+      "dir": "in",
+      "field_path": "rst",
+      "instance_path": "dut",
+      "kind": "comb",
+      "module": "ext_dct8_top",
+      "probe_id": "0xc146efb69bee1b8c",
+      "subkind": "wire",
+      "ty": "!pyc.reset",
+      "width_bits": 1
+    },
+    {
+      "canonical_path": "dut:x",
+      "dir": "in",
+      "field_path": "x",
+      "instance_path": "dut",
+      "kind": "comb",
+      "module": "ext_dct8_top",
+      "probe_id": "0x29d0b0c4b9e26188",
+      "subkind": "wire",
+      "ty": "i64",
+      "width_bits": 64
+    },
+    {
+      "canonical_path": "dut:y",
+      "dir": "out",
+      "field_path": "y",
+      "instance_path": "dut",
+      "kind": "comb",
+      "module": "ext_dct8_top",
+      "probe_id": "0x2a24f40a4334066a",
+      "subkind": "wire",
+      "ty": "i64",
+      "width_bits": 64
+    }
+  ],
+  "root_instance": "dut",
+  "top": "ext_dct8_top",
+  "version": 3
+}
