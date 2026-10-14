@@ -92,6 +92,21 @@ public:
     return true;
   }
 
+  // Bulk wake: OR a precomputed (word, mask) pair in one store. Generated
+  // simulators emit these pairs as compile-time constants so a whole fanout
+  // group collapses to one load+or+store instead of a mark loop.
+  void markWordUnchecked(std::size_t word, std::uint64_t mask) noexcept {
+    assert(word < kWords && "dirty word index exceeds fixed capacity");
+    words_[word] |= mask;
+  }
+
+  // True when no rank in [word*64, word*64+64) is dirty. Generated guard
+  // groups test this once to skip up to 64 per-comb checks.
+  bool wordClean(std::size_t word) const noexcept {
+    assert(word < kWords && "dirty word index exceeds fixed capacity");
+    return words_[word] == 0;
+  }
+
   std::size_t count() const noexcept {
     std::size_t total = 0;
     for (std::uint64_t word : words_) {
