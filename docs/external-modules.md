@@ -11,7 +11,6 @@ pyCircuit 的编译、优化与双后端仿真链路。IR 中外部模块以 `py
 ```toml
 [module]
 name = "ext_dct8"        # 全局唯一符号名（不得与任何 func 同名；也是用户 C++ 类名）
-verilog_top = "dct8"     # 可选：Verilog module 名（默认 = name）
 
 [[ports]]                # 顺序即端口顺序；name/dir/width 必填
 name = "in"
@@ -30,6 +29,7 @@ width = 64
 
 [backends.verilog]       # Verilog/Verilator 后端
 files = ["ext/dct8.v"]   # 相对示例根目录
+top = "dct8"             # 可选：Verilog module 名（默认 = name）
 
 [backends.cpp]           # C++ 后端
 type = "source"          # source（推荐）：源文件直接进仿真器链接
@@ -41,14 +41,13 @@ header = "ext_dct8.hpp"  # 用户类：端口成员 + eval()（见 §1.3）
 
 ```mlir
 pyc.ext_module @ext_dct8 {function_type = (i64, i1) -> (i64),
-    verilog_top = "dct8",
     arg_names = ["in", "valid"], result_names = ["out"]} : (i64, i1) -> (i64)
 
 %y = pyc.instance %x, %v {callee = @ext_dct8, name = "u_dct"} : (i64, i1) -> i64
 ```
 
 Verifier 约束（gate-first，`PYCOps.cpp`）：
-- `arg_names`/`result_names` 与签名 arity 匹配；`verilog_top` 非空（如给）。
+- `arg_names`/`result_names` 与签名 arity 匹配。
 - `pyc.instance` callee 可指向 `func.func` 或 `pyc.ext_module`，类型必须一致。
 
 ### 1.3 C++ 类绑定（`runtime/cpp/pyc_ext.hpp`）
@@ -81,7 +80,7 @@ struct ext_dct8 {                       // 类名 = module name
   走内部 instance 同款路径：`u_dct->in = x; u_dct->eval();`——全部计算来自
   用户代码，黑盒语义体现为编译器从不打开类体。
 - **Verilog**：`pyc.instance`→ext 符号发射为 Verilog 实例化（模块名 =
-  `verilog_top`，端口按 `arg_names`/`result_names` 绑定）；用户 `.v` 文件
+  `[backends.verilog].top`（默认 = name），端口按 `arg_names`/`result_names` 绑定）；用户 `.v` 文件
   加入 Verilator 源列表（`verilator_manifest.json`）。
 
 ## 3. 调度语义

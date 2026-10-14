@@ -2,7 +2,6 @@
 # lane_u = sum(byte[x] * (u+1)) truncated to 16 bits; out packs lanes 0..3.
 [module]
 name = "ext_dct8"
-verilog_top = "dct8"
 
 [[ports]]
 name = "in"
@@ -21,6 +20,7 @@ width = 64
 
 [backends.verilog]
 files = ["dct8.v"]
+top = "dct8"
 
 [backends.cpp]
 type = "source"

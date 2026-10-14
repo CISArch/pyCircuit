@@ -4,7 +4,6 @@ A user model is described by an ``extmod.toml`` manifest:
 
     [module]
     name = "ext_dct8"        # symbol name; also the user C++ class name
-    verilog_top = "dct8"     # optional: Verilog module name (default: name)
 
     [[ports]]
     name = "in"
@@ -76,7 +75,6 @@ def parse_manifest(path: str | Path) -> ExtModuleDecl:
     name = str(mod.get("name", "")).strip()
     if not name:
         raise DesignError(f"{p}: [module] name must be non-empty")
-    verilog_top = mod.get("verilog_top")
 
     raw_ports = raw.get("ports")
     if not isinstance(raw_ports, list) or not raw_ports:
@@ -96,10 +94,14 @@ def parse_manifest(path: str | Path) -> ExtModuleDecl:
         seen.add(pname)
         ports.append(ExtPort(name=pname, dir=pdir, width=pwidth))
 
+    backends = raw.get("backends") or {}
+    verilog = backends.get("verilog") or {}
+    verilog_top = verilog.get("top") or name
+
     return ExtModuleDecl(
         name=name,
         ports=tuple(ports),
-        verilog_top=str(verilog_top).strip() if verilog_top else None,
+        verilog_top=str(verilog_top).strip(),
     )
 
 
