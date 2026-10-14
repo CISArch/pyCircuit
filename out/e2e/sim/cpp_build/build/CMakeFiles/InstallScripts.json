@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/ldz/pycircuit-workspace/pyCircuit-ext-module/out/e2e/sim/cpp_build/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
