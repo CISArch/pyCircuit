@@ -1142,14 +1142,26 @@ static void emitMetadataCombFanout(
   llvm::sort(fanouts);
   if (fanouts.empty())
     return;
+  // Emit fanout wake as per-word OR masks instead of a mark loop: each group
+  // of up to 64 combs sharing a dirty word collapses to one store.
+  llvm::SmallVector<std::pair<unsigned, uint64_t>> wordMasks;
+  for (unsigned fanout : fanouts) {
+    unsigned word = fanout / 64;
+    uint64_t mask = uint64_t{1} << (fanout % 64);
+    if (!wordMasks.empty() && wordMasks.back().first == word)
+      wordMasks.back().second |= mask;
+    else
+      wordMasks.emplace_back(word, mask);
+  }
   std::string fanoutName = "_pyc_direct_fanout_" + sanitizeId(nt.get(value));
-  os << indent << "static constexpr std::array<unsigned, " << fanouts.size()
-     << "> " << fanoutName << "{{";
-  llvm::interleaveComma(fanouts, os,
-                        [&](unsigned fanout) { os << fanout << "u"; });
+  os << indent << "static constexpr std::array<std::pair<unsigned, std::uint64_t>, "
+     << wordMasks.size() << "> " << fanoutName << "{{";
+  llvm::interleaveComma(wordMasks, os, [&](const auto &wm) {
+    os << "{" << wm.first << "u, 0x" << llvm::utohexstr(wm.second) << "ull}";
+  });
   os << "}};\n";
-  os << indent << "for (unsigned _pyc_consumer : " << fanoutName << ")\n";
-  os << indent << "  _pyc_mark_comb_dirty(_pyc_consumer);\n";
+  os << indent << "for (const auto &[_pyc_w, _pyc_m] : " << fanoutName << ")\n";
+  os << indent << "  _pyc_comb_dirty.markWordUnchecked(_pyc_w, _pyc_m);\n";
 }
 
 static bool isDirtyDrivenInput(Value input) {
@@ -2513,6 +2525,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // Note: The IR is allowed to have "late" pyc.assign ops (e.g. queue wrappers
   // that defer wiring). To keep C++ simulation correct, eval() runs a small
   // fixed-point iteration that alternates comb evaluation and primitive eval.
+  //
+  // Guard grouping: consecutive guarded combs that share one 64-bit dirty
+  // word are wrapped in a single wordClean(word) probe; when the whole word is
+  // clean one load+branch skips up to 64 per-comb checks.
   os << "  inline void eval_comb_pass() {\n";
   llvm::SmallVector<Operation *> ordered;
   if (!topoOrder(/*includePrims=*/false, ordered)) {
@@ -2523,21 +2539,66 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
   }
 
+  unsigned openGuardWord = ~0u;
+  auto closeGuardGroup = [&]() {
+    if (openGuardWord != ~0u) {
+      os << "    }\n";
+      openGuardWord = ~0u;
+    }
+  };
+
+  // A wordClean group pays off only when it can skip checks for several
+  // combs. In the per-comb dispatch most guarded combs are interleaved with
+  // plain wire ops, so only runs of >= 2 consecutive same-word guarded combs
+  // are wrapped; a singleton group would add a load+branch on the hot path.
+  llvm::SmallVector<int64_t> combGuardWordOf;
+  combGuardWordOf.reserve(ordered.size());
   for (Operation *op : ordered) {
+    int64_t word = -1;
+    if (auto comb = dyn_cast<pyc::CombOp>(*op))
+      if (!hasDirtyPolledBoundaryInput(comb))
+        word = combIndex.lookup(comb.getOperation()) / 64;
+    combGuardWordOf.push_back(word);
+  }
+  llvm::SmallVector<bool> runMember(ordered.size(), false);
+  for (unsigned i = 0; i + 1 < ordered.size(); ++i)
+    if (combGuardWordOf[i] >= 0 && combGuardWordOf[i] == combGuardWordOf[i + 1])
+      runMember[i] = runMember[i + 1] = true;
+
+  unsigned opIdx = 0;
+  for (Operation *op : ordered) {
+    if (!runMember[opIdx])
+      closeGuardGroup();
     if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
+      closeGuardGroup();
       os << "    " << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
+      ++opIdx;
       continue;
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
       unsigned index = combIndex.lookup(comb.getOperation());
       if (!hasDirtyPolledBoundaryInput(comb)) {
-        os << "    if (_pyc_comb_is_active(" << index << "u)) {\n";
-        os << "      eval_comb_" << index << "();\n";
-        os << "    }\n";
+        if (runMember[opIdx]) {
+          unsigned guardWord = index / 64;
+          if (openGuardWord != guardWord) {
+            closeGuardGroup();
+            os << "    if (!_pyc_comb_dirty.wordClean(" << guardWord
+               << "u)) {\n";
+            openGuardWord = guardWord;
+          }
+          os << "      if (_pyc_comb_is_active(" << index << "u)) {\n";
+          os << "        eval_comb_" << index << "();\n";
+          os << "      }\n";
+        } else {
+          os << "    if (_pyc_comb_is_active(" << index << "u)) {\n";
+          os << "      eval_comb_" << index << "();\n";
+          os << "    }\n";
+        }
       } else {
-        os << "    ";
-        os << "eval_comb_" << index << "();\n";
+        closeGuardGroup();
+        os << "    eval_comb_" << index << "();\n";
       }
+      ++opIdx;
       continue;
     }
     if (auto a = dyn_cast<pyc::AssertOp>(*op)) {
@@ -2546,6 +2607,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         msg = m.getValue().str();
       os << "    if (!" << nt.get(a.getCond()) << ".toBool()) { std::cerr << " << cppStringLiteral(msg)
          << " << \"\\n\"; std::abort(); }\n";
+      ++opIdx;
       continue;
     }
     if (isa<arith::ConstantOp,
@@ -2587,8 +2649,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             pyc::VAndReduceOp,
             pyc::VAddReduceOp,
             arith::SelectOp>(*op)) {
+      // Plain wire computation must run every pass: it feeds outputs, polled
+      // combs, and downstream combs regardless of dirty state, so it must
+      // never sit inside a wordClean guard group.
+      closeGuardGroup();
       if (failed(emitCombAssign(*op, os, nt)))
         return failure();
+      ++opIdx;
       continue;
     }
     if (isa<pyc::FifoOp,
@@ -2601,12 +2668,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             pyc::RegOp,
             pyc::DelayLineOp>(*op)) {
       // Primitives are evaluated in eval(), and regs only tick.
+      ++opIdx;
       continue;
     }
-    if (isa<func::ReturnOp, pyc::WireOp>(*op))
+    if (isa<func::ReturnOp, pyc::WireOp>(*op)) {
+      ++opIdx;
       continue;
+    }
+    closeGuardGroup();
+    ++opIdx;
     return op->emitError("unsupported op for C++ emission: ") << op->getName();
   }
+  closeGuardGroup();
   os << "  }\n\n";
 
   llvm::SmallVector<Operation *> fullOrdered;
@@ -2994,8 +3067,51 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     emitPrimitiveOutputWake(outputs, indent, outputSnapshot);
   };
 
+  // Guard-group state for one emitted eval function: consecutive guarded
+  // combs sharing one 64-bit dirty word share a single wordClean probe.
+  struct CombGuardGroupState {
+    unsigned openGuardWord = ~0u;
+  };
+  auto closeCombGuardGroup = [&](CombGuardGroupState &state, llvm::StringRef indent) {
+    if (state.openGuardWord != ~0u) {
+      os << indent << "}\n";
+      state.openGuardWord = ~0u;
+    }
+  };
+
+  // A wordClean group pays off only when it can skip checks for several
+  // combs (see eval_comb_pass above). Runs are computed on the exact emitted
+  // sequence so a group never degenerates to a single member.
+  auto buildCombRunMember = [&](llvm::ArrayRef<Operation *> ops, unsigned begin,
+                                unsigned end) -> llvm::DenseMap<Operation *, bool> {
+    llvm::DenseMap<Operation *, bool> member;
+    llvm::SmallVector<int64_t> words(end - begin, -1);
+    for (unsigned i = begin; i < end; ++i) {
+      int64_t word = -1;
+      if (auto comb = dyn_cast<pyc::CombOp>(ops[i]))
+        if (!hasDirtyPolledBoundaryInput(comb))
+          word = combIndex.lookup(comb.getOperation()) / 64;
+      words[i - begin] = word;
+    }
+    for (unsigned i = 0; i + 1 < words.size(); ++i)
+      if (words[i] >= 0 && words[i] == words[i + 1]) {
+        member[ops[begin + i]] = true;
+        member[ops[begin + i + 1]] = true;
+      }
+    return member;
+  };
+
   auto emitEvalNode =
-      [&](Operation *op, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) -> LogicalResult {
+      [&](Operation *op, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef(),
+          CombGuardGroupState *guard = nullptr,
+          const llvm::DenseMap<Operation *, bool> *runMember = nullptr) -> LogicalResult {
+    if (guard) {
+      bool inRun = false;
+      if (auto c = dyn_cast<pyc::CombOp>(*op))
+        inRun = !hasDirtyPolledBoundaryInput(c) && runMember && runMember->lookup(op);
+      if (!inRun)
+        closeCombGuardGroup(*guard, indent);
+    }
     if (auto fifo = dyn_cast<pyc::FifoOp>(*op)) {
       emitFifoEvalWithCache(fifo, indent, changedAnyVar);
       return success();
@@ -3031,9 +3147,22 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
       unsigned index = combIndex.lookup(comb.getOperation());
       if (!hasDirtyPolledBoundaryInput(comb)) {
-        os << indent << "if (_pyc_comb_is_active(" << index << "u)) {\n";
-        os << indent << "  eval_comb_" << index << "();\n";
-        os << indent << "}\n";
+        if (guard && runMember && runMember->lookup(op)) {
+          unsigned guardWord = index / 64;
+          if (guard->openGuardWord != guardWord) {
+            closeCombGuardGroup(*guard, indent);
+            os << indent << "if (!_pyc_comb_dirty.wordClean(" << guardWord
+               << "u)) {\n";
+            guard->openGuardWord = guardWord;
+          }
+          os << indent << "  if (_pyc_comb_is_active(" << index << "u)) {\n";
+          os << indent << "    eval_comb_" << index << "();\n";
+          os << indent << "  }\n";
+        } else {
+          os << indent << "if (_pyc_comb_is_active(" << index << "u)) {\n";
+          os << indent << "  eval_comb_" << index << "();\n";
+          os << indent << "}\n";
+        }
       } else {
         os << indent << "eval_comb_" << index << "();\n";
       }
@@ -3412,9 +3541,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         std::string methodName = "eval_topo_part_" + std::to_string(chunkIdx);
         topoEvalMethods.push_back(methodName);
         os << "  inline void " << methodName << "() {\n";
+        CombGuardGroupState topoGuard;
+        llvm::DenseMap<Operation *, bool> chunkRunMember = buildCombRunMember(fullOrdered, begin, end);
         for (unsigned i = begin; i < end; ++i)
-          if (failed(emitEvalNode(fullOrdered[i], "    ")))
+          if (failed(emitEvalNode(fullOrdered[i], "    ", llvm::StringRef(), &topoGuard, &chunkRunMember)))
             return failure();
+        closeCombGuardGroup(topoGuard, "    ");
         os << "  }\n\n";
       }
     }
@@ -3426,9 +3558,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       for (const std::string &methodName : topoEvalMethods)
         os << "    " << methodName << "();\n";
     } else {
+      CombGuardGroupState evalGuard;
+      llvm::DenseMap<Operation *, bool> evalRunMember = buildCombRunMember(fullOrdered, 0, fullOrdered.size());
       for (Operation *op : fullOrdered)
-        if (failed(emitEvalNode(op, "    ")))
+        if (failed(emitEvalNode(op, "    ", llvm::StringRef(), &evalGuard, &evalRunMember)))
           return failure();
+      closeCombGuardGroup(evalGuard, "    ");
     }
   } else {
     os << "    eval_comb_pass();\n";
@@ -3885,6 +4020,7 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   os << "#include <memory>\n";
   os << "#include <string>\n";
   os << "#include <type_traits>\n";
+  os << "#include <utility>\n";
   os << "#include <cpp/pyc_sim.hpp>\n";
   os << "#include <cpp/pyc_change_scheduler.hpp>\n\n";
   os << "namespace pyc::gen {\n\n";
