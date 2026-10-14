@@ -17,6 +17,7 @@
 // degrade to no-ops when the user class does not provide them (C++17).
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <type_traits>
 
@@ -66,10 +67,18 @@ struct has_probe<T, R, P,
                      std::declval<R &>(), std::declval<const std::string &>()))>>
     : std::true_type {};
 
+// Generated call sites pass the child member as-is, which is either the
+// class instance or a unique_ptr to it; unwrap smart pointers here so the
+// capability traits always inspect the user class itself.
+template <typename T>
+inline T &ext_deref(T &child) { return child; }
+template <typename T>
+inline T &ext_deref(std::unique_ptr<T> &child) { return *child; }
+
 template <typename T, typename TbT, typename EI, typename ES>
 inline void ext_trace_child(T &child, TbT &tb, const std::string &full, EI &&ei, ES &&es) {
-  trace_dispatch(child, tb, full, ei, es,
-                 has_trace<T, TbT, EI, ES>{});
+  using C = std::decay_t<decltype(ext_deref(child))>;
+  trace_dispatch(ext_deref(child), tb, full, ei, es, has_trace<C, TbT, EI, ES>{});
 }
 template <typename T, typename TbT, typename EI, typename ES>
 inline void trace_dispatch(T &child, TbT &tb, const std::string &full, EI &&ei, ES &&es,
@@ -81,7 +90,8 @@ inline void trace_dispatch(T &, TbT &, const std::string &, EI &&, ES &&, std::f
 
 template <typename T, typename R>
 inline void ext_register_child(T &child, R &reg, const std::string &prefix) {
-  probe_dispatch(child, reg, prefix, has_probe<T, R, std::string>{});
+  using C = std::decay_t<decltype(ext_deref(child))>;
+  probe_dispatch(ext_deref(child), reg, prefix, has_probe<C, R, std::string>{});
 }
 template <typename T, typename R>
 inline void probe_dispatch(T &child, R &reg, const std::string &prefix, std::true_type) {
