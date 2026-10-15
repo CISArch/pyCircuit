@@ -1188,41 +1188,24 @@ static void emitMetadataCombFanout(
   if (sourceIt == schedule.valueToNode.end())
     return;
 
-  unsigned sourcePartition = schedule.nodes[sourceIt->second].partition;
-
   llvm::SmallSet<unsigned, 8> uniqueFanouts;
   for (uint64_t targetId : schedule.nodes[sourceIt->second].fanout) {
     const EmissionScheduleNode &target = schedule.nodes[targetId];
     if (!isa<pyc::CombOp>(target.operation))
       continue;
-    // Same-partition consumers are evaluated inside the partition group, so
-    // re-marking them would only force a spurious extra pass.
-    if (target.partition == sourcePartition)
-      continue;
-    uniqueFanouts.insert(target.partition);
+    auto it = combIndices.find(target.operation);
+    if (it != combIndices.end())
+      uniqueFanouts.insert(it->second);
   }
   llvm::SmallVector<unsigned> fanouts(uniqueFanouts.begin(),
                                       uniqueFanouts.end());
   llvm::sort(fanouts);
   if (fanouts.empty())
     return;
-  // Group partition ids into 64-bit word masks: each distinct word becomes one
-  // markMaskUnchecked OR instead of a per-id read-modify-write loop. Small
-  // fanouts (<= 2 ids total) keep the simple scalar loop, which is cheaper
-  // than building and holding masks.
+  // Fanout wake as per-word OR masks over comb indices; one store per dirty
+  // word instead of N read-modify-write marks.
   constexpr std::size_t kFanoutWordBits = 64;
-  if (fanouts.size() <= 2) {
-    std::string fanoutName = "_pyc_direct_fanout_" + sanitizeId(nt.get(value));
-    os << indent << "static constexpr std::array<unsigned, " << fanouts.size()
-       << "> " << fanoutName << "{{";
-    llvm::interleaveComma(fanouts, os,
-                          [&](unsigned fanout) { os << fanout << "u"; });
-    os << "}};\n";
-    os << indent << "for (unsigned _pyc_consumer : " << fanoutName << ")\n";
-    os << indent << "  _pyc_mark_comb_dirty(_pyc_consumer);\n";
-    return;
-  }
-  std::string fanoutName = "_pyc_fanout_mask_" + sanitizeId(nt.get(value));
+  std::string fanoutName = "_pyc_direct_fanout_" + sanitizeId(nt.get(value));
   llvm::SmallVector<std::pair<unsigned, std::uint64_t>> wordMasks;
   for (unsigned fanout : fanouts) {
     unsigned word = fanout / kFanoutWordBits;
@@ -1235,12 +1218,11 @@ static void emitMetadataCombFanout(
   os << indent << "static constexpr std::array<std::pair<unsigned, std::uint64_t>, "
      << wordMasks.size() << "> " << fanoutName << "{{";
   llvm::interleaveComma(wordMasks, os, [&](const auto &wm) {
-    os << "{" << wm.first << "u, 0x"
-       << llvm::utohexstr(wm.second, /*LowerCase=*/true) << "ull}";
+    os << "{" << wm.first << "u, 0x" << llvm::utohexstr(wm.second) << "ull}";
   });
   os << "}};\n";
-  os << indent << "for (const auto &_pyc_wm : " << fanoutName << ")\n";
-  os << indent << "  _pyc_comb_dirty.markMaskUnchecked(_pyc_wm.first, _pyc_wm.second);\n";
+  os << indent << "for (const auto &[_pyc_w, _pyc_m] : " << fanoutName << ")\n";
+  os << indent << "  _pyc_comb_dirty.markMaskUnchecked(_pyc_w, _pyc_m);\n";
 }
 
 // True when the input is produced (possibly through a chain of pure
@@ -1275,33 +1257,28 @@ static bool hasDirtyPolledBoundaryInput(pyc::CombOp comb) {
   });
 }
 
-static void emitCombInputGuard(unsigned partition,
-                               ArrayRef<unsigned> memberIndices,
-                               MutableArrayRef<pyc::CombOp> members,
-                               llvm::raw_ostream &os, NameTable &nt) {
-  os << "    bool _pyc_comb_should_eval = _pyc_comb_take_active(" << partition
+static void emitCombInputGuard(pyc::CombOp comb, llvm::raw_ostream &os,
+                               NameTable &nt, unsigned idx) {
+  os << "    bool _pyc_comb_should_eval = _pyc_comb_take_active(" << idx
      << "u);\n";
-  os << "    bool _pyc_comb_inputs_changed = !_pyc_part_" << partition
+  os << "    bool _pyc_comb_inputs_changed = !_pyc_comb_" << idx
      << "_inputs_valid;\n";
-  for (auto [memberPos, comb] : llvm::enumerate(members)) {
-    unsigned idx = memberIndices[memberPos];
-    for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
-      if (isDirtyDrivenInput(input))
-        continue;
-      std::string cacheName = "_pyc_comb_" + std::to_string(idx) + "_input_" +
-                              std::to_string(inputIndex);
-      os << "    if (" << cacheName << " != " << nt.get(input) << ") {\n";
-      os << "      " << cacheName << " = " << nt.get(input) << ";\n";
-      os << "      _pyc_comb_inputs_changed = true;\n";
-      os << "    }\n";
-    }
+  for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
+    if (isDirtyDrivenInput(input))
+      continue;
+    std::string cacheName = "_pyc_comb_" + std::to_string(idx) + "_input_" +
+                            std::to_string(inputIndex);
+    os << "    if (" << cacheName << " != " << nt.get(input) << ") {\n";
+    os << "      " << cacheName << " = " << nt.get(input) << ";\n";
+    os << "      _pyc_comb_inputs_changed = true;\n";
+    os << "    }\n";
   }
   os << "    _pyc_comb_inputs_changed = _pyc_comb_inputs_changed || "
         "_pyc_comb_should_eval;\n";
   os << "    if (!_pyc_comb_inputs_changed) {\n";
   os << "      return;\n";
   os << "    }\n";
-  os << "    _pyc_part_" << partition << "_inputs_valid = true;\n";
+  os << "    _pyc_comb_" << idx << "_inputs_valid = true;\n";
 }
 
 static void emitCombResultPublish(
@@ -1435,8 +1412,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                               const ObservationPlans &probePlans) {
   NameTable nt;
 
-  if (failed(rejectMultipleWireDrivers(f)))
-    return failure();
 
   if (!llvm::hasSingleElement(f.getBody()))
     return f.emitError("C++ emitter currently supports single-block functions only");
@@ -1772,11 +1747,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 
   // Change-driven inputs use producer activity; external boundaries are polled.
   if (!combs.empty()) {
-    os << "  // Per-partition validity flags and per-comb input snapshots for"
-       << " change-driven evaluation.\n";
-    for (unsigned part = 0; part < schedule->partitionCount; ++part)
-      os << "  bool _pyc_part_" << part << "_inputs_valid = false;\n";
+    os << "  // Per-comb validity flags and input snapshots for change-driven"
+       << " evaluation.\n";
     for (auto [index, comb] : llvm::enumerate(combs)) {
+      os << "  bool _pyc_comb_" << index << "_inputs_valid = false;\n";
       for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
         if (isDirtyDrivenInput(input))
           continue;
@@ -1788,8 +1762,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
 
   if (!combs.empty()) {
-    os << "  // Runtime-owned local fused-comb dirty set (comb partitions).\n";
-    os << "  pyc::cpp::DirtyBitset<" << schedule->partitionCount
+    os << "  // Runtime-owned local fused-comb dirty set (per-comb ids).\n";
+    os << "  pyc::cpp::DirtyBitset<" << combs.size()
        << "> _pyc_comb_dirty{};\n";
     os << "  inline bool _pyc_comb_take_active(unsigned id) {\n";
     os << "    return _pyc_comb_dirty.takeUnchecked(id);\n";
@@ -2652,8 +2626,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << " {\n";
   if (!combs.empty()) {
-    os << "    for (unsigned _pyc_id = 0; _pyc_id < "
-       << schedule->partitionCount << "u; ++_pyc_id)\n";
+    os << "    for (unsigned _pyc_id = 0; _pyc_id < " << combs.size()
+       << "u; ++_pyc_id)\n";
     os << "      _pyc_comb_dirty.mark(_pyc_id);\n";
   }
   for (auto r : regs) {
@@ -2874,25 +2848,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     return true;
   };
 
-  // Comb partition dispatch tables: only the first member of a partition (in
-  // slot order) calls the partition group method; partitions containing any
-  // polled boundary input are always probed (their guard compares snapshots).
-  llvm::SmallVector<unsigned> combPartitionOf(combs.size(), 0u);
-  llvm::SmallVector<unsigned> partitionFirst(schedule->partitionCount, ~0u);
-  llvm::SmallVector<char> partitionPolled(schedule->partitionCount, 0);
-  for (auto [i, comb] : llvm::enumerate(combs)) {
-    auto nodeIt = schedule->valueToNode.find(comb.getResult(0));
-    if (nodeIt == schedule->valueToNode.end())
-      return comb.emitError(
-          "C++ emitter cannot map comb to a schedule node for partitioning");
-    unsigned part = schedule->nodes[nodeIt->second].partition;
-    combPartitionOf[i] = part;
-    if (partitionFirst[part] == ~0u)
-      partitionFirst[part] = static_cast<unsigned>(i);
-    if (hasDirtyPolledBoundaryInput(comb))
-      partitionPolled[part] = 1;
-  }
-
   // eval_comb_pass(): evaluate all combinational ops/assigns.
   //
   // Note: The IR is allowed to have "late" pyc.assign ops (e.g. queue wrappers
@@ -2915,15 +2870,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
       unsigned index = combIndex.lookup(comb.getOperation());
-      unsigned part = combPartitionOf[index];
-      if (index == partitionFirst[part]) {
-        if (!partitionPolled[part]) {
-          os << "    if (_pyc_comb_is_active(" << part << "u)) {\n";
-          os << "      eval_comb_part_" << part << "();\n";
-          os << "    }\n";
-        } else {
-          os << "    eval_comb_part_" << part << "();\n";
-        }
+      if (!hasDirtyPolledBoundaryInput(comb)) {
+        os << "    if (_pyc_comb_is_active(" << index << "u)) {\n";
+        os << "      eval_comb_" << index << "();\n";
+        os << "    }\n";
+      } else {
+        os << "    eval_comb_" << index << "();\n";
       }
       continue;
     }
@@ -3417,15 +3369,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
       unsigned index = combIndex.lookup(comb.getOperation());
-      unsigned part = combPartitionOf[index];
-      if (index != partitionFirst[part])
-        return success();
-      if (!partitionPolled[part]) {
-        os << indent << "if (_pyc_comb_is_active(" << part << "u)) {\n";
-        os << indent << "  eval_comb_part_" << part << "();\n";
+      if (!hasDirtyPolledBoundaryInput(comb)) {
+        os << indent << "if (_pyc_comb_is_active(" << index << "u)) {\n";
+        os << indent << "  eval_comb_" << index << "();\n";
         os << indent << "}\n";
       } else {
-        os << indent << "eval_comb_part_" << part << "();\n";
+        os << indent << "eval_comb_" << index << "();\n";
       }
       return success();
     }
