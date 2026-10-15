@@ -255,3 +255,8 @@ designs/outerCube/
 # gate outputs
 docs/gates
 
+
+# local A/B artifacts (fall-commit-gate)
+.cppircuit_out/
+.local-bin/
+cpp-ab/

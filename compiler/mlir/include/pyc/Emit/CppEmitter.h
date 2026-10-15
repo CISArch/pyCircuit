@@ -83,6 +83,14 @@ struct CppEmitterOptions {
   // per-register negedge_update() sweep. Only valid when every register uses
   // the same clock and commit() always consumes pending (tick-fuse mode).
   bool fuseNegedgeReset = false;
+  /// Gate the generated tick_commit's local reg/delay-line walk behind a
+  /// module-level `_pyc_commit_needed` flag. Modules on a single unique clock
+  /// (fastEdge) set it on rising/unchanged tick_compute and leave it clear on
+  /// a falling edge, where every local reg/delay-line already has pending==0
+  /// and the walk was provably a no-op. Sub-module recursion and clocked
+  /// fifo/mem/cdc primitives keep their unconditional tick_commit: they
+  /// maintain their own edge state. Off by default for A/B.
+  bool fallCommitGate = false;
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,
