@@ -113,7 +113,7 @@ grep -q '_pyc_change_schedule_rank{{0u, 1u, 1u, 2u, 0u}}' \
 grep -q '_pyc_change_schedule_slot{{0u, 1u, 2u, 3u, 4u}}' \
   "${dirty_cpp}"
 grep -q 'DirtyBitset<' "${dirty_cpp}"
-# Fanout wakes emit as (word, mask) pairs ORed through DirtyBitset::markWordUnchecked;
+# Fanout wakes emit as (word, mask) pairs ORed through DirtyBitset::markMaskUnchecked;
 # comb_1 fans out to combs {1, 2} = word 0, mask 0x6.
 grep -q 'std::array<std::pair<unsigned, std::uint64_t>, 1> _pyc_direct_fanout_.*{{0u, 0x6ull}}' \
   "${dirty_cpp}"
@@ -133,9 +133,11 @@ if grep -qE '_pyc_comb_[0-9]+_input_[0-9]+ != pyc_reg_[0-9]+_inst->q' "${state_c
   echo "::error title=comb-dirty::polls register Q" >&2
   exit 1
 fi
-grep -q '_pyc_commit_changed_pyc_reg_4_inst' "${state_cpp}"
-grep -q 'if (_pyc_commit_changed_pyc_reg_4_inst)' "${state_cpp}"
-grep -q '_pyc_comb_dirty.markWordUnchecked' "${state_cpp}"
+# SeqBank mode: the reg commits through the per-bank dirty bitmap and wakes
+# its comb fanout via markMaskUnchecked (per-reg _pyc_commit_changed_* path
+# only appears with --no-seq-bank).
+grep -q '_pyc_bank_dirty_.* = seq_bank_.*\.commit()' "${state_cpp}"
+grep -q '_pyc_comb_dirty.markMaskUnchecked' "${state_cpp}"
 "${CXX}" -std=c++17 -O0 \
   -I"${state_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
   "${STATE_DRIVER}" \
@@ -150,7 +152,7 @@ mkdir -p "${instance_dir}"
   -o "${instance_dir}/comb_dirty_instance.cpp" "${common[@]}"
 instance_cpp="${instance_dir}/comb_dirty_instance.cpp"
 grep -q '_pyc_direct_fanout_' "${instance_cpp}"
-grep -q '_pyc_comb_dirty.markWordUnchecked' "${instance_cpp}"
+grep -q '_pyc_comb_dirty.markMaskUnchecked' "${instance_cpp}"
 "${CXX}" -std=c++17 -O0 \
   -I"${instance_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
   "${INSTANCE_DRIVER}" -o "${OUT}/run_instance"
@@ -172,7 +174,7 @@ for required in \
   'kReadData0Changed' \
   'kReadData1Changed' \
   '_pyc_commit_changed_' \
-  '_pyc_comb_dirty.markWordUnchecked'; do
+  '_pyc_comb_dirty.markMaskUnchecked'; do
   if ! grep -q "${required}" "${primitive_cpp}"; then
     echo "fail: primitive dirty source missing ${required}" >&2
     exit 1
