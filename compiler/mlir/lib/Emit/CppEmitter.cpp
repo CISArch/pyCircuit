@@ -1771,8 +1771,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             regNext = pn.second;
           } else {
             regInst = nt.get(regQ->q) + "_inst->pending";
-            regNext = regQ->tap ? (nt.get(regQ->tap) + "_qNext")
-                                : (nt.get(regQ->q) + "_inst->qNext");
+            regNext = regQ->tap ? ("&" + nt.get(regQ->tap) + "_qNext")
+                                : ("&" + nt.get(regQ->q) + "_inst->qNext");
           }
         }
         namedProbes.push_back(NamedProbeInfo{
