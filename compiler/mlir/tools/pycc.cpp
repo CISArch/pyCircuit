@@ -2692,6 +2692,7 @@ int main(int argc, char **argv) {
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
+  pm.addNestedPass<func::FuncOp>(pyc::createShlChainFoldPass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
   // SeqBank partition runs after all state rewrites so banks cover the final

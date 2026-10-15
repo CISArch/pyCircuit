@@ -17,6 +17,7 @@ std::unique_ptr<::mlir::Pass> createCombCanonicalizePass();
 std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
+std::unique_ptr<::mlir::Pass> createShlChainFoldPass();
 std::unique_ptr<::mlir::Pass>
 createRetimePipelinesPass(unsigned maxStages = 0,
                           unsigned maxExtraCombOps = 32,
