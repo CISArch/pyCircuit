@@ -25,6 +25,12 @@ public:
     assert(rank < kCapacity && "dirty rank exceeds fixed capacity");
     if (rank >= kCapacity)
       return false;
+    return markUnchecked(rank);
+  }
+
+  // Hot-path mark without bounds checking. Generated simulators call this
+  // with compile-time-constant partition ids.
+  bool markUnchecked(std::size_t rank) noexcept {
     const std::size_t word = rank / kWordBits;
     const std::uint64_t mask = std::uint64_t{1} << (rank % kWordBits);
     const bool inserted = (words_[word] & mask) == 0;
@@ -48,6 +54,12 @@ public:
     assert(rank < kCapacity && "dirty rank exceeds fixed capacity");
     if (rank >= kCapacity)
       return false;
+    return testUnchecked(rank);
+  }
+
+  // Hot-path membership test without bounds checking; generated simulators
+  // query compile-time-constant partition ids.
+  bool testUnchecked(std::size_t rank) const noexcept {
     const std::size_t word = rank / kWordBits;
     const std::uint64_t mask = std::uint64_t{1} << (rank % kWordBits);
     return (words_[word] & mask) != 0;
@@ -58,6 +70,12 @@ public:
     assert(rank < kCapacity && "dirty rank exceeds fixed capacity");
     if (rank >= kCapacity)
       return false;
+    return takeUnchecked(rank);
+  }
+
+  // Hot-path remove without bounds checking; generated simulators pass
+  // compile-time-constant partition ids.
+  bool takeUnchecked(std::size_t rank) noexcept {
     const std::size_t word = rank / kWordBits;
     const std::uint64_t mask = std::uint64_t{1} << (rank % kWordBits);
     const bool present = (words_[word] & mask) != 0;
@@ -84,21 +102,6 @@ public:
         return false;
     }
     return true;
-  }
-
-  // Bulk wake: OR a precomputed (word, mask) pair in one store. Generated
-  // simulators emit these pairs as compile-time constants so a whole fanout
-  // group collapses to one load+or+store instead of a mark loop.
-  void markWordUnchecked(std::size_t word, std::uint64_t mask) noexcept {
-    assert(word < kWords && "dirty word index exceeds fixed capacity");
-    words_[word] |= mask;
-  }
-
-  // True when no rank in [word*64, word*64+64) is dirty. Generated guard
-  // groups test this once to skip up to 64 per-comb checks.
-  bool wordClean(std::size_t word) const noexcept {
-    assert(word < kWords && "dirty word index exceeds fixed capacity");
-    return words_[word] == 0;
   }
 
   std::size_t count() const noexcept {
