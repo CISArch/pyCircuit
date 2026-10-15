@@ -136,18 +136,6 @@ def _vcd_signal_changes(path: Path, signal_path: str) -> list[tuple[int, int]]:
     return list(changes.items())
 
 
-def _placement_summary(out_dir: Path) -> dict[str, int]:
-    manifest_path = (
-        out_dir
-        / "device"
-        / "cpp"
-        / "alias_name_check"
-        / "cpp_compile_manifest.json"
-    )
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    return manifest["profile_summary"]["cpp_placement"]
-
-
 def test_trace_config_named_alias_matches_cpp_and_verilator(
     tmp_path: Path,
 ) -> None:
@@ -303,7 +291,6 @@ def test_trace_config_named_alias_matches_cpp_and_verilator(
     ).read_text(encoding="utf-8")
     assert "Wire<8> debug_sum_alias{};" in cpp_header
     assert 'trace_port(debug_sum_alias, "debug_sum_alias");' in cpp_header
-    selected_placement = _placement_summary(selected_out)
     verilog_device = (
         selected_out
         / "device"
@@ -401,7 +388,6 @@ def test_trace_config_named_alias_matches_cpp_and_verilator(
         / "alias_name_check"
         / "alias_name_check.v"
     ).read_text(encoding="utf-8") == verilog_device
-    ports_only_placement = _placement_summary(selected_out)
 
     no_config_out = tmp_path / "no-config"
     _run_build(
@@ -423,16 +409,6 @@ def test_trace_config_named_alias_matches_cpp_and_verilator(
         / "alias_name_check.hpp"
     ).read_text(encoding="utf-8")
     assert "debug_sum_alias" not in no_config_header
-    no_config_placement = _placement_summary(no_config_out)
-    assert (
-        selected_placement["probe_pinned_struct"]
-        == no_config_placement["probe_pinned_struct"] + 1
-    )
-    assert (
-        ports_only_placement["probe_pinned_struct"]
-        == no_config_placement["probe_pinned_struct"]
-    )
-
     no_config_trace_dir = no_config_out / "cpp-traces"
     _run_cpp(no_config_out, no_config_trace_dir)
     no_config_vcd = (

@@ -90,7 +90,6 @@ add_library(pyc_transforms
   lib/Transforms/PackI1RegsPass.cpp
   lib/Transforms/PackStateLanesPass.cpp
   lib/Transforms/FuseCombPass.cpp
-  lib/Transforms/CppPlacementPass.cpp
   lib/Transforms/LowerSCFToPYCStaticPass.cpp
   lib/Transforms/PrunePortsPass.cpp
   lib/Transforms/RetimePipelinesPass.cpp
