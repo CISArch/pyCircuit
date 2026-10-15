@@ -5,7 +5,6 @@
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Dialect/PYC/PYCTypes.h"
 #include "pyc/Transforms/ChangeDrivenSchedule.h"
-#include "pyc/Transforms/CombPartition.h"
 #include "pyc/Transforms/StateOptimization.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -413,7 +412,7 @@ static FailureOr<EmissionSchedule> readEmissionSchedule(func::FuncOp func) {
   // every scheduled operation is its own partition (identity mode), which
   // reproduces the pre-partition dispatch exactly.
   auto partitionCountAttr = summary.getAs<IntegerAttr>(
-      kChangeSchedulePartitionCountKey);
+      llvm::StringLiteral("partition_count"));
   if (partitionCountAttr) {
     int64_t declared = partitionCountAttr.getInt();
     if (declared <= 0)
@@ -432,7 +431,7 @@ static FailureOr<EmissionSchedule> readEmissionSchedule(func::FuncOp func) {
       }
       auto attr =
           node.operation->getAttrOfType<IntegerAttr>(
-              kChangeSchedulePartitionAttr);
+              llvm::StringLiteral("pyc.change_schedule.partition"));
       if (!attr || attr.getInt() < 0 ||
           static_cast<uint64_t>(attr.getInt()) >= schedule.partitionCount)
         return node.operation->emitError(
