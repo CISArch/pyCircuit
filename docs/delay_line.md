@@ -51,8 +51,10 @@ b@4 ─────────────────────────�
 ```text
 --state-pack-width=192
 --state-retime-max-stages=0
---state-retime-max-extra-comb-ops=32
 ```
+
+retiming 不设组合规模预算：组合锥按合法性（纯白名单、无反馈、无锥外 fanout）整体
+接受，锥多大都收；最终 `--logic-depth` gate 是唯一的深度闸。
 
 等价状态合并会减少逻辑位数。delay line 和 lane packing 减少 C++ 里的状态对象数量，
 不减少逻辑位数，也不等于综合后的触发器数量。
@@ -167,9 +169,6 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 ```text
 --state-retime-max-stages=0
     单个 computed pipeline 的最大寄存器级数；0 表示不单独限制
-
---state-retime-max-extra-comb-ops=32
-    重建历史视图最多允许增加的组合 op 数
 
 --state-pack-width=192
     Stage 2 单个 packed storage 的默认最大宽度
@@ -551,7 +550,7 @@ history。中间值被模块输出、assert、组合 consumer，甚至另一寄�
 - 每级 init 可由前一级 init 位精确求值，且与原 consumer init 完全相同；
 - 被删除状态的 next 不反馈依赖候选内状态，也不通过未解析 wire 隐藏反馈；
 - 组合锥中间结果没有锥外 fanout；共同下沉的源状态没有其他使用；
-- 新 history bits 不增加，新增组合 op 数在预算内；
+- 新 history bits 不增加；
 - 外部可读身份改挂到 tap/线/留下的源 history，不改变可读值。
 
 `eq(0, 0)` 的新 init 会计算为 1，而不是机械沿用 0。动态 shift、截位和有符号比较也

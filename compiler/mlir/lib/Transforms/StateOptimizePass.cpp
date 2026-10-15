@@ -72,7 +72,6 @@ struct StateOptimizePass
     // not consume a state that has a more profitable global equivalent-state
     // or direct-chain rewrite.
     runRetimePipelines(function, tunables.retimeMaxStages,
-                       tunables.retimeMaxExtraCombOps,
                        /*accumulateStats=*/false);
     // Sinking moves consumer cones onto source.next, placing them in the
     // same combinational cone as the producers of next. The fusion win

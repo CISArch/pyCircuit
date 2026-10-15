@@ -640,8 +640,7 @@ static bool needsRebuiltView(PipelineRegion &region, unsigned index) {
   return false;
 }
 
-static bool finalizeRegion(PipelineRegion &region, unsigned maxExtraCombOps,
-                           RetimeStats &stats) {
+static bool finalizeRegion(PipelineRegion &region, RetimeStats &stats) {
   llvm::DenseSet<Value> stateValues;
   for (pyc::RegOp reg : region.regs)
     stateValues.insert(reg.getQ());
@@ -703,17 +702,12 @@ static bool finalizeRegion(PipelineRegion &region, unsigned maxExtraCombOps,
   }
   region.extraCombOps =
       std::max<int64_t>(0, region.clonedCombOps - region.uniqueCombOps);
-  if (region.extraCombOps > static_cast<int64_t>(maxExtraCombOps)) {
-    ++stats.blockedCost;
-    return false;
-  }
   return true;
 }
 
 static std::optional<PipelineRegion>
 findRegionFromTail(pyc::RegOp tail, const llvm::DenseSet<Operation *> &claimed,
-                   unsigned maxStages, unsigned maxExtraCombOps,
-                   RetimeStats &stats) {
+                   unsigned maxStages, RetimeStats &stats) {
   PipelineRegion region;
   llvm::SmallVector<pyc::RegOp> regsFromTail{tail};
   llvm::SmallVector<PipelineLink> linksFromTail;
@@ -750,7 +744,7 @@ findRegionFromTail(pyc::RegOp tail, const llvm::DenseSet<Operation *> &claimed,
 
   region.regs.assign(regsFromTail.rbegin(), regsFromTail.rend());
   region.links.assign(linksFromTail.rbegin(), linksFromTail.rend());
-  if (!finalizeRegion(region, maxExtraCombOps, stats))
+  if (!finalizeRegion(region, stats))
     return std::nullopt;
   return region;
 }
@@ -847,8 +841,7 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
   stats.stateBitsRemoved += region.stateBitsRemoved;
 }
 
-static RetimeStats runRetiming(func::FuncOp function, unsigned maxStages,
-                               unsigned maxExtraCombOps) {
+static RetimeStats runRetiming(func::FuncOp function, unsigned maxStages) {
   RetimeStats stats;
   runCommonDelaySinking(function, stats);
   llvm::SmallVector<pyc::RegOp> regs;
@@ -860,8 +853,7 @@ static RetimeStats runRetiming(func::FuncOp function, unsigned maxStages,
   llvm::DenseSet<Operation *> noClaims;
   llvm::SmallVector<PipelineRegion> candidates;
   for (pyc::RegOp tail : llvm::reverse(regs)) {
-    auto region =
-        findRegionFromTail(tail, noClaims, maxStages, maxExtraCombOps, stats);
+    auto region = findRegionFromTail(tail, noClaims, maxStages, stats);
     if (region)
       candidates.push_back(std::move(*region));
   }
@@ -922,10 +914,8 @@ struct RetimePipelinesPass
 
   RetimePipelinesPass() = default;
   RetimePipelinesPass(const RetimePipelinesPass &other) : PassWrapper(other) {}
-  RetimePipelinesPass(unsigned maxStages, unsigned maxExtraCombOps,
-                      bool accumulateStats) {
+  RetimePipelinesPass(unsigned maxStages, bool accumulateStats) {
     maxStagesOption = maxStages;
-    maxExtraCombOpsOption = maxExtraCombOps;
     accumulateStatsOption = accumulateStats;
   }
 
@@ -940,18 +930,13 @@ struct RetimePipelinesPass
       *this, "max-stages",
       llvm::cl::desc("Maximum registers per retimed region (0 is unlimited)"),
       llvm::cl::init(0)};
-  Option<unsigned> maxExtraCombOpsOption{
-      *this, "max-extra-comb-ops",
-      llvm::cl::desc("Maximum cloned combinational operations after retiming"),
-      llvm::cl::init(32)};
   Option<bool> accumulateStatsOption{
       *this, "accumulate-stats",
       llvm::cl::desc("Add rewrite statistics to an earlier retiming round"),
       llvm::cl::init(false)};
 
   void runOnOperation() override {
-    RetimeStats stats =
-        runRetiming(getOperation(), maxStagesOption, maxExtraCombOpsOption);
+    RetimeStats stats = runRetiming(getOperation(), maxStagesOption);
     writeStats(getOperation(), stats, accumulateStatsOption);
   }
 };
@@ -959,15 +944,13 @@ struct RetimePipelinesPass
 } // namespace
 
 std::unique_ptr<::mlir::Pass>
-createRetimePipelinesPass(unsigned maxStages, unsigned maxExtraCombOps,
-                          bool accumulateStats) {
-  return std::make_unique<RetimePipelinesPass>(maxStages, maxExtraCombOps,
-                                               accumulateStats);
+createRetimePipelinesPass(unsigned maxStages, bool accumulateStats) {
+  return std::make_unique<RetimePipelinesPass>(maxStages, accumulateStats);
 }
 
 void runRetimePipelines(func::FuncOp function, unsigned maxStages,
-                        unsigned maxExtraCombOps, bool accumulateStats) {
-  RetimeStats stats = runRetiming(function, maxStages, maxExtraCombOps);
+                        bool accumulateStats) {
+  RetimeStats stats = runRetiming(function, maxStages);
   writeStats(function, stats, accumulateStats);
 }
 

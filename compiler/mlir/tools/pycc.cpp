@@ -214,11 +214,6 @@ static llvm::cl::opt<bool> noStateOpt(
     llvm::cl::desc("Disable the structural state optimization pipeline (keep the plain netlist)"),
     llvm::cl::init(false));
 
-static llvm::cl::opt<unsigned> stateRetimeMaxExtraCombOps(
-    "state-retime-max-extra-comb-ops",
-    llvm::cl::desc("Maximum duplicated combinational operations from retiming"),
-    llvm::cl::init(32));
-
 static llvm::cl::opt<unsigned> statePackWidth(
     "state-pack-width",
     llvm::cl::desc(
@@ -2669,7 +2664,6 @@ int main(int argc, char **argv) {
     // formation/history sharing, and lane packing in one func-level pass.
     pyc::StateOptimizeTunables stateTunables;
     stateTunables.retimeMaxStages = stateRetimeMaxStages;
-    stateTunables.retimeMaxExtraCombOps = stateRetimeMaxExtraCombOps;
     stateTunables.packMaxWidth = statePackWidth;
     pm.addNestedPass<func::FuncOp>(
         pyc::createStateOptimizePass(stateTunables));
