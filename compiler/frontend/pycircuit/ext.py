@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .design import Design, DesignError
-from .data import Bits, Data
+from .data import Data
 from .hw import Signal, Wire
 
 
@@ -154,24 +154,6 @@ def declare(target: Any, manifest_path: str | Path) -> Callable[..., Any]:
     def _type_for(p: ExtPort) -> Data:
         return Data.from_str(f"i{p.width}")
 
-    def instance(*, name: str, **ports: Any) -> Any:
-        """Instantiate the external module with by-name port binding.
-
-        Positional inputs are not allowed; every input port must be given
-        exactly once via keyword (``in_`` for reserved names).
-        """
-        # Resolve the owning circuit from any Signal argument.
-        circuit = None
-        for v in ports.values():
-            sig = _as_signal(v)
-            if sig is not None:
-                circuit = getattr(type(sig), "__self__", None)
-                break
-        raise NotImplementedError(
-            "ext module instantiation goes through Circuit.instance_op; "
-            "see docs/external-modules.md for the bind() helper"
-        )
-
     def bind(circuit: Any, *, name: str, **ports: Any) -> Any:
         """Bind ports on `circuit` (a ModuleBuilder/Circuit) by keyword name."""
         in_map: dict[str, Any] = {}
@@ -206,17 +188,7 @@ def declare(target: Any, manifest_path: str | Path) -> Callable[..., Any]:
             return outs[0]
         return {p.name: s for p, s in zip(decl.outputs, outs)}
 
-    instance.bind = bind  # type: ignore[attr-defined]
-    return instance
-
-
-def _as_signal(v: Any) -> Any:
-    if isinstance(v, Wire):
-        return v.sig
-    lit = getattr(v, "sig", None)
-    if isinstance(lit, Signal):
-        return lit
-    return v if isinstance(v, Signal) else None
+    return bind
 
 
 def _coerce(v: Any, expected: Data, port: str) -> Signal:

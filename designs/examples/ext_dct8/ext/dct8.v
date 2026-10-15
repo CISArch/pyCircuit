@@ -1,7 +1,9 @@
 // dct8.v — reference Verilog implementation of the ext_dct8 black box.
-// Bit-exact with ext/dct8.cpp and ext/dct8_ref.py:
+// Bit-exact with ext/dct8.cpp:
 //   lane_u = sum over x of byte[x] * (u+1), truncated to 16 bits;
 //   out packs lanes 0..3 into 16-bit fields.
+// `valid` is a declared interface port (see ext_dct8.toml) but is not used by
+// the datapath; it is kept as a port so the C++/Verilog bindings stay symmetric.
 `timescale 1ns/1ps
 
 module dct8 (
@@ -25,6 +27,4 @@ module dct8 (
   wire [15:0] l3 = (4 * sum8);
 
   assign out = {l3, l2, l1, l0};
-
-  wire _unused = &{1'b0, valid, 1'b0};
 endmodule

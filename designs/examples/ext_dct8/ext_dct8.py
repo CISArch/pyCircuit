@@ -19,11 +19,8 @@ def build(m: CycleAwareCircuit, domain: CycleAwareDomain) -> None:
     dct = extmod.declare(m, manifest)
 
     x = m.input("x", width=64)
-    y = dct.bind(m, name="u_dct", in_=x, valid=1)
+    y = dct(m, name="u_dct", in_=x, valid=1)
     m.output("y", y)
 
 
 build.__pycircuit_name__ = "ext_dct8_top"
-
-if __name__ == "__main__":
-    print(compile_cycle_aware(build, name="ext_dct8", eager=True).emit_mlir())

@@ -1,21 +1,21 @@
 """Testbench for the ext_dct8 external-module example (docs/external-modules.md).
 
 Drives stimulus into the black box and checks outputs against the embedded
-golden function (same formula as ext/dct8_ref.py, ext/dct8.cpp, ext/dct8.v).
+golden function (same formula as ext/dct8.cpp, ext/dct8.v).
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-from pycircuit import Tb, compile_cycle_aware, testbench
+from pycircuit import Tb, testbench
 
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from ext_dct8 import build  # noqa: E402
-from ext_dct8_config import DEFAULT_PARAMS, TB_PRESETS  # noqa: E402
+from ext_dct8_config import TB_PRESETS  # noqa: E402
 
 
 def _golden(value: int) -> int:
@@ -37,14 +37,10 @@ VECTORS = [
 @testbench
 def tb(t: Tb) -> None:
     p = TB_PRESETS["smoke"]
-    t.timeout(int(p["timeout"]))
+    t.timeout(p["timeout"])
 
     for i, vec in enumerate(VECTORS):
         t.drive("x", vec, at=i)
         t.expect("y", _golden(vec), at=i)
 
-    t.finish(at=int(p["finish"]))
-
-
-if __name__ == "__main__":
-    print(compile_cycle_aware(build, name="tb_ext_dct8_top", eager=True, **DEFAULT_PARAMS).emit_mlir())
+    t.finish(at=p["finish"])
