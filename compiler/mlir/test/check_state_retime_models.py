@@ -31,7 +31,7 @@ def result(command: list[str]) -> tuple[int, int]:
 def emit(pycc: Path, output: Path, kind: str) -> dict[str, object]:
     run([
         str(pycc), str(HERE / "state_retime_codegen.mlir"), f"--emit={kind}",
-        "--state-pack-width=0", "-o", str(output),
+        "--state-pack-width=1", "-o", str(output),
     ])
     return json.loads(Path(f"{output}.stats.json").read_text(encoding="utf-8"))
 
@@ -60,7 +60,7 @@ def main() -> None:
         # it keeps the plain register netlist for the equivalence reference.
         run([
             str(args.pycc), str(HERE / "state_retime_codegen.mlir"),
-            "--emit=cpp", "--state-pack-width=0",
+            "--emit=cpp", "--state-pack-width=1",
             "--observe-named=all", "--no-state-opt", "-o", str(plain_cpp),
         ])
         plain_stats = json.loads(
