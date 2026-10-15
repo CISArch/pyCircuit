@@ -14,6 +14,7 @@ std::unique_ptr<::mlir::Pass> createFuseCombPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
 std::unique_ptr<::mlir::Pass> createCombineDelayChainsPass();
 std::unique_ptr<::mlir::Pass> createRetimePipelinesPass();
+std::unique_ptr<::mlir::Pass> createShlChainFoldPass();
 std::unique_ptr<::mlir::Pass> createPackI1RegsPass();
 /// After C++ state opt remaps identities, drop pyc.name values that are not
 /// in the runtime observation demand set (@probe source, trace fields, or
