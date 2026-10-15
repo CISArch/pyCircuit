@@ -64,7 +64,6 @@ struct PipelineRegion {
   int64_t uniqueCombOps = 0;
   int64_t clonedCombOps = 0;
   int64_t extraCombOps = 0;
-  int64_t maxRebuiltDepth = 0;
   int64_t stateBitsRemoved = 0;
 };
 
@@ -97,60 +96,6 @@ static bool isAllowedConeOp(Operation *op) {
 
 static std::optional<llvm::APInt> constantValue(Value value);
 static std::optional<StateSource> stateSource(Value value);
-
-static unsigned downstreamCombDepth(Value value,
-                                    const llvm::DenseSet<Operation *> &internal,
-                                    unsigned limit,
-                                    llvm::DenseMap<Operation *, unsigned> &memo,
-                                    llvm::DenseSet<Operation *> &visiting) {
-  unsigned depth = 0;
-  for (Operation *user : value.getUsers()) {
-    if (internal.contains(user) || isStatefulConsumer(user) ||
-        isa<func::ReturnOp, pyc::AssertOp>(user))
-      continue;
-    if (!isAllowedConeOp(user) || !visiting.insert(user).second)
-      return limit + 1;
-    unsigned userDepth = 1;
-    if (auto it = memo.find(user); it != memo.end()) {
-      userDepth = it->second;
-    } else {
-      for (Value result : user->getResults())
-        userDepth =
-            std::max(userDepth, 1 + downstreamCombDepth(result, internal, limit,
-                                                        memo, visiting));
-      memo.try_emplace(user, userDepth);
-    }
-    visiting.erase(user);
-    depth = std::max(depth, userDepth);
-    if (depth > limit)
-      return depth;
-  }
-  return depth;
-}
-
-static unsigned producerCombDepth(Value value, unsigned limit,
-                                  llvm::DenseMap<Value, unsigned> &memo,
-                                  llvm::DenseSet<Value> &visiting) {
-  if (!value || isa<BlockArgument>(value) || constantValue(value) ||
-      stateSource(value))
-    return 0;
-  if (auto it = memo.find(value); it != memo.end())
-    return it->second;
-  if (!visiting.insert(value).second)
-    return limit + 1;
-  Operation *def = value.getDefiningOp();
-  if (!def || !isAllowedConeOp(def)) {
-    visiting.erase(value);
-    return limit + 1;
-  }
-  unsigned depth = 1;
-  for (Value operand : def->getOperands())
-    depth =
-        std::max(depth, 1 + producerCombDepth(operand, limit, memo, visiting));
-  visiting.erase(value);
-  memo.try_emplace(value, depth);
-  return depth;
-}
 
 static std::optional<llvm::APInt> constantValue(Value value) {
   llvm::SmallPtrSet<Operation *, 8> aliasSeen;
@@ -414,8 +359,7 @@ static bool hasOpaqueNextDependency(Value value, llvm::DenseSet<Value> &seen) {
 }
 
 static std::optional<CommonDelayRegion>
-matchCommonDelayRegion(Operation *root, unsigned maxCombDepth,
-                       RetimeStats &stats) {
+matchCommonDelayRegion(Operation *root, RetimeStats &stats) {
   if (!root || root->getNumResults() != 1 || root->getResult(0).use_empty() ||
       !isAllowedConeOp(root))
     return std::nullopt;
@@ -457,15 +401,8 @@ matchCommonDelayRegion(Operation *root, unsigned maxCombDepth,
       visiting.erase(value);
       return;
     }
-    // Same DAG pruning as the pipeline matcher. Cones larger than the depth
-    // budget are rejected below, so stop walking once that bound is crossed.
+    // Same DAG pruning as the pipeline matcher.
     if (!region.coneSet.insert(def).second) {
-      visiting.erase(value);
-      return;
-    }
-    if (region.coneSet.size() > maxCombDepth) {
-      failed = true;
-      ++stats.blockedCost;
       visiting.erase(value);
       return;
     }
@@ -479,10 +416,6 @@ matchCommonDelayRegion(Operation *root, unsigned maxCombDepth,
 
   if (failed || region.sources.size() < 2 || !region.coneSet.contains(root))
     return std::nullopt;
-  if (region.coneOps.size() > maxCombDepth) {
-    ++stats.blockedCost;
-    return std::nullopt;
-  }
 
   const StateSource &key = region.sources.front();
   llvm::DenseSet<Value> sourceValues;
@@ -504,35 +437,6 @@ matchCommonDelayRegion(Operation *root, unsigned maxCombDepth,
     for (Operation *user : source.q.getUsers())
       if (!region.coneSet.contains(user))
         return std::nullopt;
-  }
-
-  llvm::DenseMap<Value, unsigned> producerDepthMemo;
-  llvm::DenseSet<Value> producerDepthVisiting;
-  llvm::DenseMap<Value, unsigned> movedDepths;
-  for (const StateSource &source : region.sources) {
-    unsigned depth = producerCombDepth(
-        source.next, maxCombDepth, producerDepthMemo, producerDepthVisiting);
-    if (depth > maxCombDepth) {
-      ++stats.blockedCost;
-      return std::nullopt;
-    }
-    movedDepths.try_emplace(source.q, depth);
-  }
-  for (Operation *op : region.coneOps) {
-    unsigned depth = 1;
-    for (Value operand : op->getOperands()) {
-      unsigned operandDepth = 0;
-      if (auto it = movedDepths.find(operand); it != movedDepths.end())
-        operandDepth = it->second;
-      else if (!constantValue(operand))
-        return std::nullopt;
-      depth = std::max(depth, 1 + operandDepth);
-    }
-    if (depth > maxCombDepth) {
-      ++stats.blockedCost;
-      return std::nullopt;
-    }
-    movedDepths.try_emplace(op->getResult(0), depth);
   }
 
   for (Operation *op : region.coneOps) {
@@ -652,8 +556,7 @@ static void rewriteCommonDelayRegion(CommonDelayRegion &region,
   stats.statePrimitivesRemoved += region.sources.size() - 1;
 }
 
-static void runCommonDelaySinking(func::FuncOp function,
-                                  unsigned maxCombDepth, RetimeStats &stats) {
+static void runCommonDelaySinking(func::FuncOp function, RetimeStats &stats) {
   llvm::SmallVector<Operation *> roots;
   function.walk([&](Operation *op) {
     if (isAllowedConeOp(op))
@@ -662,7 +565,7 @@ static void runCommonDelaySinking(func::FuncOp function,
 
   llvm::SmallVector<CommonDelayRegion> candidates;
   for (Operation *root : llvm::reverse(roots)) {
-    auto region = matchCommonDelayRegion(root, maxCombDepth, stats);
+    auto region = matchCommonDelayRegion(root, stats);
     if (region)
       candidates.push_back(std::move(*region));
   }
@@ -738,7 +641,7 @@ static bool needsRebuiltView(PipelineRegion &region, unsigned index) {
 }
 
 static bool finalizeRegion(PipelineRegion &region, unsigned maxExtraCombOps,
-                           unsigned maxCombDepth, RetimeStats &stats) {
+                           RetimeStats &stats) {
   llvm::DenseSet<Value> stateValues;
   for (pyc::RegOp reg : region.regs)
     stateValues.insert(reg.getQ());
@@ -791,24 +694,16 @@ static bool finalizeRegion(PipelineRegion &region, unsigned maxExtraCombOps,
   region.stateBitsRemoved = oldStateBits - newStateBits;
 
   int64_t prefixOps = 0;
-  llvm::DenseMap<Operation *, unsigned> downstreamMemo;
   for (unsigned i = 0; i < region.regs.size(); ++i) {
     if (i > 0)
       prefixOps += static_cast<int64_t>(region.links[i - 1].coneOps.size());
     if (!needsRebuiltView(region, i))
       continue;
     region.clonedCombOps += prefixOps;
-    llvm::DenseSet<Operation *> visiting;
-    unsigned downstream =
-        downstreamCombDepth(region.regs[i].getQ(), region.coneSet, maxCombDepth,
-                            downstreamMemo, visiting);
-    region.maxRebuiltDepth = std::max(
-        region.maxRebuiltDepth, prefixOps + static_cast<int64_t>(downstream));
   }
   region.extraCombOps =
       std::max<int64_t>(0, region.clonedCombOps - region.uniqueCombOps);
-  if (region.extraCombOps > static_cast<int64_t>(maxExtraCombOps) ||
-      region.maxRebuiltDepth > static_cast<int64_t>(maxCombDepth)) {
+  if (region.extraCombOps > static_cast<int64_t>(maxExtraCombOps)) {
     ++stats.blockedCost;
     return false;
   }
@@ -818,7 +713,7 @@ static bool finalizeRegion(PipelineRegion &region, unsigned maxExtraCombOps,
 static std::optional<PipelineRegion>
 findRegionFromTail(pyc::RegOp tail, const llvm::DenseSet<Operation *> &claimed,
                    unsigned maxStages, unsigned maxExtraCombOps,
-                   unsigned maxCombDepth, RetimeStats &stats) {
+                   RetimeStats &stats) {
   PipelineRegion region;
   llvm::SmallVector<pyc::RegOp> regsFromTail{tail};
   llvm::SmallVector<PipelineLink> linksFromTail;
@@ -855,7 +750,7 @@ findRegionFromTail(pyc::RegOp tail, const llvm::DenseSet<Operation *> &claimed,
 
   region.regs.assign(regsFromTail.rbegin(), regsFromTail.rend());
   region.links.assign(linksFromTail.rbegin(), linksFromTail.rend());
-  if (!finalizeRegion(region, maxExtraCombOps, maxCombDepth, stats))
+  if (!finalizeRegion(region, maxExtraCombOps, stats))
     return std::nullopt;
   return region;
 }
@@ -953,10 +848,9 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
 }
 
 static RetimeStats runRetiming(func::FuncOp function, unsigned maxStages,
-                               unsigned maxExtraCombOps,
-                               unsigned maxCombDepth) {
+                               unsigned maxExtraCombOps) {
   RetimeStats stats;
-  runCommonDelaySinking(function, maxCombDepth, stats);
+  runCommonDelaySinking(function, stats);
   llvm::SmallVector<pyc::RegOp> regs;
   function.walk([&](pyc::RegOp reg) {
     regs.push_back(reg);
@@ -967,8 +861,7 @@ static RetimeStats runRetiming(func::FuncOp function, unsigned maxStages,
   llvm::SmallVector<PipelineRegion> candidates;
   for (pyc::RegOp tail : llvm::reverse(regs)) {
     auto region =
-        findRegionFromTail(tail, noClaims, maxStages, maxExtraCombOps,
-                           maxCombDepth, stats);
+        findRegionFromTail(tail, noClaims, maxStages, maxExtraCombOps, stats);
     if (region)
       candidates.push_back(std::move(*region));
   }
@@ -978,9 +871,7 @@ static RetimeStats runRetiming(func::FuncOp function, unsigned maxStages,
                         return lhs.regs.size() > rhs.regs.size();
                       if (lhs.stateBitsRemoved != rhs.stateBitsRemoved)
                         return lhs.stateBitsRemoved > rhs.stateBitsRemoved;
-                      if (lhs.extraCombOps != rhs.extraCombOps)
-                        return lhs.extraCombOps < rhs.extraCombOps;
-                      return lhs.maxRebuiltDepth < rhs.maxRebuiltDepth;
+                      return lhs.extraCombOps < rhs.extraCombOps;
                     });
 
   llvm::DenseSet<Operation *> claimed;
@@ -1032,10 +923,9 @@ struct RetimePipelinesPass
   RetimePipelinesPass() = default;
   RetimePipelinesPass(const RetimePipelinesPass &other) : PassWrapper(other) {}
   RetimePipelinesPass(unsigned maxStages, unsigned maxExtraCombOps,
-                      unsigned maxCombDepth, bool accumulateStats) {
+                      bool accumulateStats) {
     maxStagesOption = maxStages;
     maxExtraCombOpsOption = maxExtraCombOps;
-    maxCombDepthOption = maxCombDepth;
     accumulateStatsOption = accumulateStats;
   }
 
@@ -1054,18 +944,14 @@ struct RetimePipelinesPass
       *this, "max-extra-comb-ops",
       llvm::cl::desc("Maximum cloned combinational operations after retiming"),
       llvm::cl::init(32)};
-  Option<unsigned> maxCombDepthOption{
-      *this, "max-comb-depth",
-      llvm::cl::desc("Maximum rebuilt prefix operation depth"),
-      llvm::cl::init(32)};
   Option<bool> accumulateStatsOption{
       *this, "accumulate-stats",
       llvm::cl::desc("Add rewrite statistics to an earlier retiming round"),
       llvm::cl::init(false)};
 
   void runOnOperation() override {
-    RetimeStats stats = runRetiming(getOperation(), maxStagesOption,
-                                    maxExtraCombOpsOption, maxCombDepthOption);
+    RetimeStats stats =
+        runRetiming(getOperation(), maxStagesOption, maxExtraCombOpsOption);
     writeStats(getOperation(), stats, accumulateStatsOption);
   }
 };
@@ -1074,16 +960,14 @@ struct RetimePipelinesPass
 
 std::unique_ptr<::mlir::Pass>
 createRetimePipelinesPass(unsigned maxStages, unsigned maxExtraCombOps,
-                          unsigned maxCombDepth, bool accumulateStats) {
-  return std::make_unique<RetimePipelinesPass>(
-      maxStages, maxExtraCombOps, maxCombDepth, accumulateStats);
+                          bool accumulateStats) {
+  return std::make_unique<RetimePipelinesPass>(maxStages, maxExtraCombOps,
+                                               accumulateStats);
 }
 
 void runRetimePipelines(func::FuncOp function, unsigned maxStages,
-                        unsigned maxExtraCombOps, unsigned maxCombDepth,
-                        bool accumulateStats) {
-  RetimeStats stats =
-      runRetiming(function, maxStages, maxExtraCombOps, maxCombDepth);
+                        unsigned maxExtraCombOps, bool accumulateStats) {
+  RetimeStats stats = runRetiming(function, maxStages, maxExtraCombOps);
   writeStats(function, stats, accumulateStats);
 }
 

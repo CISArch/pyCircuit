@@ -219,11 +219,6 @@ static llvm::cl::opt<unsigned> stateRetimeMaxExtraCombOps(
     llvm::cl::desc("Maximum duplicated combinational operations from retiming"),
     llvm::cl::init(32));
 
-static llvm::cl::opt<unsigned> stateRetimeMaxCombDepth(
-    "state-retime-max-comb-depth",
-    llvm::cl::desc("Maximum rebuilt prefix depth from retiming"),
-    llvm::cl::init(32));
-
 static llvm::cl::opt<unsigned> statePackWidth(
     "state-pack-width",
     llvm::cl::desc(
@@ -2675,8 +2670,6 @@ int main(int argc, char **argv) {
     pyc::StateOptimizeTunables stateTunables;
     stateTunables.retimeMaxStages = stateRetimeMaxStages;
     stateTunables.retimeMaxExtraCombOps = stateRetimeMaxExtraCombOps;
-    stateTunables.retimeMaxCombDepth =
-        std::min<unsigned>(stateRetimeMaxCombDepth, logicDepthLimit);
     stateTunables.packMaxWidth = statePackWidth;
     pm.addNestedPass<func::FuncOp>(
         pyc::createStateOptimizePass(stateTunables));

@@ -52,7 +52,6 @@ b@4 ─────────────────────────�
 --state-pack-width=192
 --state-retime-max-stages=0
 --state-retime-max-extra-comb-ops=32
---state-retime-max-comb-depth=32
 ```
 
 等价状态合并会减少逻辑位数。delay line 和 lane packing 减少 C++ 里的状态对象数量，
@@ -171,9 +170,6 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 
 --state-retime-max-extra-comb-ops=32
     重建历史视图最多允许增加的组合 op 数
-
---state-retime-max-comb-depth=32
-    重建前缀及下游路径的局部深度上限；实际值不超过 --logic-depth
 
 --state-pack-width=192
     Stage 2 单个 packed storage 的默认最大宽度
@@ -555,13 +551,11 @@ history。中间值被模块输出、assert、组合 consumer，甚至另一寄�
 - 每级 init 可由前一级 init 位精确求值，且与原 consumer init 完全相同；
 - 被删除状态的 next 不反馈依赖候选内状态，也不通过未解析 wire 隐藏反馈；
 - 组合锥中间结果没有锥外 fanout；共同下沉的源状态没有其他使用；
-- 新 history bits 不增加，新增组合 op、重建前缀及其下游深度均在预算内；
+- 新 history bits 不增加，新增组合 op 数在预算内；
 - 外部可读身份改挂到 tap/线/留下的源 history，不改变可读值。
 
 `eq(0, 0)` 的新 init 会计算为 1，而不是机械沿用 0。动态 shift、截位和有符号比较也
-使用 `APInt` 按结果位宽求值。局部深度预算取
-`min(--state-retime-max-comb-depth, --logic-depth)`，超预算候选只被跳过，不会让原本
-可编译的设计在最终 logic-depth gate 才失败。
+使用 `APInt` 按结果位宽求值。
 
 ### 10.4 Pass 顺序为什么是 merge -> retime -> form/pack
 
