@@ -80,5 +80,9 @@ std::unique_ptr<::mlir::Pass>
 createCppPlacementPass(unsigned combChunkNodes,
                        std::string traceCodegenPlanPath = {});
 std::unique_ptr<::mlir::Pass> createVectorUnrollPass();
+/// Analysis-only: tag each pyc.reg with `pyc.seq_bank_id` (one bank per
+/// equivalent clock domain) plus function-level stats; the C++ emitter
+/// lowers each bank into one pyc::cpp::SeqBank<W> update loop.
+std::unique_ptr<::mlir::Pass> createSeqBankPartitionPass();
 
 } // namespace pyc

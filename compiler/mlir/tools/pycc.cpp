@@ -214,6 +214,18 @@ static llvm::cl::opt<bool> noStateOpt(
     llvm::cl::desc("Disable the structural state optimization pipeline (keep the plain netlist)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> seqBank(
+    "seq-bank",
+    llvm::cl::desc(
+        "Lower same-clock registers into per-clock SeqBank update loops "
+        "(use --no-seq-bank for the per-reg lowering)"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<bool> noSeqBank(
+    "no-seq-bank",
+    llvm::cl::desc("Disable SeqBank lowering; expand per-reg tick code"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<unsigned> stateRetimeMaxExtraCombOps(
     "state-retime-max-extra-comb-ops",
     llvm::cl::desc("Maximum duplicated combinational operations from retiming"),
@@ -2686,6 +2698,10 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+  // SeqBank partition runs after all state rewrites so banks cover the final
+  // reg set; the C++ emitter reads the ids. fuse-comb does not move state.
+  if (emitKind == "cpp" && seqBank && !noSeqBank)
+    pm.addNestedPass<func::FuncOp>(pyc::createSeqBankPartitionPass());
   // Demand mode drops undemanded pyc.name after identities were remapped,
   // before fuse-comb treats leftover names as barriers.
   if (emitKind == "cpp" && llvm::StringRef(observeNamed) == "demand")

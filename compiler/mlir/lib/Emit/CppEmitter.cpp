@@ -1416,7 +1416,66 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  " << cppType(tap.getTap().getType()) << " " << nt.get(tap.getTap())
        << "_qNext{};\n";
 
+  // SeqBank grouping: scalar regs carrying pyc.seq_bank_id lower into
+  // per-bank pyc::cpp::SeqBank<W> members; everything else keeps the
+  // per-reg expansion. Map: bank id -> (width, regs in IR order).
+  llvm::DenseMap<int64_t, unsigned> seqBankWidth;
+  llvm::DenseMap<int64_t, llvm::SmallVector<pyc::RegOp>> seqBanked;
+  llvm::SmallVector<pyc::RegOp> unbankedRegs;
+  for (pyc::RegOp r : regs) {
+    auto idAttr = r->getAttrOfType<IntegerAttr>("pyc.seq_bank_id");
+    if (isa<VectorType>(r.getQ().getType()) || !idAttr) {
+      unbankedRegs.push_back(r);
+      continue;
+    }
+    const int64_t id = idAttr.getValue().getSExtValue();
+    unsigned w = bitWidth(r.getQ().getType());
+    // Regs rewritten by earlier passes (retiming/packing) may carry a width
+    // different from the partition-time majority; split into a per-width
+    // sub-bank keyed (id, width) so SeqBank<W>'s single template width holds.
+    const int64_t key = id * 4096 + static_cast<int64_t>(w);
+    seqBankWidth.try_emplace(key, w);
+    seqBanked[key].push_back(r);
+    r->setAttr("pyc.seq_bank_id",
+               IntegerAttr::get(IntegerType::get(r->getContext(), 64), key));
+  }
+  llvm::SmallVector<int64_t> seqBankIds;
+  for (auto &kv : seqBanked)
+    seqBankIds.push_back(kv.first);
+  std::sort(seqBankIds.begin(), seqBankIds.end());
+  // Rewrite the reg list so the per-reg paths skip banked regs.
+  regs.clear();
+  for (pyc::RegOp r : unbankedRegs)
+    regs.push_back(r);
+
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
+  // Probe write-intent binding for a scalar reg: either its pyc_reg inst
+  // (unbanked) or the owning SeqBank's lane storage. Returns the C++ text
+  // for `&...pending` and `&...qNext`.
+  auto probePendingNext = [&](pyc::RegOp r) -> std::pair<std::string, std::string> {
+    if (auto idAttr = r->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
+      if (!isa<VectorType>(r.getQ().getType())) {
+        const int64_t id = idAttr.getValue().getSExtValue();
+        // Lane index within the bank = position in seqBanked[id].
+        long lane = 0;
+        if (auto it = seqBanked.find(id); it != seqBanked.end()) {
+          for (pyc::RegOp cand : it->second) {
+            if (cand == r)
+              break;
+            ++lane;
+          }
+        }
+        std::string bank = "seq_bank_" + std::to_string(id);
+        // lane_pending/lane_qnext return pointers; keep the '&' at the call
+        // site out of this string (callers concatenate it verbatim after &).
+        // lane_pending/lane_qnext return pointers, so emit without '&'.
+        return {bank + ".lane_pending(" + std::to_string(lane) + "u)",
+                bank + ".lane_qnext(" + std::to_string(lane) + "u)"};
+      }
+    }
+    return {nt.get(r.getQ()) + "_inst->pending",
+            nt.get(r.getQ()) + "_inst->qNext"};
+  };
   auto delayKey = [&](pyc::DelayLineOp delay) { return nt.get(delay.getQ()); };
   auto delayTapKey = [&](pyc::DelayTapOp tap) { return nt.get(tap.getTap()); };
   auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
@@ -1693,12 +1752,29 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         if (!seenNamedFields.insert(fieldPath).second)
           return;
         auto regQ = findStateStorageSource(value);
-        std::string regInst =
-            regQ ? (nt.get(regQ->q) + "_inst") : std::string();
+        std::string regInst;
         std::string regNext;
-        if (regQ)
-          regNext = regQ->tap ? (nt.get(regQ->tap) + "_qNext")
-                              : (regInst + "->qNext");
+        if (regQ) {
+          // SeqBank lanes carry the pending/qNext storage for their reg.
+          pyc::RegOp srcReg;
+          if (!regQ->tap) {
+            Value qVal = regQ->q;
+            if (auto *def = qVal.getDefiningOp())
+              if (auto alias = dyn_cast<pyc::AliasOp>(def))
+                qVal = alias.getOperand();
+            if (auto *d2 = qVal.getDefiningOp())
+              srcReg = dyn_cast<pyc::RegOp>(d2);
+          }
+          if (srcReg) {
+            auto pn = probePendingNext(srcReg);
+            regInst = pn.first;   // full `&expr` text
+            regNext = pn.second;
+          } else {
+            regInst = nt.get(regQ->q) + "_inst->pending";
+            regNext = regQ->tap ? (nt.get(regQ->tap) + "_qNext")
+                                : (nt.get(regQ->q) + "_inst->qNext");
+          }
+        }
         namedProbes.push_back(NamedProbeInfo{
             fieldPath,
             nt.get(value),
@@ -1769,19 +1845,34 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 			    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
 		      const auto &source = *outRegQ[i];
 		      const unsigned storageWidth = bitWidth(source.q.getType());
+		      // Resolve the owning pyc.reg (if any) for SeqBank lane bindings.
+		      pyc::RegOp srcReg;
+		      if (!source.tap) {
+		        Value qVal = source.q;
+		        if (auto *def = qVal.getDefiningOp())
+		          if (auto alias = dyn_cast<pyc::AliasOp>(def))
+		            qVal = alias.getOperand();
+		        if (auto *d2 = qVal.getDefiningOp())
+		          srcReg = dyn_cast<pyc::RegOp>(d2);
+		      }
+		      const auto pendNext = srcReg ? probePendingNext(srcReg)
+		                                   : std::pair<std::string, std::string>{
+		                                         nt.get(source.q) + "_inst->pending",
+		                                         source.tap ? nt.get(source.tap) + "_qNext"
+		                                                    : nt.get(source.q) + "_inst->qNext"};
+		      const bool banked = pendNext.first.rfind("seq_bank_", 0) == 0;
+		      const std::string refP = banked ? pendNext.first : "&" + pendNext.first;
+		      const std::string refN = banked ? pendNext.second : "&" + pendNext.second;
 		      if (source.lsb != 0 || storageWidth != w) {
 			        os << "    reg.addRegSlice<" << w << ", " << storageWidth
 			           << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &"
-			           << outNames[i] << ", &" << nt.get(source.q)
-			           << "_inst->pending, &"
-                       << (source.tap ? nt.get(source.tap) + "_qNext"
-                                      : nt.get(source.q) + "_inst->qNext")
+			           << outNames[i] << ", " << refP << ", "
+                       << refN
                        << ", " << source.lsb << "u);\n";
 			      } else {
 			        os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
-			           << ", &" << nt.get(source.q) << "_inst->pending, &"
-                       << (source.tap ? nt.get(source.tap) + "_qNext"
-                                      : nt.get(source.q) + "_inst->qNext")
+			           << ", " << refP << ", "
+                       << refN
                        << ");\n";
 		      }
 		    } else {
@@ -1790,17 +1881,22 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		  }
       for (const auto &named : namedProbes) {
         if (named.isReg && !isa<VectorType>(named.type)) {
+          const bool bankedN = named.cppRegInst.rfind("seq_bank_", 0) == 0;
           if (named.stateLsb != 0 ||
               named.stateStorageWidth != named.width) {
             os << "    reg.addRegSlice<" << named.width << ", "
                << named.stateStorageWidth << ">(reg_path("
                << cppStringLiteral(named.fieldPath) << "), &"
-               << named.cppValue << ", &" << named.cppRegInst
-               << "->pending, &" << named.cppRegNext << ", "
+               << named.cppValue << ", "
+               << (bankedN ? named.cppRegInst : "&" + named.cppRegInst)
+               << ", " << named.cppRegNext << ", "
                << named.stateLsb << "u);\n";
           } else {
-            os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
-               << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegNext << ");\n";
+            os << "    reg.addReg<" << named.width << ">(reg_path("
+               << cppStringLiteral(named.fieldPath) << "), &"
+               << named.cppValue << ", "
+               << (bankedN ? named.cppRegInst : "&" + named.cppRegInst)
+               << ", " << named.cppRegNext << ");\n";
           }
         } else {
           emitWireProbes(os, named.type, named.width, named.fieldPath, named.cppValue);
@@ -1817,6 +1913,27 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         if (storageWidth == 0)
           return storage->emitError("lazy probe storage has empty width");
         const std::string inst = nt.get(q) + "_inst";
+        // SeqBank lane bindings when the storage is a banked reg's q: the q
+        // wire address is shared with the bank lane, so only pending/qNext
+        // switch to the bank accessors.
+        std::string pendText = "&" + inst + "->pending";
+        std::string nextText = "&" + inst + "->qNext";
+        std::string qText = "&" + inst + "->q";
+        {
+          Value qVal = q;
+          if (auto *def = qVal.getDefiningOp())
+            if (auto alias = dyn_cast<pyc::AliasOp>(def))
+              qVal = alias.getOperand();
+          if (auto *d2 = qVal.getDefiningOp())
+            if (auto srcReg = dyn_cast<pyc::RegOp>(d2)) {
+              auto pn = probePendingNext(srcReg);
+              if (pn.first.rfind("seq_bank_", 0) == 0) {
+                pendText = pn.first;
+                nextText = pn.second;
+                qText = "&" + nt.get(q);  // the shared q wire itself
+              }
+            }
+        }
         for (Attribute item : slices) {
           auto dict = dyn_cast<DictionaryAttr>(item);
           if (!dict)
@@ -1866,14 +1983,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
           }
           if (lsb == 0 && width == storageWidth) {
             os << "    reg.addReg<" << width << ">(reg_path("
-               << cppStringLiteral(field) << "), &" << inst << "->q, &" << inst
-               << "->pending, &" << inst << "->qNext);\n";
+               << cppStringLiteral(field) << "), " << qText << ", "
+               << pendText << ", " << nextText << ");\n";
             continue;
           }
           os << "    reg.addRegLazySlice<" << width << ", " << storageWidth
-             << ">(reg_path(" << cppStringLiteral(field) << "), &" << inst
-             << "->q, " << lsb << "u, &" << inst << "->pending, &" << inst
-             << "->qNext);\n";
+             << ">(reg_path(" << cppStringLiteral(field) << "), " << qText
+             << ", " << lsb << "u, " << pendText << ", " << nextText
+             << ");\n";
         }
         return success();
       };
@@ -1986,6 +2103,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     else
       os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
   }
+  for (int64_t bankId : seqBankIds)
+    os << "  pyc::cpp::SeqBank<" << seqBankWidth[bankId] << "> seq_bank_"
+       << bankId << ";\n";
   std::string fastClkName;
   bool fastClkUnique = true;
   auto noteFastClk = [&](Value clk) {
@@ -1999,6 +2119,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     noteFastClk(r.getClk());
   for (auto delay : delayLines)
     noteFastClk(delay.getClk());
+  for (int64_t bankId : seqBankIds)
+    for (pyc::RegOp r : seqBanked[bankId])
+      noteFastClk(r.getClk());
   const bool fastEdge = fastClkUnique && !fastClkName.empty();
   if (fastEdge) {
     os << "  bool _pyc_clk_prev = false;\n";
@@ -2309,6 +2432,19 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pyc_reg<" << w << ">(";
     os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
        << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
+  }
+  for (int64_t bankId : seqBankIds) {
+    os << "    seq_bank_" << bankId << ".add_lanes({";
+    bool firstLane = true;
+    for (pyc::RegOp r : seqBanked[bankId]) {
+      if (!firstLane)
+        os << ", ";
+      firstLane = false;
+      os << "{&" << nt.get(r.getQ()) << ", &" << nt.get(r.getNext()) << ", &"
+         << nt.get(r.getRst()) << ", &" << nt.get(r.getEn()) << ", &"
+         << nt.get(r.getInit()) << "}";
+    }
+    os << "});\n";
   }
   for (auto delay : delayLines) {
     unsigned w = bitWidth(delay.getQ().getType());
@@ -3550,18 +3686,24 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "      bool _pyc_fall = _pyc_clk_prev && !_pyc_now;\n";
     os << "      _pyc_clk_prev = _pyc_now;\n";
     os << "      if (_pyc_rise) {\n";
+    for (int64_t bankId : seqBankIds)
+      os << "        seq_bank_" << bankId << ".compute_rise();\n";
     emitEdgeCall("posedge_tick_compute", "        ");
     if (failed(emitTapUpdates("        ")))
       return failure();
     os << "        _pyc_seq_armed = true;\n";
     os << "      } else if (_pyc_fall) {\n";
     os << "        if (_pyc_seq_armed) {\n";
+    for (int64_t bankId : seqBankIds)
+      os << "          seq_bank_" << bankId << ".negedge();\n";
     emitEdgeCall("negedge_update", "          ");
     os << "          _pyc_seq_armed = false;\n";
     os << "        }\n";
     if (failed(emitTapUpdates("        ")))
       return failure();
     os << "      } else {\n";
+    for (int64_t bankId : seqBankIds)
+      os << "        seq_bank_" << bankId << ".compute_generic(_pyc_now);\n";
     emitEdgeCall("tick_compute", "        ");
     if (failed(emitTapUpdates("        ")))
       return failure();
@@ -3646,6 +3788,24 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                            (indent + "  ").str());
     os << indent << "}\n";
   };
+  // SeqBank commit: one loop per bank; each set bit in the returned per-lane
+  // dirty bitmap wakes exactly that reg's fanout (same precision as the
+  // per-reg path).
+  for (int64_t bankId : seqBankIds) {
+    const unsigned w = seqBankWidth[bankId];
+    std::string bank = "seq_bank_" + std::to_string(bankId);
+    os << "    const auto &_pyc_bank_dirty_" << bankId << " = " << bank
+       << ".commit();\n";
+    unsigned lane = 0;
+    for (pyc::RegOp r : seqBanked[bankId]) {
+      os << "    if ((_pyc_bank_dirty_" << bankId << "[" << (lane >> 6)
+         << "u] >> " << (lane & 63) << "u) & 1u) {\n";
+      emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt, "      ");
+      os << "    }\n";
+      ++lane;
+    }
+    (void)w;
+  }
   for (auto r : regs) {
     std::string key = nt.get(r.getQ()) + "_inst";
     std::string changed = "_pyc_commit_changed_" + key;
@@ -3881,6 +4041,7 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   os << "#include <string>\n";
   os << "#include <type_traits>\n";
   os << "#include <cpp/pyc_sim.hpp>\n";
+  os << "#include <cpp/pyc_seq_bank.hpp>\n";
   os << "#include <cpp/pyc_change_scheduler.hpp>\n\n";
   os << "namespace pyc::gen {\n\n";
 
