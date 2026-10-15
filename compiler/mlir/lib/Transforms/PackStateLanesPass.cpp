@@ -280,13 +280,12 @@ public:
 
   Option<unsigned> maxWidthOption{
       *this, "max-width",
-      llvm::cl::desc("Maximum packed integer width (0 = no limit; groups close "
-                     "only on control/dependency boundaries)"),
-      llvm::cl::init(192)};
+      llvm::cl::desc("Maximum packed integer width (0 disables packing)"),
+      llvm::cl::init(1024)};
   void runOnOperation() override {
     func::FuncOp function = getOperation();
     PackStats stats;
-    {
+    if (maxWidthOption != 0) {
       for (Block &block : function.getBody())
         packBlock(block, stats);
     }
@@ -349,10 +348,7 @@ void packBlockImpl(Block &block, PackStats &stats, unsigned maxWidth) {
       }
 
       auto type = dyn_cast<IntegerType>(lane.q.getType());
-      // maxWidth == 0 means "no cap": every integer lane is a candidate and
-      // groups close only on control/dependency boundaries.
-      if (!type || type.getWidth() == 0 ||
-          (maxWidth != 0 && type.getWidth() > maxWidth))
+      if (!type || type.getWidth() == 0 || type.getWidth() > maxWidth)
         continue;
       lane.width = type.getWidth();
       lane.position = positions.lookup(lane.op);
@@ -386,8 +382,7 @@ void packBlockImpl(Block &block, PackStats &stats, unsigned maxWidth) {
       };
 
       for (const StateLane &lane : bucket) {
-        if (!group.empty() && maxWidth != 0 &&
-            groupWidth + lane.width > maxWidth)
+        if (!group.empty() && groupWidth + lane.width > maxWidth)
           flush();
         llvm::SmallVector<StateLane> prospective(group.begin(), group.end());
         prospective.push_back(lane);
@@ -409,8 +404,10 @@ createPackStateLanesPass(unsigned maxWidth) {
 
 void runPackStateLanes(func::FuncOp function, unsigned maxWidth) {
   PackStats stats;
-  for (Block &block : function.getBody())
-    packBlockImpl(block, stats, maxWidth);
+  if (maxWidth != 0) {
+    for (Block &block : function.getBody())
+      packBlockImpl(block, stats, maxWidth);
+  }
   setI64Attr(function, "pyc.stats.state_opt_pack_groups", stats.groups);
   setI64Attr(function, "pyc.stats.state_opt_pack_reg_groups",
              stats.regGroups);

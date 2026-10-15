@@ -49,7 +49,7 @@ b@4 ─────────────────────────�
 仍可调的预算是：
 
 ```text
---state-pack-width=0（默认；0 = 不设宽度上限）
+--state-pack-width=1024
 --state-retime-max-stages=0
 --state-retime-max-extra-comb-ops=32
 --state-retime-max-comb-depth=32
@@ -175,13 +175,13 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 --state-retime-max-comb-depth=32
     重建前缀及下游路径的局部深度上限；实际值不超过 --logic-depth
 
---state-pack-width=0
-    0（默认）= 不设打包组宽度上限，组只在控制/依赖边界处封口；
-    正整数（如 192）= 按该宽度封组打包
+--state-pack-width=1024
+    Stage 2 打包组宽度上限（默认 1024）；组宽超过会跨更多 64bit 字并
+    拉长 emitted concat 的变参模板链
 
---state-pack-width=<bits>（如 1 或负值语义不存在，用 --no-state-opt）
-    整体关闭打包需 `--no-state-opt`；如需单独隔离 Stage 2，
-    可临时把 max-width 设为 1 使打包几乎不产生 ≥2 lane 的组
+--state-pack-width=0
+    禁用 Stage 2，便于隔离 Stage 1/1.5 收益（实测在 DavinciTop 上
+    禁用打包 -48.8%）
 
 ```
 
@@ -467,7 +467,7 @@ Packing：
 直接成为模块输出的 packed slice 仍被 probe manifest 分类为 state。有运行时读取需求
 的具名逻辑 state 可通过 slice alias 和 `addRegSlice` 保持逻辑 probe 映射。
 
-### 9.4 打包宽度的选择（默认不封顶）
+### 9.4 打包宽度的选择（默认 1024）
 
 更宽的 storage 会减少 primitive 数，但超宽 `Bits<W>` 的 concat/extract、copy 和
 更新成本也会上升。该结论来自 C++ 微基准，且明显依赖 workload：
@@ -481,11 +481,13 @@ Packing：
 | 192 | 4,362.49 | 6 | 40,979 |
 | 256 | 6,051.11 | 4 | 38,052 |
 
-在该微基准上 192-bit 相对不打包快 32.8%，相对 128-bit 快 10.8%。**当前
-`pycc` 默认 `--state-pack-width=0`（不设上限）**：DavinciTop 34 trace 的成对
-实测显示打包是大幅净收益（默认 192 的 2560.5 cyc/s 对比禁用打包 1310.0，
-差 -48.8%），按封顶宽度预算的保守策略反而损害真实 workload；超宽组的
-concat/extract 成本若在个别设计上显著，可用正整数上限（192/128/256）收紧。
+在该微基准上 192-bit 相对不打包快 32.8%，相对 128-bit 快 10.8%。DavinciTop
+34 trace 的成对实测显示打包是大幅净收益（封顶 192 的 2560.5 cyc/s 对比禁用
+打包 1310.0，禁用 **-48.8%**）；但完全不设上限会把上千个窄 lane 拼进一根
+超宽状态，emitted concat 的 `SumWidth` 递归模板超过 clang 1024 层上限，
+host 编译直接失败（2026-10-15 实测，全 34 trace 编译失败）。**当前默认
+`--state-pack-width=1024`**：保留封顶作为 host 编译器安全护栏，同时允许比
+192 更宽的组；上限族谱正整数可调（128/192/256/...）。
 
 性能模式还会运行旧 `PackI1RegsPass`，收集通用 dependency-aware packer 留下的
 i1 lane。（早期草稿中的"显式观测保留模式"已删除，见第 6 节。）

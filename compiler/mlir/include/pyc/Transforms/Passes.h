@@ -47,7 +47,7 @@ struct StateOptimizeTunables {
   unsigned retimeMaxStages = 0;
   unsigned retimeMaxExtraCombOps = 32;
   unsigned retimeMaxCombDepth = 32;
-  unsigned packMaxWidth = 0; // 0 = no cap on packed group width
+  unsigned packMaxWidth = 1024; // 0 disables packing
 };
 std::unique_ptr<::mlir::Pass>
 createStateOptimizePass(const StateOptimizeTunables &tunables = {});
