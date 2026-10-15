@@ -199,13 +199,13 @@ def _coerce(v: Any, expected: Data, port: str) -> Signal:
     if isinstance(v, Signal):
         if v.ty == expected:
             return v
-        if isinstance(v.ty, Bits) and isinstance(expected, Bits):
-            if v.ty.width < expected.width:
-                return v.zext(width=expected.width)
-            if v.ty.width > expected.width:
-                return v.trunc(width=expected.width)
-            return v
-        raise DesignError(f"ext port {port!r}: type mismatch, got {v.ty} expected {expected}")
+        # Width/type must match exactly: no silent zext/trunc coercion. An
+        # external black-box port has a fixed width declared in the manifest,
+        # so shipping a mismatched signal is an elaboration-time error the user
+        # must fix explicitly (e.g. by slicing/extending the signal upstream).
+        raise DesignError(
+            f"ext port {port!r}: width mismatch, got {v.ty} expected {expected}"
+        )
     # Constant integer literal.
     iv = int(v)
     limit = 1 << expected.width
