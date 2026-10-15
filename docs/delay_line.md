@@ -49,7 +49,7 @@ b@4 ─────────────────────────�
 仍可调的预算是：
 
 ```text
---state-pack-width=192
+--state-pack-width=0
 --state-retime-max-stages=0
 --state-retime-max-extra-comb-ops=32
 --state-retime-max-comb-depth=32
@@ -175,8 +175,8 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 --state-retime-max-comb-depth=32
     重建前缀及下游路径的局部深度上限；实际值不超过 --logic-depth
 
---state-pack-width=192
-    Stage 2 单个 packed storage 的默认最大宽度
+--state-pack-width=0
+    Stage 2 lane 打包默认禁用；设为正整数（如 192）后按该宽度封组打包
 
 --state-pack-width=0
     禁用 Stage 2，便于隔离 Stage 1/1.5 收益
@@ -189,7 +189,7 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 {
   "state_opt_policy": "structural",
   "state_retime_policy": "pipeline",
-  "state_opt_pack_width": 192
+  "state_opt_pack_width": 0
 }
 ```
 
@@ -465,10 +465,10 @@ Packing：
 直接成为模块输出的 packed slice 仍被 probe manifest 分类为 state。有运行时读取需求
 的具名逻辑 state 可通过 slice alias 和 `addRegSlice` 保持逻辑 probe 映射。
 
-### 9.4 为什么默认宽度是 192
+### 9.4 打包宽度的选择（默认禁用）
 
 更宽的 storage 会减少 primitive 数，但超宽 `Bits<W>` 的 concat/extract、copy 和
-更新成本也会上升。默认值不是“越宽越好”，而是由 C++ 微基准选择。
+更新成本也会上升。该结论来自 C++ 微基准，且明显依赖 workload：
 
 128 个独立 8-bit state、500,000 cycles、每种宽度 3 次取中位数：
 
@@ -479,8 +479,11 @@ Packing：
 | 192 | 4,362.49 | 6 | 40,979 |
 | 256 | 6,051.11 | 4 | 38,052 |
 
-192-bit 相对不打包快 32.8%，相对 128-bit 快 10.8%。256-bit 虽然 primitive 更少，
-但超宽运算成本抵消了调度收益，因此默认选择 192。
+在该微基准上 192-bit 相对不打包快 32.8%，相对 128-bit 快 10.8%；256-bit 虽然
+primitive 更少，但超宽运算成本抵消了调度收益。**当前 `pycc` 默认
+`--state-pack-width=0`（禁用 Stage 2 打包）**：微基准收益来自"大量窄 lane"的
+特定 workload，是否适用于目标设计需按 workload 实测；需要时显式传
+`--state-pack-width=192`（或 128/256）重新启用。
 
 性能模式还会运行旧 `PackI1RegsPass`，收集通用 dependency-aware packer 留下的
 i1 lane。（早期草稿中的"显式观测保留模式"已删除，见第 6 节。）
@@ -796,9 +799,9 @@ sequential/formal equivalence，不能靠局部 matcher 放宽。
 
 ### 17.3 没有基于综合反馈的目标相关 pack cost model
 
-192 是当前 C++ workload 上的默认折中，不代表所有 host、数据宽度和 RTL 目标都最优。
-后续可根据 backend、lane width 分布和真实 benchmark 选择不同上限，但不能只以
-primitive 数最少为目标。
+192 是微基准测得的 C++ workload 折中（Stage 2 默认关闭，见 9.4），不代表所有
+host、数据宽度和 RTL 目标都最优。后续可根据 backend、lane width 分布和真实
+benchmark 选择不同上限，但不能只以 primitive 数最少为目标。
 
 ### 17.4 X-state 和综合资源仍需独立评估
 

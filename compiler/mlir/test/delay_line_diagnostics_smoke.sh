@@ -66,7 +66,7 @@ for flag in --combine-delay-chains --state-delay-opt --state-retime \
   fi
 done
 
-"${PYCC}" "${INPUT}" --emit=cpp \
+"${PYCC}" "${INPUT}" --emit=cpp --state-pack-width=192 \
   --profile-json="${PROFILE_JSON}" -o "${MODEL}" 2>"${STDERR_LOG}"
 
 python3 - "${MODEL}.stats.json" "${STDERR_LOG}" "${PROFILE_JSON}" <<'PY'

@@ -107,7 +107,7 @@ fi
 "${FILECHECK_BIN}" "${STAGE15_STAGE2_INPUT}" --check-prefix=CAP \
   --input-file="${TMP_DIR}/packed-cap12.mlir"
 
-"${PYCC}" "${DEFAULT_INPUT}" --emit=cpp \
+"${PYCC}" "${DEFAULT_INPUT}" --emit=cpp --state-pack-width=192 \
   -o "${TMP_DIR}/default.hpp" 2>"${TMP_DIR}/default.stderr"
 "${PYCC}" "${DEFAULT_INPUT}" --emit=cpp --no-state-opt \
   -o "${TMP_DIR}/default-plain.hpp" 2>"${TMP_DIR}/default-plain.stderr"
@@ -152,7 +152,7 @@ if ! "${TMP_DIR}/observation-demand-comb-runtime"; then
   exit 1
 fi
 
-"${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp \
+"${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp --state-pack-width=192 \
   --observe-named=demand \
   -o "${TMP_DIR}/packed-probes-demand.hpp" 2>"${TMP_DIR}/packed-probes-demand.stderr"
 if grep -qE 'lane0_state[[:space:]]*=|lane1_state[[:space:]]*=' \
@@ -182,7 +182,7 @@ if ! "${TMP_DIR}/state-pack-probe-demand-runtime"; then
   exit 1
 fi
 
-"${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp \
+"${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp --state-pack-width=192 \
   --observe-named=all \
   --probe-manifest="${TMP_DIR}/packed-probes.json" \
   -o "${TMP_DIR}/packed-probes.hpp" 2>"${TMP_DIR}/packed-probes.stderr"

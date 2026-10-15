@@ -228,7 +228,7 @@ static llvm::cl::opt<unsigned> statePackWidth(
     "state-pack-width",
     llvm::cl::desc(
         "Maximum packed state-lane width in structural mode (0 disables Stage 2)"),
-    llvm::cl::init(192));
+    llvm::cl::init(0));
 
 static llvm::cl::opt<bool> noInline(
     "noinline",
