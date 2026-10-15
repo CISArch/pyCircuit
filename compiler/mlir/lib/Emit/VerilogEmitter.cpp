@@ -1,7 +1,5 @@
 #include "pyc/Emit/VerilogEmitter.h"
 
-#include "pyc/Emit/WireDriverCheck.h"
-
 #include "pyc/Dialect/PYC/PYCOps.h"
 #include "pyc/Dialect/PYC/PYCTypes.h"
 
@@ -473,39 +471,10 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
          << lsb << "];\n";
     return success();
   }
-  if (auto tap = dyn_cast<pyc::DelayTapOp>(op)) {
-    auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
-    auto depth = tap->getAttrOfType<IntegerAttr>("depth");
-    auto width = delay ? leafWidth(delay.getQ().getType()) : std::nullopt;
-    auto outTy = leafIntType(tap.getTap().getType());
-    if (!delay || !depth || !width || !outTy)
-      return {tap.emitError("invalid delay tap source or depth")};
-    std::string lineName = nt.get(tap.getLine());
-    std::string baseName = nt.get(delay.getQ());
-    std::string suffix;
-    if (llvm::StringRef(lineName).starts_with(baseName))
-      suffix = lineName.substr(baseName.size());
-    const auto bit = (depth.getInt() - 1) * static_cast<int64_t>(*width);
-    std::string history = baseName + "__history" + suffix;
-    std::string bitSelect = "[" + std::to_string(bit + *width - 1) + ":" +
-                            std::to_string(bit) + "]";
-    Type tapTy = tap.getTap().getType();
-    // Vector delay lines declare `history` as unpacked-per-lane packed buses,
-    // so the stage bit-select must sit after each lane index rather than on
-    // the whole array.
-    if (auto vt = dyn_cast<VectorType>(tapTy)) {
-      SmallVector<int64_t> shape = vectorShape(vt);
-      walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
-        std::string idx = indexSuffix(indices);
-        os << "assign " << nt.get(tap.getTap()) << idx << " = " << history
-           << idx << bitSelect << ";\n";
-      });
-    } else {
-      os << "assign " << nt.get(tap.getTap()) << " = " << history << bitSelect
-         << ";\n";
-    }
-    return success();
-  }
+  if (isa<pyc::DelayTapOp>(op))
+    return {op.emitError("pyc.delay_tap is not supported by the Verilog "
+                         "backend (delay lines are C++-only; re-emit with "
+                         "--emit=cpp or disable state optimization)")};
   if (auto sh = dyn_cast<pyc::ShliOp>(op)) {
     os << "assign " << nt.get(sh.getResult()) << " = (" << nt.get(sh.getIn()) << " << " << sh.getAmountAttr().getInt()
        << ");\n";
@@ -761,11 +730,7 @@ static LogicalResult emitNetlistOp(Operation &op, raw_ostream &os, NameTable &nt
                pyc::VBroadcastDimOp,
                pyc::VOrReduceOp,
                pyc::VAndReduceOp,
-               pyc::VAddReduceOp,
-               // Delay taps slice the per-lane history bus themselves; the
-               // element-wise walk would rebind names to per-lane mangles
-               // and corrupt the history reference.
-               pyc::DelayTapOp>(op))
+               pyc::VAddReduceOp>(op))
         return emitVectorElementwise(op, vt, os, nt);
   std::optional<LogicalResult> handled = emitScalarOpAssign(op, os, nt);
   if (!handled)
@@ -948,8 +913,6 @@ static bool topoSortCombOps(ArrayRef<Operation *> ops, NameTable &nt, llvm::Smal
 
 static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmitterOptions &opts) {
   (void)opts;
-  if (failed(rejectMultipleWireDrivers(f)))
-    return failure();
   NameTable nt;
   std::vector<std::string> outNames;
   outNames.reserve(f.getNumResults());
@@ -1033,22 +996,14 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
   }
   os << "\n";
 
-  // Expose existing delay stages as a read-only packed history bus for taps.
-  f.walk([&](pyc::DelayLineOp delay) {
-    bool hasTaps = llvm::any_of(delay.getQ().getUsers(),
-                                [](Operation *user) {
-                                  return isa<pyc::DelayTapOp>(user);
-                                });
-    if (!hasTaps)
-      return;
-    auto width = leafWidth(delay.getQ().getType());
-    auto depth = delay->getAttrOfType<IntegerAttr>("depth");
-    if (!width || !depth)
-      return;
-    os << "wire [" << (*width * depth.getInt() - 1) << ":0] "
-       << nt.get(delay.getQ()) << "__history"
-       << vUnpacked(delay.getQ().getType()) << ";\n";
-  });
+  // Reject delay lines early with a clear diagnostic: the Verilog backend
+  // keeps the pre-optimization netlist contract and never emits them.
+  bool sawDelayLine = false;
+  f.walk([&](pyc::DelayLineOp) { sawDelayLine = true; });
+  if (sawDelayLine)
+    return f.emitError("pyc.delay_line is not supported by the Verilog "
+                       "backend (delay lines are C++-only; re-emit with "
+                       "--emit=cpp or disable state optimization)");
   os << "\n";
 
   // Collect top-level ops for netlist-friendly emission.
@@ -1096,7 +1051,6 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
               pyc::LshrOp,
               pyc::AshrOp,
               pyc::ConcatOp,
-              pyc::DelayTapOp,
               pyc::VGetOp,
               pyc::VCreateOp,
               pyc::VBroadcastOp,
@@ -1111,7 +1065,7 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
         instOps.push_back(&op);
         continue;
       }
-      if (isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp, pyc::ByteMemOp>(op)) {
+      if (isa<pyc::RegOp, pyc::FifoOp, pyc::ByteMemOp>(op)) {
         seqInstOps.push_back(&op);
         continue;
       }
@@ -1295,50 +1249,6 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
         }
         continue;
       }
-      if (auto delay = dyn_cast<pyc::DelayLineOp>(op)) {
-        auto qTy = delay.getQ().getType();
-        auto width = leafWidth(qTy);
-        if (!width)
-          return delay.emitError("verilog emitter only supports integer delay_line leaf data type");
-        auto depthAttr = delay->getAttrOfType<IntegerAttr>("depth");
-        if (!depthAttr)
-          return delay.emitError("missing integer attribute `depth`");
-        auto depth = depthAttr.getValue().getZExtValue();
-        const bool hasTaps = llvm::any_of(
-            delay.getQ().getUsers(), [](Operation *user) {
-              return isa<pyc::DelayTapOp>(user);
-            });
-
-        auto emitDelay = [&](llvm::StringRef suffix, llvm::StringRef instanceSuffix) {
-          os << "pyc_delay_line #(.WIDTH(" << *width << "), .DEPTH(" << depth << ")) "
-             << nt.get(delay.getQ()) << "_inst" << instanceSuffix << " (\n";
-          os << "  .clk(" << nt.get(delay.getClk()) << "),\n";
-          os << "  .rst(" << nt.get(delay.getRst()) << "),\n";
-          os << "  .en(" << nt.get(delay.getEn()) << "),\n";
-          os << "  .d(" << nt.get(delay.getNext()) << suffix << "),\n";
-          os << "  .init(" << nt.get(delay.getInit()) << suffix << "),\n";
-          os << "  .q(" << nt.get(delay.getQ()) << suffix << ")";
-          if (hasTaps)
-            os << ",\n  .history(" << nt.get(delay.getQ()) << "__history"
-               << suffix << ")";
-          os << "\n";
-          os << ");\n";
-        };
-
-        if (auto vt = dyn_cast<VectorType>(qTy)) {
-          SmallVector<int64_t> shape = vectorShape(vt);
-          walkVectorIndices(shape, [&](ArrayRef<int64_t> indices) {
-            std::string suffix = indexSuffix(indices);
-            std::string instanceSuffix;
-            for (int64_t index : indices)
-              instanceSuffix += "_" + std::to_string(index);
-            emitDelay(suffix, instanceSuffix);
-          });
-        } else {
-          emitDelay("", "");
-        }
-        continue;
-      }
       if (auto fifo = dyn_cast<pyc::FifoOp>(op)) {
         auto inDataTy = dyn_cast<IntegerType>(fifo.getInData().getType());
         if (!inDataTy)
@@ -1512,7 +1422,6 @@ LogicalResult emitVerilog(ModuleOp module, llvm::raw_ostream &os, const VerilogE
   }
   if (opts.includePrimitives) {
     os << "`include \"pyc_reg.v\"\n";
-    os << "`include \"pyc_delay_line.v\"\n";
     os << "`include \"pyc_fifo.v\"\n\n";
     os << "`include \"pyc_byte_mem.v\"\n\n";
     os << "`include \"pyc_sync_mem.v\"\n";

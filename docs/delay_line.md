@@ -44,10 +44,12 @@ b@4 ─────────────────────────�
 - 端口行为、周期数、reset/enable/init 和功能数据流仍必须等价。
 
 只有 `--emit=cpp`（或 `-cpp`）跑完整状态优化（structural 合并 + pipeline retiming）。
-`--emit=verilog` 与 `--emit=none` 保持优化前的寄存器网表。仍可调的预算是：
+`--emit=verilog` 与 `--emit=none` 保持优化前的寄存器网表；Verilog 后端不认识
+`pyc.delay_line`/`pyc.delay_tap`，若 IR 中出现会明确报错（delay lines 为 C++ 专属）。
+仍可调的预算是：
 
 ```text
---state-pack-width=192
+--state-pack-width=1024
 --state-retime-max-stages=0
 --state-retime-max-extra-comb-ops=32
 --state-retime-max-comb-depth=32
@@ -173,11 +175,13 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 --state-retime-max-comb-depth=32
     重建前缀及下游路径的局部深度上限；实际值不超过 --logic-depth
 
---state-pack-width=192
-    Stage 2 单个 packed storage 的默认最大宽度
+--state-pack-width=1024
+    Stage 2 打包组宽度上限（默认 1024）；组宽超过会跨更多 64bit 字并
+    拉长 emitted concat 的变参模板链
 
 --state-pack-width=0
-    禁用 Stage 2，便于隔离 Stage 1/1.5 收益
+    禁用 Stage 2，便于隔离 Stage 1/1.5 收益（实测在 DavinciTop 上
+    禁用打包 -48.8%）
 
 ```
 
@@ -187,7 +191,7 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 {
   "state_opt_policy": "structural",
   "state_retime_policy": "pipeline",
-  "state_opt_pack_width": 192
+  "state_opt_pack_width": 0
 }
 ```
 
@@ -316,7 +320,7 @@ return %side, %q2
 
 `pyc.delay_tap` 是只读视图，不拥有第二份状态。其 verifier 要求 source 必须是
 `pyc.delay_line`，tap depth 在 `1..line.depth`，并且类型一致。C++ ring 从同一个
-history array 读取 tap；Verilog 从同一组 stages 的只读 history bus 取 slice。这样
+history array 读取 tap；Verilog 后端不支持 delay-line（见 11.2）。这样
 旁路值和末端值都保持原来的周期关系，状态存储仍只有一份。
 
 默认模式不会忽略真实 state dependency、写回 fanout、组合环或跨 block 边界。
@@ -463,10 +467,10 @@ Packing：
 直接成为模块输出的 packed slice 仍被 probe manifest 分类为 state。有运行时读取需求
 的具名逻辑 state 可通过 slice alias 和 `addRegSlice` 保持逻辑 probe 映射。
 
-### 9.4 为什么默认宽度是 192
+### 9.4 打包宽度的选择（默认 1024）
 
 更宽的 storage 会减少 primitive 数，但超宽 `Bits<W>` 的 concat/extract、copy 和
-更新成本也会上升。默认值不是“越宽越好”，而是由 C++ 微基准选择。
+更新成本也会上升。该结论来自 C++ 微基准，且明显依赖 workload：
 
 128 个独立 8-bit state、500,000 cycles、每种宽度 3 次取中位数：
 
@@ -477,8 +481,13 @@ Packing：
 | 192 | 4,362.49 | 6 | 40,979 |
 | 256 | 6,051.11 | 4 | 38,052 |
 
-192-bit 相对不打包快 32.8%，相对 128-bit 快 10.8%。256-bit 虽然 primitive 更少，
-但超宽运算成本抵消了调度收益，因此默认选择 192。
+在该微基准上 192-bit 相对不打包快 32.8%，相对 128-bit 快 10.8%。DavinciTop
+34 trace 的成对实测显示打包是大幅净收益（封顶 192 的 2560.5 cyc/s 对比禁用
+打包 1310.0，禁用 **-48.8%**）；但完全不设上限会把上千个窄 lane 拼进一根
+超宽状态，emitted concat 的 `SumWidth` 递归模板超过 clang 1024 层上限，
+host 编译直接失败（2026-10-15 实测，全 34 trace 编译失败）。**当前默认
+`--state-pack-width=1024`**：保留封顶作为 host 编译器安全护栏，同时允许比
+192 更宽的组；上限族谱正整数可调（128/192/256/...）。
 
 性能模式还会运行旧 `PackI1RegsPass`，收集通用 dependency-aware packer 留下的
 i1 lane。（早期草稿中的"显式观测保留模式"已删除，见第 6 节。）
@@ -607,17 +616,11 @@ unsigned head = 0;
 调度降为 O(1)。reset 必须填充全部历史位置，仍为 O(depth)。scalar/vector 分别使用
 `pyc_delay_line<Width, Depth>` 和 `pyc_vec_delay_line<T, Depth>`。
 
-### 11.2 Verilog delay-line：真实 shift register
+### 11.2 Verilog：不支持 delay-line
 
-[`VerilogEmitter.cpp`](../compiler/mlir/lib/Emit/VerilogEmitter.cpp) 生成：
-
-```verilog
-pyc_delay_line #(.WIDTH(8), .DEPTH(128)) delay_inst (...);
-```
-
-[`pyc_delay_line.v`](../runtime/verilog/pyc_delay_line.v) 使用寄存器数组、同步 reset
-循环和 enabled shift。Verilog 不采用 C++ ring index，避免给硬件增加地址状态和
-mux。vector delay-line 按 scalar leaf 展开共享控制的实例。
+Verilog 后端保持未优化网表契约，**不实现** delay-line lowering：IR 中出现
+`pyc.delay_line` / `pyc.delay_tap` 时 emitter 以明确诊断拒绝
+（delay lines 为 C++ 专属；如需 Verilog 对照请用 `--no-state-opt` 关闭状态优化）。
 
 ### 11.3 Packed state 的 probe/trace
 
@@ -773,7 +776,7 @@ python3 compiler/mlir/test/check_state_retime_models.py
 | Pipeline | [`pycc.cpp`](../compiler/mlir/tools/pycc.cpp) | 默认策略、pass 顺序、CLI 和统计汇总 |
 | Gates | [`CheckClockDomainsPass.cpp`](../compiler/mlir/lib/Transforms/CheckClockDomainsPass.cpp)、[`CheckCombCyclesPass.cpp`](../compiler/mlir/lib/Transforms/CheckCombCyclesPass.cpp)、[`CheckLogicDepthPass.cpp`](../compiler/mlir/lib/Transforms/CheckLogicDepthPass.cpp) | 把 delay-line 视为时序边界并执行 legality 检查 |
 | C++ | [`CppEmitter.cpp`](../compiler/mlir/lib/Emit/CppEmitter.cpp)、[`pyc_primitives.hpp`](../runtime/cpp/pyc_primitives.hpp)、[`pyc_probe_registry.hpp`](../runtime/cpp/pyc_probe_registry.hpp)、[`pyc_trace_bin.hpp`](../runtime/cpp/pyc_trace_bin.hpp) | ring runtime、packed slice probe 和 trace |
-| Verilog | [`VerilogEmitter.cpp`](../compiler/mlir/lib/Emit/VerilogEmitter.cpp)、[`pyc_delay_line.v`](../runtime/verilog/pyc_delay_line.v) | 可综合 delay-line lowering |
+| Verilog | [`VerilogEmitter.cpp`](../compiler/mlir/lib/Emit/VerilogEmitter.cpp) | 不支持 delay-line（明确报错） |
 | Tests | [`state_delay_optimization_smoke.sh`](../compiler/mlir/test/state_delay_optimization_smoke.sh)、[`delay_line_diagnostics_smoke.sh`](../compiler/mlir/test/delay_line_diagnostics_smoke.sh)、[`check_state_delay_tap_models.py`](../compiler/mlir/test/check_state_delay_tap_models.py)、[`check_state_retime_models.py`](../compiler/mlir/test/check_state_retime_models.py) | 默认策略、delay tap、retiming 和运行时 probe |
 
 ## 17. 当前没有实现的优化
@@ -800,9 +803,9 @@ sequential/formal equivalence，不能靠局部 matcher 放宽。
 
 ### 17.3 没有基于综合反馈的目标相关 pack cost model
 
-192 是当前 C++ workload 上的默认折中，不代表所有 host、数据宽度和 RTL 目标都最优。
-后续可根据 backend、lane width 分布和真实 benchmark 选择不同上限，但不能只以
-primitive 数最少为目标。
+192 是微基准测得的 C++ workload 折中（Stage 2 默认关闭，见 9.4），不代表所有
+host、数据宽度和 RTL 目标都最优。后续可根据 backend、lane width 分布和真实
+benchmark 选择不同上限，但不能只以 primitive 数最少为目标。
 
 ### 17.4 X-state 和综合资源仍需独立评估
 

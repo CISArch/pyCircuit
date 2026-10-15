@@ -233,6 +233,23 @@ static llvm::cl::opt<unsigned> stateRetimeMaxStages(
     llvm::cl::desc("Maximum registers per retimed region (0 is unlimited)"),
     llvm::cl::init(0));
 
+static llvm::cl::opt<bool> noStateOpt(
+    "no-state-opt",
+    llvm::cl::desc("Disable the structural state optimization pipeline (keep the plain netlist)"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<bool> seqBank(
+    "seq-bank",
+    llvm::cl::desc(
+        "Lower same-clock registers into per-clock SeqBank update loops "
+        "(use --no-seq-bank for the per-reg lowering)"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<bool> noSeqBank(
+    "no-seq-bank",
+    llvm::cl::desc("Disable SeqBank lowering; expand per-reg tick code"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<unsigned> stateRetimeMaxExtraCombOps(
     "state-retime-max-extra-comb-ops",
     llvm::cl::desc("Maximum duplicated combinational operations from retiming"),
@@ -247,7 +264,7 @@ static llvm::cl::opt<unsigned> statePackWidth(
     "state-pack-width",
     llvm::cl::desc(
         "Maximum packed state-lane width in structural mode (0 disables Stage 2)"),
-    llvm::cl::init(192));
+    llvm::cl::init(1024));
 
 static llvm::cl::opt<bool> noInline(
     "noinline",
@@ -1181,7 +1198,6 @@ static std::optional<std::string> findToolchainRoot(const char *argv0) {
 static LogicalResult emitPrimitivesFile(llvm::StringRef outPath, llvm::StringRef primDir, bool targetFpga) {
   static const char *kFiles[] = {
       "pyc_reg.v",
-      "pyc_delay_line.v",
       "pyc_fifo.v",
       "pyc_byte_mem.v",
       "pyc_sync_mem.v",
@@ -2659,7 +2675,7 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
   // State merge, retiming, and packing stay on the C++ emit path only so
   // Verilog keeps the pre-optimization netlist.
-  const bool enableStateDelayOptimization = (emitKind == "cpp");
+  const bool enableStateDelayOptimization = (emitKind == "cpp") && !noStateOpt;
   if (enableStateDelayOptimization) {
     // Unified structural state optimization: equivalent-state merge rounds
     // (with in-pass canonicalize/CSE between them), retiming, direct-chain
@@ -2678,6 +2694,10 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+  // SeqBank partition runs after all state rewrites so banks cover the final
+  // reg set; the C++ emitter reads the ids. fuse-comb does not move state.
+  if (emitKind == "cpp" && seqBank && !noSeqBank)
+    pm.addNestedPass<func::FuncOp>(pyc::createSeqBankPartitionPass());
   // Demand mode drops undemanded pyc.name after identities were remapped,
   // before fuse-comb treats leftover names as barriers.
   if (emitKind == "cpp" && llvm::StringRef(observeNamed) == "demand")
@@ -2969,6 +2989,7 @@ int main(int argc, char **argv) {
         os << "#include <string>\n";
         os << "#include <type_traits>\n";
         os << "#include <cpp/pyc_sim.hpp>\n";
+        os << "#include <cpp/pyc_seq_bank.hpp>\n";
         os << "#include <cpp/pyc_change_scheduler.hpp>\n";
       };
 
@@ -3197,6 +3218,7 @@ int main(int argc, char **argv) {
           hos << "#include <memory>\n";
           hos << "#include <type_traits>\n";
           hos << "#include <cpp/pyc_sim.hpp>\n";
+          hos << "#include <cpp/pyc_seq_bank.hpp>\n";
           hos << "#include <cpp/pyc_change_scheduler.hpp>\n";
           for (const std::string &dep : deps[f.getSymName()])
             hos << "#include \"" << dep << ".hpp\"\n";

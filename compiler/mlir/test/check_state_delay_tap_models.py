@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify C++ delay taps against unoptimized Verilog."""
+"""Verify C++ delay taps against unoptimized C++ (delay lines are C++-only)."""
 
 from __future__ import annotations
 
@@ -30,10 +30,10 @@ def result(command: list[str]) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def emit(pycc: Path, source: Path, output: Path, kind: str) -> dict[str, object]:
+def emit(pycc: Path, source: Path, output: Path, extra: list[str]) -> dict[str, object]:
     run([
-        str(pycc), str(source), f"--emit={kind}",
-        "--state-pack-width=0", "-o", str(output),
+        str(pycc), str(source), "--emit=cpp",
+        "--state-pack-width=1", *extra, "-o", str(output),
     ])
     return json.loads(Path(f"{output}.stats.json").read_text(encoding="utf-8"))
 
@@ -46,18 +46,6 @@ def compile_cpp(cxx: str, header: Path, binary: Path) -> None:
     ])
 
 
-def compile_verilator(verilog: Path, obj_dir: Path) -> Path:
-    env = dict(os.environ)
-    env["CCACHE_DISABLE"] = "1"
-    run([
-        "verilator", "--cc", "--exe", "--build", "-j", "2", "-Wno-fatal",
-        f"-I{ROOT / 'runtime/verilog'}", "--Mdir", str(obj_dir),
-        "--top-module", "state_delay_tap_codegen", str(verilog),
-        str(HERE / "state_delay_tap_verilator.cpp"),
-    ], env=env)
-    return obj_dir / "Vstate_delay_tap_codegen"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pycc", type=Path, default=DEFAULT_BUILD / "pycc")
@@ -67,36 +55,37 @@ def main() -> None:
     source = HERE / "state_delay_tap_codegen.mlir"
     with tempfile.TemporaryDirectory(prefix="pyc-delay-tap-", dir="/tmp") as path:
         temp = Path(path)
-        cpp = temp / "tap.hpp"
-        verilog = temp / "tap.v"
+        opt_cpp = temp / "opt.hpp"
+        plain_cpp = temp / "plain.hpp"
         observed: dict[str, tuple[int, int]] = {}
-        cpp_stats = emit(args.pycc, source, cpp, "cpp")
-        verilog_stats = emit(args.pycc, source, verilog, "verilog")
-        if cpp_stats.get("delay_chain_taps_created") != 1:
-            raise AssertionError(f"cpp: unexpected tap stats: {cpp_stats}")
-        if cpp_stats.get("reg_count") != 4 or cpp_stats.get("reg_bits") != 32:
-            raise AssertionError(f"cpp: logical state changed: {cpp_stats}")
-        if verilog_stats.get("delay_chain_taps_created"):
+        opt_stats = emit(args.pycc, source, opt_cpp, [])
+        plain_stats = emit(args.pycc, source, plain_cpp, ["--no-state-opt"])
+        if opt_stats.get("delay_chain_taps_created") != 1:
+            raise AssertionError(f"opt: unexpected tap stats: {opt_stats}")
+        if opt_stats.get("reg_count") != 4 or opt_stats.get("reg_bits") != 32:
+            raise AssertionError(f"opt: logical state changed: {opt_stats}")
+        if plain_stats.get("delay_chain_taps_created"):
             raise AssertionError(
-                f"verilog: tap rewrite ran unexpectedly: {verilog_stats}"
+                f"plain: tap rewrite ran unexpectedly: {plain_stats}"
             )
-        if (verilog_stats.get("reg_count") != 4 or
-                verilog_stats.get("reg_bits") != 32):
+        if (plain_stats.get("reg_count") != 4 or
+                plain_stats.get("reg_bits") != 32):
             raise AssertionError(
-                f"verilog: unoptimized state changed: {verilog_stats}"
+                f"plain: unoptimized state changed: {plain_stats}"
             )
-        if verilog_stats.get("state_opt_policy") != "off":
-            raise AssertionError(f"verilog: policy is not off: {verilog_stats}")
+        if plain_stats.get("state_opt_policy") != "off":
+            raise AssertionError(f"plain: policy is not off: {plain_stats}")
 
-        compile_cpp(args.cxx, cpp, temp / "cpp_bin")
-        observed["cpp"] = result([str(temp / "cpp_bin")])
-        observed["verilog"] = result([str(compile_verilator(verilog, temp / "obj"))])
+        compile_cpp(args.cxx, opt_cpp, temp / "opt_bin")
+        observed["opt"] = result([str(temp / "opt_bin")])
+        compile_cpp(args.cxx, plain_cpp, temp / "plain_bin")
+        observed["plain"] = result([str(temp / "plain_bin")])
         if len(set(observed.values())) != 1:
             raise AssertionError(f"delay tap backend mismatch: {observed}")
         cycles, checksum = next(iter(observed.values()))
         print(
             "delay tap equivalence verified: 4-reg chain -> one depth-4 history "
-            f"with depth-2 tap; optimized C++ matches unoptimized Verilog for "
+            f"with depth-2 tap; optimized C++ matches unoptimized C++ for "
             f"{cycles} cycles "
             f"(checksum={checksum})"
         )

@@ -47,7 +47,7 @@ struct StateOptimizeTunables {
   unsigned retimeMaxStages = 0;
   unsigned retimeMaxExtraCombOps = 32;
   unsigned retimeMaxCombDepth = 32;
-  unsigned packMaxWidth = 192; // 0 disables packing
+  unsigned packMaxWidth = 1024; // 0 disables packing
 };
 std::unique_ptr<::mlir::Pass>
 createStateOptimizePass(const StateOptimizeTunables &tunables = {});
@@ -74,5 +74,9 @@ std::unique_ptr<::mlir::Pass> createCheckLogicDepthPass(unsigned logicDepth);
 std::unique_ptr<::mlir::Pass> createCollectCompileStatsPass();
 std::unique_ptr<::mlir::Pass> createFlattenInstancesPass();
 std::unique_ptr<::mlir::Pass> createVectorUnrollPass();
+/// Analysis-only: tag each pyc.reg with `pyc.seq_bank_id` (one bank per
+/// equivalent clock domain) plus function-level stats; the C++ emitter
+/// lowers each bank into one pyc::cpp::SeqBank<W> update loop.
+std::unique_ptr<::mlir::Pass> createSeqBankPartitionPass();
 
 } // namespace pyc
