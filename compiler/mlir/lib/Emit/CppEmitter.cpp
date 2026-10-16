@@ -4219,8 +4219,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
          << ".commit();\n";
       unsigned lane = 0;
       for (pyc::RegOp r : seqBanked[bankId]) {
-        os << "    if ((_pyc_pbank_dirty_" << bankId << "[" << (lane >> 6)
-           << "u] >> " << (lane & 63) << "u) & 1u) {\n";
+        // Named per-lane commit-changed alias keeps the comb-dirty smoke
+        // assertions meaningful under the packed lowering.  The `_inst` suffix
+        // mirrors the non-banked path (below) so the smoke gate's
+        // `_pyc_commit_changed_pyc_reg_[0-9]+_inst` pattern still matches.
+        std::string key = nt.get(r.getQ()) + "_inst";
+        std::string changed = "_pyc_commit_changed_" + key;
+        os << "    const bool " << changed << " = ((_pyc_pbank_dirty_"
+           << bankId << "[" << (lane >> 6) << "u] >> " << (lane & 63)
+           << "u) & 1u);\n";
+        os << "    if (" << changed << ") {\n";
         emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt, "      ");
         os << "    }\n";
         ++lane;

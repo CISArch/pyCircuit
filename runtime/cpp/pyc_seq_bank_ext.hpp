@@ -398,9 +398,12 @@ public:
     return reinterpret_cast<bool *>(&pending_[i]);
   }
   // Raw packed storage access for probe write-data (const for reads; the
-  // registry only reads through it).
-  const std::uint64_t *storage_data() const { return cur_.data(); }
-  std::uint64_t *storage_data() { return cur_.data(); }
+  // registry only reads through it).  Probes observe the write-intent on the
+  // armed posedge, which lands in `nxt_` during compute_rise() before the
+  // commit() step; post-commit nxt_ == cur_ so reads after commit() are
+  // unchanged.  Hence expose `nxt_`, not the committed `cur_`.
+  const std::uint64_t *storage_data() const { return nxt_.data(); }
+  std::uint64_t *storage_data() { return nxt_.data(); }
 
   static constexpr std::size_t word_count(unsigned bits) {
     return (bits + 63) / 64;
