@@ -2106,15 +2106,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                 break;
               }
             }
-            std::string tapWriteNext =
-                matchingTap ? (nt.get(matchingTap.getTap()) + "_qNext")
-                            : (inst + "->qNext");
-            // Banked source delay: emit a static DelayBank::TapView and pass
-            // its pointer as the DelayInst argument (same tap()/pending
-            // interface), with write-intent from the bank lane.
-            std::string tapInstDecl;
-            std::string tapInstRef = inst;
-            std::string pendText = "&" + inst + "->pending";
+            std::string tapWriteNext;
+            // Banked detection for the fallback write-next.
+            std::string bankPend;
+            std::string bankQNext;
+            std::string tapViewDecl;
+            std::string tapViewRef;
             {
               Value qv = q;
               if (auto *def = qv.getDefiningOp())
@@ -2124,17 +2121,17 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                 if (auto srcDelay = dyn_cast<pyc::DelayLineOp>(d2)) {
                   auto [dinst, dpend, dnext] = delayBinding(srcDelay);
                   if (dinst.empty()) {
-                    if (auto idAttr =
-                            srcDelay->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
+                    if (auto idAttr = srcDelay->getAttrOfType<IntegerAttr>(
+                            "pyc.seq_bank_id")) {
                       const int64_t raw = idAttr.getValue().getSExtValue();
                       const unsigned dw = bitWidth(srcDelay.getQ().getType());
                       if (auto da = srcDelay->getAttrOfType<IntegerAttr>("depth")) {
                         const int64_t key = raw * 65536 +
                                             static_cast<int64_t>(dw) * 256 +
                                             da.getValue().getZExtValue();
-                        long lane = 0;
                         if (auto it = delayBanked.find(key);
                             it != delayBanked.end()) {
+                          long lane = 0;
                           for (pyc::DelayLineOp c : it->second) {
                             if (c == srcDelay)
                               break;
@@ -2142,33 +2139,52 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                           }
                           const std::string bank =
                               "delay_bank_" + std::to_string(key);
-                          tapInstDecl =
+                          bankPend = bank + ".lane_pending(" +
+                                     std::to_string(lane) + "u)";
+                          bankQNext = bank + ".lane_qnext(" +
+                                      std::to_string(lane) + "u)";
+                          tapViewDecl =
                               "    static const pyc::cpp::DelayBank<" +
                               std::to_string(dw) + ">::TapView _pyc_tvw_" +
-                              std::to_string(key) + "_" + std::to_string(lane) +
-                              "{&" + bank + ", " + std::to_string(lane) + "u};\n";
-                          tapInstRef = "&_pyc_tvw_" + std::to_string(key) +
+                              std::to_string(key) + "_" +
+                              std::to_string(lane) + "{&" + bank + ", " +
+                              std::to_string(lane) + "u};\n";
+                          tapViewRef = "&_pyc_tvw_" + std::to_string(key) +
                                        "_" + std::to_string(lane);
-                          pendText = bank + ".lane_pending(" +
-                                     std::to_string(lane) + "u)";
                         }
                       }
                     }
                   }
                 }
             }
+            if (matchingTap)
+              tapWriteNext = nt.get(matchingTap.getTap()) + "_qNext";
+            else if (!bankQNext.empty())
+              tapWriteNext = bankQNext;
+            else
+              tapWriteNext = inst + "->qNext";
+            if (tapViewDecl.empty()) {
+              tapViewDecl = "";
+              tapViewRef = inst;
+              if (bankPend.empty())
+                bankPend = "&" + inst + "->pending";
+            }
+            // Banked source delay: emit a static DelayBank::TapView and pass
+            // its pointer as the DelayInst argument (same tap()/pending
+            // interface), with write-intent from the bank lane.
             if (lsb == 0 && width == storageWidth) {
-              os << tapInstDecl;
+              os << tapViewDecl;
               os << "    reg.addRegLazyTap<" << width << ">(reg_path("
-                 << cppStringLiteral(field) << "), " << tapInstRef << ", "
-                 << tapDepth << "u, " << pendText << ", &" << tapWriteNext
-                 << ");\n";
+                 << cppStringLiteral(field) << "), " << tapViewRef << ", "
+                 << tapDepth << "u, " << (bankPend.empty() ? ("&" + inst + "->pending") : bankPend)
+                 << ", &" << tapWriteNext << ");\n";
             } else {
-              os << tapInstDecl;
+              os << tapViewDecl;
               os << "    reg.addRegLazyTapSlice<" << width << ", "
                  << storageWidth << ">(reg_path(" << cppStringLiteral(field)
-                 << "), " << tapInstRef << ", " << tapDepth << "u, " << lsb
-                 << "u, " << pendText << ", &" << tapWriteNext << ");\n";
+                 << "), " << tapViewRef << ", " << tapDepth << "u, " << lsb
+                 << "u, " << (bankPend.empty() ? ("&" + inst + "->pending") : bankPend)
+                 << ", &" << tapWriteNext << ");\n";
             }
             continue;
           }
