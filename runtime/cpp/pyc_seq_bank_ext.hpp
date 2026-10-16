@@ -322,17 +322,19 @@ public:
   void compute_rise() {
     clkPrev_ = true;
     nxt_ = cur_;  // disabled lanes keep their held bits
+    std::uint64_t words[kMaxLaneWords];
     for (std::size_t i = 0; i < lanes_.size(); ++i) {
       const Lane &lane = lanes_[i];
       const bool r = lane.rst->toBool();
       const bool e = lane.en->toBool();
       pending_[i] = static_cast<char>(r | e);
-      if (r)
-        write_bits(nxt_, lane.offset, lane.width,
-                   read_lane_words(lane.init, lane.width));
-      else if (e)
-        write_bits(nxt_, lane.offset, lane.width,
-                   read_lane_words(lane.d, lane.width));
+      if (r) {
+        read_lane_words(lane.init, lane.width, words);
+        write_lane_bits(nxt_, lane.offset, lane.width, words);
+      } else if (e) {
+        read_lane_words(lane.d, lane.width, words);
+        write_lane_bits(nxt_, lane.offset, lane.width, words);
+      }
     }
   }
 
@@ -350,39 +352,96 @@ public:
 
 
   // Bits<W> stores words contiguously; lane.width bits are in the low words.
-  static std::uint64_t read_lane_words(const void *wire, unsigned width) {
-    const std::uint64_t *w = static_cast<const std::uint64_t *>(wire);
-    std::uint64_t value = 0;
+  // Lanes wider than 64 bits move through fixed 64-word (4096-bit) scratch
+  // buffers word by word; single-word fast paths stay branch-free.
+  static constexpr unsigned kMaxLaneWords = 64;
+  // Read `width` bits of `v` at `off` into `out` (out[k] = lane bits
+  // [64k, 64k+64)). v must have room for word (off+width-1)/64 + 1.
+  static void read_lane_bits(const std::vector<std::uint64_t> &v,
+                             unsigned off, unsigned width,
+                             std::uint64_t *out) {
     unsigned got = 0;
-    while (got < width) {
-      value |= w[got / 64] << got;
-      got += 64;
+    for (unsigned k = 0; got < width; ++k, got += 64) {
+      const unsigned take = std::min<unsigned>(64, width - got);
+      const unsigned w0 = (off + got) / 64, b0 = (off + got) % 64;
+      std::uint64_t acc = v[w0] >> b0;
+      const unsigned hiBits = 64 - b0;
+      if (hiBits < take)
+        acc |= v[w0 + 1] << hiBits;
+      const std::uint64_t mask = take == 64 ? ~0ull : ((1ull << take) - 1);
+      out[k] = acc & mask;
     }
-    return value;
   }
+  // Write `width` bits from `in` into `v` at `off`.
+  static void write_lane_bits(std::vector<std::uint64_t> &v, unsigned off,
+                              unsigned width, const std::uint64_t *in) {
+    unsigned put = 0;
+    for (unsigned k = 0; put < width; ++k, put += 64) {
+      const unsigned take = std::min<unsigned>(64, width - put);
+      const unsigned w0 = (off + put) / 64, b0 = (off + put) % 64;
+      const std::uint64_t mask = take == 64 ? ~0ull : ((1ull << take) - 1);
+      v[w0] = (v[w0] & ~(mask << b0)) | ((in[k] & mask) << b0);
+      const unsigned hiBits = 64 - b0;
+      if (hiBits < take) {
+        const unsigned rem = take - hiBits;
+        const std::uint64_t hiMask =
+            rem == 64 ? ~0ull : ((1ull << rem) - 1);
+        v[w0 + 1] = (v[w0 + 1] & ~hiMask) | ((in[k] >> hiBits) & hiMask);
+      }
+    }
+  }
+  // Copy `width` bits of lane storage into `out` (zero-padded above width).
+  static void read_lane_words(const void *wire, unsigned width,
+                              std::uint64_t *out) {
+    const std::uint64_t *w = static_cast<const std::uint64_t *>(wire);
+    const unsigned words = (width + 63) / 64;
+    for (unsigned k = 0; k < words; ++k)
+      out[k] = w[k];
+    const unsigned rem = width % 64;
+    if (rem != 0)
+      out[words - 1] &= (1ull << rem) - 1;
+  }
+  // Copy lane value words into lane storage (`width` bits; the final partial
+  // word is read-modify-write so wider caller storage keeps its high bits).
   static void write_lane_words(void *wire, unsigned width,
-                               std::uint64_t value) {
+                               const std::uint64_t *in) {
     std::uint64_t *w = static_cast<std::uint64_t *>(wire);
-    std::uint64_t mask = width >= 64 ? ~0ull : ((1ull << width) - 1);
-    w[0] = (w[0] & ~mask) | (value & mask);
-    for (unsigned k = 1; k * 64 < width; ++k)
-      w[k] = value >> (k * 64);
+    const unsigned words = (width + 63) / 64;
+    for (unsigned k = 0; k < words; ++k)
+      w[k] = in[k];
+    const unsigned rem = width % 64;
+    if (rem != 0) {
+      const std::uint64_t mask = (1ull << rem) - 1;
+      w[words - 1] = (w[words - 1] & ~mask) | (in[words - 1] & mask);
+    }
   }
   // Applies pending lanes, writes q wires, returns per-lane dirty bitmap.
   const std::vector<std::uint64_t> &commit() {
     dirty_.assign(word_count(totalBits_), 0);
+    changed_.assign(lanes_.size(), false);
     const std::size_t words = word_count(totalBits_);
     for (std::size_t w = 0; w < words; ++w) {
       if (cur_[w] == nxt_[w])
         continue;
-      // Only lanes overlapping this word need evaluation.
+      // Only lanes overlapping this word need evaluation.  changed_[i]
+      // guards multi-word lanes from being re-processed on later words.
       for (std::size_t i = 0; i < lanes_.size(); ++i) {
         const Lane &lane = lanes_[i];
         if (!(lane.offset < (w + 1) * 64 && lane.offset + lane.width > w * 64))
           continue;
-        const std::uint64_t from = read_bits(cur_, lane.offset, lane.width);
-        const std::uint64_t to = read_bits(nxt_, lane.offset, lane.width);
-        if (from == to)
+        if (changed_[i])
+          continue;
+        std::uint64_t from[kMaxLaneWords], to[kMaxLaneWords];
+        read_lane_bits(cur_, lane.offset, lane.width, from);
+        read_lane_bits(nxt_, lane.offset, lane.width, to);
+        bool same = true;
+        for (unsigned k = 0, n = (lane.width + 63) / 64; k < n; ++k) {
+          if (from[k] != to[k]) {
+            same = false;
+            break;
+          }
+        }
+        if (same)
           continue;
         write_lane_words(lane.q, lane.width, to);
         changed_[i] = true;
