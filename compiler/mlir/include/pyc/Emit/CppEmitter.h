@@ -71,7 +71,9 @@ struct CppEmitterOptions {
 
   SplitMode splitMode = SplitMode::None;
   /// Lower SeqBank groups into contiguous PackedRegBank storage.
-  bool packedBank = false;
+  /// Always-on: bit-packed storage delivers packing's locality at the
+  /// lowering level while keeping register-precision dirty wake.
+  bool packedBank = true;
   unsigned shardThresholdLines = 120000;
   unsigned shardThresholdBytes = 4 * 1024 * 1024;
   // Chunk full-topology eval bodies to avoid mega-functions that are expensive

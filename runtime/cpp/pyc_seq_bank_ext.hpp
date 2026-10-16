@@ -394,7 +394,13 @@ public:
   }
 
   // Probe view (write-intent v1: disabled for packed lanes).
-  bool *lane_pending(std::size_t) { return nullptr; }
+  bool *lane_pending(std::size_t i) {
+    return reinterpret_cast<bool *>(&pending_[i]);
+  }
+  // Raw packed storage access for probe write-data (const for reads; the
+  // registry only reads through it).
+  const std::uint64_t *storage_data() const { return cur_.data(); }
+  std::uint64_t *storage_data() { return cur_.data(); }
 
   static constexpr std::size_t word_count(unsigned bits) {
     return (bits + 63) / 64;

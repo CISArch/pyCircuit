@@ -1574,10 +1574,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             ++lane;
           }
         }
+        if (packedBank)
+          return {"packed_bank_" + std::to_string(id) + ".lane_pending(" +
+                      std::to_string(lane) + "u)",
+                  "&" + nt.get(r.getQ())};
         std::string bank = "seq_bank_" + std::to_string(id);
         // lane_pending/lane_qnext return pointers; keep the '&' at the call
         // site out of this string (callers concatenate it verbatim after &).
-        // lane_pending/lane_qnext return pointers, so emit without '&'.
         return {bank + ".lane_pending(" + std::to_string(lane) + "u)",
                 bank + ".lane_qnext(" + std::to_string(lane) + "u)"};
       }
@@ -1988,6 +1991,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		        if (auto *d2 = qVal.getDefiningOp())
 		          srcReg = dyn_cast<pyc::RegOp>(d2);
 		      }
+		      std::string refP, refN;
 		      std::string pendBase = nt.get(source.q) + "_inst->pending";
 		      std::string nextBase = source.tap
 		                                         ? (nt.get(source.tap) + "_qNext")
@@ -2015,15 +2019,81 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		      }
 		      const auto pendNext = std::pair<std::string, std::string>{pendBase, nextBase};
 		      const bool banked = pendNext.first.rfind("seq_bank_", 0) == 0 ||
-		                              pendNext.first.rfind("delay_bank_", 0) == 0;
-		      const std::string refP = banked ? pendNext.first : "&" + pendNext.first;
-		      const std::string refN = banked ? pendNext.second : "&" + pendNext.second;
+		                              pendNext.first.rfind("delay_bank_", 0) == 0 ||
+		                              pendNext.first.rfind("packed_bank_", 0) == 0;
+		      // Packed-bank: slice probes' write-data must view the packed
+		      // storage (lane q wires are written back from it). Generate a
+		      // reinterpret of the owning bank's storage; lsb becomes the lane's
+		      // bit offset.
+		      std::string packedViewDecl;
+		      std::string packedViewRef;
+		      unsigned packedLsb = source.lsb;
+		      static llvm::DenseSet<int64_t> packedViewDeclsEmitted;
+		      if (packedBank && source.storage) {
+		        if (auto srcRegPK = dyn_cast<pyc::RegOp>(source.storage)) {
+		          if (auto idAttr = srcRegPK->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
+		            const int64_t pid = idAttr.getValue().getSExtValue();
+		            unsigned bitOff = 0;
+		            if (auto it = seqBanked.find(pid); it != seqBanked.end())
+		              for (pyc::RegOp c : it->second) {
+		                if (c == srcRegPK)
+		                  break;
+		                bitOff += bitWidth(c.getQ().getType());
+		              }
+		            // Declare once per bank (static local; idempotent).
+		            if (!packedViewDeclsEmitted.contains(pid)) {
+		              packedViewDeclsEmitted.insert(pid);
+		              packedViewDecl =
+		                  "    pyc::cpp::PackedRegBank *_pyc_pbank_v_" +
+		                  std::to_string(pid) + " = &packed_bank_" +
+		                  std::to_string(pid) + ";\n";
+		            }
+		            packedViewRef =
+		                "reinterpret_cast<pyc::cpp::Wire<" +
+		                std::to_string(storageWidth) + ">*>(_pyc_pbank_v_" +
+		                std::to_string(pid) + "->storage_data())";
+		            long pl = 0;
+		            for (pyc::RegOp c : seqBanked[pid]) {
+		              if (c == srcRegPK)
+		                break;
+		              ++pl;
+		            }
+		            // pending/qnext for this lane (pointers, no & needed).
+		            refP = "packed_bank_" + std::to_string(pid) +
+		                   ".lane_pending(" + std::to_string(pl) + "u)";
+		            refN = packedViewRef;
+		            packedLsb = source.lsb + bitOff;
+		          }
+		        }
+		      }
+		      // Packed-bank mode: write-data for slice probes is the packed
+		      // storage itself (lanes are packed in bit order, so a 16-bit
+		      // view covers adjacent lanes; lsb positions the slice).
+		      if (packedBank && source.storage) {
+		        if (auto srcRegPK = dyn_cast<pyc::RegOp>(source.storage)) {
+		          if (auto idAttr = srcRegPK->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
+		            const int64_t pid = idAttr.getValue().getSExtValue();
+		            unsigned acc = 0;
+		            if (auto it = seqBanked.find(pid); it != seqBanked.end())
+		              for (pyc::RegOp c : it->second) {
+		                if (c == srcRegPK)
+		                  break;
+		                acc += bitWidth(c.getQ().getType());
+		              }
+		            // packedViewDecl/Ref already computed above for this bank.
+		            // adjust lsb to the lane's bit offset in the packed storage
+		          }
+		        }
+		      }
+		      refP = banked ? pendNext.first : "&" + pendNext.first;
+		      refN = banked ? pendNext.second : "&" + pendNext.second;
 		      if (source.lsb != 0 || storageWidth != w) {
+			        os << packedViewDecl;
 			        os << "    reg.addRegSlice<" << w << ", " << storageWidth
 			           << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &"
 			           << outNames[i] << ", " << refP << ", "
-                       << refN
-                       << ", " << source.lsb << "u);\n";
+                       << (packedViewRef.empty() ? refN : packedViewRef)
+                       << ", " << packedLsb << "u);\n";
 			      } else {
 			        os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
 			           << ", " << refP << ", "
@@ -2037,7 +2107,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       for (const auto &named : namedProbes) {
         if (named.isReg && !isa<VectorType>(named.type)) {
           const bool bankedN = named.cppRegInst.rfind("seq_bank_", 0) == 0 ||
-                       named.cppRegInst.rfind("delay_bank_", 0) == 0;
+                       named.cppRegInst.rfind("delay_bank_", 0) == 0 ||
+                       named.cppRegInst.rfind("packed_bank_", 0) == 0;
           if (named.stateLsb != 0 ||
               named.stateStorageWidth != named.width) {
             os << "    reg.addRegSlice<" << named.width << ", "
@@ -2083,10 +2154,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
           if (auto *d2 = qVal.getDefiningOp())
             if (auto srcReg = dyn_cast<pyc::RegOp>(d2)) {
               auto pn = probePendingNext(srcReg);
-              if (pn.first.rfind("seq_bank_", 0) == 0) {
+              if (pn.first.rfind("seq_bank_", 0) == 0 ||
+                  pn.first.rfind("packed_bank_", 0) == 0) {
                 pendText = pn.first;
-                nextText = pn.second;
-                qText = "&" + nt.get(q);  // the shared q wire itself
+                nextText = "&" + nt.get(q);  // shared q wire (packed has no
+                                             // per-lane qNext storage)
+                qText = "&" + nt.get(q);
               }
             }
         }
