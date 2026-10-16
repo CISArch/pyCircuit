@@ -1974,6 +1974,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		      return f.emitError("invalid input port width for ProbeRegistry: ") << getPortCanonicalFieldPath(f, i, /*isResult=*/false);
 		    emitWireProbes(os, arg.getType(), w, inCanon[static_cast<unsigned>(i)], inNames[static_cast<unsigned>(i)]);
 		  }
+		  // Per-function dedup for packed-bank probe view decls. Bank ids are
+		  // numbered per FuncOp by the partition pass, so the same id appears
+		  // in many submodules; the set must reset for every emitFunc call
+		  // (a function-level static would skip declarations in later
+		  // submodules and break their probe compile).
+		  llvm::DenseSet<int64_t> packedViewDecls;
 		  for (unsigned i = 0; i < f.getNumResults(); ++i) {
 		    unsigned w = bitWidth(f.getResultTypes()[i]);
 		    if (w == 0)
@@ -2028,7 +2034,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		      std::string packedViewDecl;
 		      std::string packedViewRef;
 		      unsigned packedLsb = source.lsb;
-		      static llvm::DenseSet<int64_t> packedViewDeclsEmitted;
+		      llvm::DenseSet<int64_t> &packedViewDeclsEmitted = packedViewDecls;
 		      if (packedBank && source.storage) {
 		        if (auto srcRegPK = dyn_cast<pyc::RegOp>(source.storage)) {
 		          if (auto idAttr = srcRegPK->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
