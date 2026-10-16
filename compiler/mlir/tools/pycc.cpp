@@ -3011,7 +3011,7 @@ int main(int argc, char **argv) {
         os << "#include <string>\n";
         os << "#include <type_traits>\n";
         os << "#include <cpp/pyc_sim.hpp>\n";
-        os << "#include <cpp/pyc_seq_bank.hpp>\n";
+        os << "#include <cpp/pyc_seq_bank.hpp>\n#include <cpp/pyc_seq_bank_ext.hpp>\n";
         os << "#include <cpp/pyc_change_scheduler.hpp>\n";
       };
 
@@ -3240,7 +3240,7 @@ int main(int argc, char **argv) {
           hos << "#include <memory>\n";
           hos << "#include <type_traits>\n";
           hos << "#include <cpp/pyc_sim.hpp>\n";
-          hos << "#include <cpp/pyc_seq_bank.hpp>\n";
+          hos << "#include <cpp/pyc_seq_bank.hpp>\n#include <cpp/pyc_seq_bank_ext.hpp>\n";
           hos << "#include <cpp/pyc_change_scheduler.hpp>\n";
           for (const std::string &dep : deps[f.getSymName()])
             hos << "#include \"" << dep << ".hpp\"\n";

@@ -47,14 +47,21 @@ struct SeqBankPartitionPass
   void runOnOperation() override {
     func::FuncOp function = getOperation();
 
-    // Regs whose clk resolves to equivalent values share a bank. Reset /
-    // enable stay per-lane (they are read per lane in the bank loop), so
-    // only the clock drives the partition. Debug-keep / observable regs keep
-    // their q wire address, which SeqBank preserves, so no exclusion is
-    // needed here.
+    // Regs and scalar delay_lines whose clk resolves to equivalent values
+    // share a bank. Reset/enable/depth stay per-lane (read per lane in the
+    // bank loop); the emitter further splits by (id, width[, depth]) because
+    // SeqBank<W>/DelayBank<W> are single-width templates and delay lanes
+    // carry per-lane depth.
     llvm::SmallVector<pyc::RegOp> regs;
-    function.walk([&](pyc::RegOp reg) { regs.push_back(reg); });
-    if (regs.empty()) {
+    llvm::SmallVector<pyc::DelayLineOp> delays;
+    function.walk([&](Operation *op) {
+      if (auto reg = dyn_cast<pyc::RegOp>(op))
+        regs.push_back(reg);
+      else if (auto delay = dyn_cast<pyc::DelayLineOp>(op))
+        if (!isa<VectorType>(delay.getQ().getType()))
+          delays.push_back(delay);
+    });
+    if (regs.empty() && delays.empty()) {
       setI64Attr(function, kSeqBankGroups, 0);
       setI64Attr(function, kSeqBankLanes, 0);
       return;
@@ -64,35 +71,44 @@ struct SeqBankPartitionPass
     std::sort(regs.begin(), regs.end(), [](pyc::RegOp a, pyc::RegOp b) {
       return a->isBeforeInBlock(b);
     });
+    std::sort(delays.begin(), delays.end(), [](pyc::DelayLineOp a, pyc::DelayLineOp b) {
+      return a->isBeforeInBlock(b);
+    });
 
     llvm::DenseMap<Value, int64_t> clkToBank;
     int64_t nextBank = 0;
+    auto resolveBank = [&](Value clk) -> int64_t {
+      auto it = clkToBank.find(clk);
+      if (it != clkToBank.end())
+        return it->second;
+      Value canonical = clk;
+      if (auto *def = clk.getDefiningOp())
+        if (isa<pyc::AliasOp>(def))
+          canonical = def->getOperand(0);
+      auto cit = clkToBank.find(canonical);
+      if (cit != clkToBank.end()) {
+        clkToBank[clk] = cit->second;
+        return cit->second;
+      }
+      const int64_t id = nextBank++;
+      clkToBank[canonical] = id;
+      clkToBank[clk] = id;
+      return id;
+    };
+
     int64_t lanes = 0;
     for (pyc::RegOp reg : regs) {
-      Value clk = reg.getClk();
-      auto it = clkToBank.find(clk);
-      int64_t bankId;
-      if (it != clkToBank.end()) {
-        bankId = it->second;
-      } else {
-        // Alias through transparent ops so `%clk_deref = %clk` style values
-        // land in the same bank.
-        Value canonical = clk;
-        if (auto *def = clk.getDefiningOp())
-          if (isa<pyc::AliasOp>(def))
-            canonical = def->getOperand(0);
-        auto cit = clkToBank.find(canonical);
-        if (cit != clkToBank.end()) {
-          bankId = cit->second;
-        } else {
-          bankId = nextBank++;
-          clkToBank[canonical] = bankId;
-        }
-        clkToBank[clk] = bankId;
-      }
+      const int64_t bankId = resolveBank(reg.getClk());
       reg->setAttr(kSeqBankId,
                    IntegerAttr::get(IntegerType::get(reg->getContext(), 64),
                                     bankId));
+      ++lanes;
+    }
+    for (pyc::DelayLineOp delay : delays) {
+      const int64_t bankId = resolveBank(delay.getClk());
+      delay->setAttr(kSeqBankId,
+                     IntegerAttr::get(IntegerType::get(delay->getContext(), 64),
+                                      bankId));
       ++lanes;
     }
 

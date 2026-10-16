@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdint>
 #include <iostream>
+#include <cstdlib>
 
 int main() {
   pyc::gen::state_delay_tap_codegen model;
@@ -30,6 +31,11 @@ int main() {
       history[1] = history[0];
       history[0] = input;
     }
+    if (getenv("TAPDBG") && cycle < 8)
+      std::cerr << "c" << cycle << " tap=" << (unsigned)model.tap.value()
+                << " exp=" << (unsigned)history[1]
+                << " tail=" << (unsigned)model.tail.value()
+                << " expt=" << (unsigned)history[3] << "\n";
     assert(model.tap.value() == history[1]);
     assert(model.tail.value() == history[3]);
     checksum ^= model.tap.value() + 0x9e3779b97f4a7c15ULL +
