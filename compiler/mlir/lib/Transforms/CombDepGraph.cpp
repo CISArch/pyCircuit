@@ -187,6 +187,20 @@ resolveResultTransfer(Operation *op, unsigned resultIndex, ModuleOp module,
     Operation *symbol =
         module ? SymbolTable::lookupSymbolIn(module, calleeAttr.getValue())
                : nullptr;
+    if (auto ext = dyn_cast_or_null<pyc::ExtModuleOp>(symbol)) {
+      // External black-box boundary (see docs/external-modules.md): analyses
+      // stop here per Decision 0134/0135 semantics. The instance result is
+      // combinationally live in the same cycle (depend on every input,
+      // depth +1); multi-cycle user pipelines are internal to the black box.
+      (void)ext;
+      transfer.baseDepth = 1;
+      transfer.edgeKind = CombDepEdgeKind::InstancePort;
+      transfer.operandDependencies.reserve(instance.getNumOperands());
+      for (unsigned inputIndex = 0; inputIndex < instance.getNumOperands();
+           ++inputIndex)
+        transfer.operandDependencies.push_back({inputIndex, 1});
+      return transfer;
+    }
     auto callee = dyn_cast_or_null<func::FuncOp>(symbol);
     if (!callee) {
       instance.emitError("pyc.instance callee is not a func.func symbol: ")

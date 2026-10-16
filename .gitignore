@@ -254,3 +254,6 @@ designs/outerCube/
 .claude/settings.local.json
 # gate outputs
 docs/gates
+
+# local scratch/build outputs
+/out/

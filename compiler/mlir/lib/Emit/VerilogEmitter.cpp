@@ -1135,13 +1135,34 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
       auto calleeAttr = op->getAttrOfType<FlatSymbolRefAttr>("callee");
       if (!calleeAttr)
         return inst.emitError("missing required FlatSymbolRefAttr `callee`");
-      auto callee = mod.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
-      if (!callee)
-        return inst.emitError("callee symbol not found: ") << calleeAttr.getValue();
+      auto ext = mod.lookupSymbol<pyc::ExtModuleOp>(calleeAttr.getValue());
+      func::FuncOp callee;
+      if (!ext) {
+        callee = mod.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
+        if (!callee)
+          return inst.emitError("callee symbol not found: ") << calleeAttr.getValue();
+      }
 
       std::vector<std::string> inPorts;
       std::vector<std::string> outPorts;
-      computeUniquePortNames(callee, inPorts, outPorts);
+      if (ext) {
+        // External module: ports from ext symbol attributes (docs/external-modules.md).
+        NameTable portNt;
+        if (auto names = ext.getArgNames())
+          for (Attribute a : *names)
+            if (auto s = dyn_cast<StringAttr>(a))
+              inPorts.push_back(portNt.unique(sanitizeId(s.getValue())));
+        while (inPorts.size() < inst.getNumOperands())
+          inPorts.push_back(portNt.unique("arg" + std::to_string(inPorts.size())));
+        if (auto names = ext.getResultNames())
+          for (Attribute a : *names)
+            if (auto s = dyn_cast<StringAttr>(a))
+              outPorts.push_back(portNt.unique(sanitizeId(s.getValue())));
+        while (outPorts.size() < inst.getNumResults())
+          outPorts.push_back(portNt.unique("out" + std::to_string(outPorts.size())));
+      } else {
+        computeUniquePortNames(callee, inPorts, outPorts);
+      }
       if (inPorts.size() != inst.getNumOperands())
         return inst.emitError("operand count does not match callee signature");
       if (outPorts.size() != inst.getNumResults())
@@ -1153,6 +1174,15 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
       if (auto shortAttr = op->getAttrOfType<StringAttr>("short_name"))
         instName = sanitizeId(shortAttr.getValue());
       instName = nt.unique(instName);
+
+      // Module name to instantiate: ext modules instantiate the user's
+      // verilog_top when provided, otherwise the ext symbol name.
+      std::string moduleName = callee ? callee.getSymName().str()
+                                      : [&]() -> std::string {
+                                          if (auto t = ext.getVerilogTop())
+                                            return sanitizeId(*t);
+                                          return sanitizeId(ext.getSymName());
+                                        }();
 
       std::vector<std::string> inConn;
       std::vector<std::string> outConn;
@@ -1189,7 +1219,7 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
         }
       }
 
-      os << callee.getSymName() << " " << instName << " (\n";
+      os << moduleName << " " << instName << " (\n";
       unsigned totalPorts = static_cast<unsigned>(inPorts.size() + outPorts.size());
       unsigned emitted = 0;
 
