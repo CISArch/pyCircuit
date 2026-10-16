@@ -101,6 +101,17 @@ ext 实例是父模块 change-driven 调度图里的一个普通节点（有
 （Decision 0134/0135 的合法切点）。多拍延迟模块在自己的 `tick_commit()`
 内部状态里实现流水，行为正确；当前不做基于声明的提前唤醒优化。
 
+**有状态 ext 与 eval 缓存**：ext 实例的输出会因内部状态推进而变化（输入
+不变），因此每次 `tick_commit` 后生成代码强制失效该实例的 eval 指纹缓存，
+下一拍必定重调 `eval()`——不要依赖"输入没变输出就不变"的纯组合假设。
+
+**时钟模块**：`dir = "clock"` / `dir = "reset"` 端口（width=1）绑定 domain
+的 clk/rst，两个后端都会连上（Verilog 按端口名接顶层 net；C++ 赋给同名
+Wire 成员）。运行时每周期在 posedge 与 negedge 各调一次 `tick_commit()`，
+时钟模块必须在 `tick_commit()` 内部自己门控：记录上次 clk 值，仅在 0→1
+跳变时推进状态（参考 `designs/examples/ext_cache/ext/ext_cache.hpp`）。
+`rst` 按同步复位处理。
+
 分析边界：`pyc-flatten-instances`/`InlineFunctions` 不内联 ext 符号；
 `CheckCombCycles`/`CheckLogicDepth`/`CheckClockDomains` 在 ext 边界停止传播
 （黑盒内部不可见）。
