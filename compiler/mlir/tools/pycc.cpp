@@ -221,6 +221,12 @@ static llvm::cl::opt<bool> seqBank(
         "(use --no-seq-bank for the per-reg lowering)"),
     llvm::cl::init(true));
 
+static llvm::cl::opt<bool> packedBank(
+    "packed-bank",
+    llvm::cl::desc("Lower SeqBank groups into contiguous PackedRegBank storage "
+                   "(packing-equivalent locality without IR merging)"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> noSeqBank(
     "no-seq-bank",
     llvm::cl::desc("Disable SeqBank lowering; expand per-reg tick code"),
@@ -3332,6 +3338,7 @@ int main(int argc, char **argv) {
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
+    cppEmitOpts.packedBank = packedBank;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))

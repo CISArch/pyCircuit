@@ -1454,6 +1454,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  " << cppType(tap.getTap().getType()) << " " << nt.get(tap.getTap())
        << "_qNext{};\n";
 
+  const bool packedBank = opts.packedBank;
+  llvm::DenseMap<void *, unsigned> packedBankOffset;
+  llvm::DenseMap<int64_t, unsigned> packedBankBits;
   // SeqBank grouping: scalar regs carrying pyc.seq_bank_id lower into
   // per-bank pyc::cpp::SeqBank<W> members; everything else keeps the
   // per-reg expansion. Map: bank id -> (width, regs in IR order).
@@ -1481,6 +1484,19 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   for (auto &kv : seqBanked)
     seqBankIds.push_back(kv.first);
   std::sort(seqBankIds.begin(), seqBankIds.end());
+  // --packed-bank: lower SeqBank groups into PackedRegBank (contiguous
+  // bit-packed storage) instead of per-lane qNext vectors. Bit offset is
+  // assigned in lane order; widths are per-lane so no depth/wide restriction.
+  if (packedBank) {
+    for (int64_t bankId : seqBankIds) {
+      unsigned off = 0;
+      for (pyc::RegOp r : seqBanked[bankId]) {
+        packedBankOffset[r->getResult(0).getAsOpaquePointer()] = off;
+        off += bitWidth(r.getQ().getType());
+      }
+      packedBankBits[bankId] = off;
+    }
+  }
   // Rewrite the reg list so the per-reg paths skip banked regs.
   regs.clear();
   for (pyc::RegOp r : unbankedRegs)
@@ -1974,8 +1990,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		      }
 		      std::string pendBase = nt.get(source.q) + "_inst->pending";
 		      std::string nextBase = source.tap
-		                                         ? ("&" + nt.get(source.tap) + "_qNext")
-		                                         : ("&" + nt.get(source.q) + "_inst->qNext");
+		                                         ? (nt.get(source.tap) + "_qNext")
+		                                         : (nt.get(source.q) + "_inst->qNext");
 		      if (srcReg) {
 		        auto pn = probePendingNext(srcReg);
 		        pendBase = pn.first;
@@ -2312,9 +2328,15 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     else
       os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
   }
-  for (int64_t bankId : seqBankIds)
-    os << "  pyc::cpp::SeqBank<" << seqBankWidth[bankId] << "> seq_bank_"
-       << bankId << ";\n";
+  for (int64_t bankId : seqBankIds) {
+    if (packedBank)
+      os << "  pyc::cpp::PackedRegBank packed_bank_" << bankId << ";\n";
+    else
+      os << "  pyc::cpp::SeqBank<" << seqBankWidth[bankId] << "> seq_bank_"
+         << bankId << ";\n";
+  }
+  // (packed lane registration happens in the ctor loop below via
+  //  packedBankOffset lookups; see the per-reg new site.)
   for (int64_t dbk : delayBankIds) {
     os << "  pyc::cpp::DelayBank<" << delayBankShape[dbk].first
        << "> delay_bank_" << dbk << ";\n";
@@ -2647,6 +2669,17 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
        << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
   }
   for (int64_t bankId : seqBankIds) {
+    if (packedBank) {
+      for (pyc::RegOp r : seqBanked[bankId]) {
+        void *opKey = r->getResult(0).getAsOpaquePointer();
+        os << "    packed_bank_" << bankId << ".add_lane(pyc::cpp::PackedRegBank::Lane{"
+           << "&" << nt.get(r.getQ()) << ", &" << nt.get(r.getNext()) << ", &"
+           << nt.get(r.getRst()) << ", &" << nt.get(r.getEn()) << ", &"
+           << nt.get(r.getInit()) << ", " << bitWidth(r.getQ().getType())
+           << "u, " << packedBankOffset[opKey] << "u});\n";
+      }
+      continue;
+    }
     os << "    seq_bank_" << bankId << ".add_lanes({";
     bool firstLane = true;
     for (pyc::RegOp r : seqBanked[bankId]) {
@@ -3943,8 +3976,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "      bool _pyc_fall = _pyc_clk_prev && !_pyc_now;\n";
     os << "      _pyc_clk_prev = _pyc_now;\n";
     os << "      if (_pyc_rise) {\n";
-    for (int64_t bankId : seqBankIds)
-      os << "        seq_bank_" << bankId << ".compute_rise();\n";
+    for (int64_t bankId : seqBankIds) {
+      if (packedBank)
+        os << "        packed_bank_" << bankId << ".compute_rise();\n";
+      else
+        os << "        seq_bank_" << bankId << ".compute_rise();\n";
+    }
     for (int64_t dbk : delayBankIds)
       os << "        delay_bank_" << dbk << ".compute_rise();\n";
     emitEdgeCall("posedge_tick_compute", "        ");
@@ -3953,8 +3990,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "        _pyc_seq_armed = true;\n";
     os << "      } else if (_pyc_fall) {\n";
     os << "        if (_pyc_seq_armed) {\n";
-    for (int64_t bankId : seqBankIds)
-      os << "          seq_bank_" << bankId << ".negedge();\n";
+    for (int64_t bankId : seqBankIds) {
+      if (packedBank)
+        os << "          packed_bank_" << bankId << ".negedge();\n";
+      else
+        os << "          seq_bank_" << bankId << ".negedge();\n";
+    }
     for (int64_t dbk : delayBankIds)
       os << "          delay_bank_" << dbk << ".negedge();\n";
     emitEdgeCall("negedge_update", "          ");
@@ -3963,8 +4004,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (failed(emitTapUpdates("        ")))
       return failure();
     os << "      } else {\n";
-    for (int64_t bankId : seqBankIds)
-      os << "        seq_bank_" << bankId << ".compute_generic(_pyc_now);\n";
+    for (int64_t bankId : seqBankIds) {
+      if (packedBank)
+        os << "        packed_bank_" << bankId << ".compute_generic(_pyc_now);\n";
+      else
+        os << "        seq_bank_" << bankId << ".compute_generic(_pyc_now);\n";
+    }
     for (int64_t dbk : delayBankIds)
       os << "        delay_bank_" << dbk << ".compute_generic(_pyc_now);\n";
     emitEdgeCall("tick_compute", "        ");
@@ -4092,10 +4137,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       ++lane;
     }
   }
-  // SeqBank commit: one loop per bank; each set bit in the returned per-lane
-  // dirty bitmap wakes exactly that reg's fanout (same precision as the
-  // per-reg path).
+  // PackedBank commit: same per-lane dirty wake as SeqBank; the packed
+  // storage updates word-at-a-time inside commit().
   for (int64_t bankId : seqBankIds) {
+    if (packedBank) {
+      std::string bank = "packed_bank_" + std::to_string(bankId);
+      os << "    const auto &_pyc_pbank_dirty_" << bankId << " = " << bank
+         << ".commit();\n";
+      unsigned lane = 0;
+      for (pyc::RegOp r : seqBanked[bankId]) {
+        os << "    if ((_pyc_pbank_dirty_" << bankId << "[" << (lane >> 6)
+           << "u] >> " << (lane & 63) << "u) & 1u) {\n";
+        emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt, "      ");
+        os << "    }\n";
+        ++lane;
+      }
+      continue;
+    }
     const unsigned w = seqBankWidth[bankId];
     std::string bank = "seq_bank_" + std::to_string(bankId);
     os << "    const auto &_pyc_bank_dirty_" << bankId << " = " << bank

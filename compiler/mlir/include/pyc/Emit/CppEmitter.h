@@ -70,6 +70,8 @@ struct CppEmitterOptions {
   static constexpr unsigned kDefaultCombChunkNodes = 256;
 
   SplitMode splitMode = SplitMode::None;
+  /// Lower SeqBank groups into contiguous PackedRegBank storage.
+  bool packedBank = false;
   unsigned shardThresholdLines = 120000;
   unsigned shardThresholdBytes = 4 * 1024 * 1024;
   // Chunk full-topology eval bodies to avoid mega-functions that are expensive

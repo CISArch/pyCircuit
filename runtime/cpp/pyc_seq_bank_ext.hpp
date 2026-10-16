@@ -48,6 +48,16 @@ public:
     advanced_.assign(word_count(lanes_.size()), 0);
   }
 
+
+
+  // Bulk form used by generated code (each argument is a braced Lane).
+  template <typename... More>
+  void add_lanes(Lane lane, More... more) {
+    add_lane(lane);
+    if constexpr (sizeof...(more) > 0)
+      add_lanes(more...);
+  }
+
   // Bulk form used by generated code.
   void add_lanes(std::initializer_list<Lane> lanes) {
     for (const Lane &lane : lanes)
@@ -275,21 +285,16 @@ private:
 };
 
 
-// PackedRegBank: one contiguous packed storage covering every scalar reg of a
-// clock domain (lanes ≤64 bit, bit-offset assigned in add order). Delivers
-// packing's wide-storage locality WITHOUT IR merging: per-lane dirty wake is
-// preserved (finer than IR packing's word granularity), and probes fall back
-// to write-intent-free addReg (trace write events disabled for packed lanes).
 class PackedRegBank {
 public:
   struct Lane {
-    Wire<64> *q;
-    Wire<64> *d;
+    void *q;         // caller-owned Bits<W> (any W)
+    const void *d;   // Bits<W>
     Wire<1> *rst;
     Wire<1> *en;
-    const Wire<64> *init;
+    const void *init;
     unsigned width;
-    unsigned offset;  // bit offset into the packed storage, assigned here
+    unsigned offset; // bit offset into the packed storage, assigned here
   };
 
   void add_lane(Lane lane) {
@@ -301,6 +306,13 @@ public:
     pending_.push_back(0);
     qView_.emplace_back();
     resize();
+  }
+
+  template <typename... More>
+  void add_lanes(Lane lane, More... more) {
+    add_lane(lane);
+    if constexpr (sizeof...(more) > 0)
+      add_lanes(more...);
   }
 
   std::size_t size() const { return lanes_.size(); }
@@ -316,9 +328,11 @@ public:
       const bool e = lane.en->toBool();
       pending_[i] = static_cast<char>(r | e);
       if (r)
-        write_bits(nxt_, lane.offset, lane.width, lane.init->value());
+        write_bits(nxt_, lane.offset, lane.width,
+                   read_lane_words(lane.init, lane.width));
       else if (e)
-        write_bits(nxt_, lane.offset, lane.width, lane.d->value());
+        write_bits(nxt_, lane.offset, lane.width,
+                   read_lane_words(lane.d, lane.width));
     }
   }
 
@@ -334,6 +348,26 @@ public:
 
   void negedge() { clkPrev_ = false; pending_.assign(lanes_.size(), 0); }
 
+
+  // Bits<W> stores words contiguously; lane.width bits are in the low words.
+  static std::uint64_t read_lane_words(const void *wire, unsigned width) {
+    const std::uint64_t *w = static_cast<const std::uint64_t *>(wire);
+    std::uint64_t value = 0;
+    unsigned got = 0;
+    while (got < width) {
+      value |= w[got / 64] << got;
+      got += 64;
+    }
+    return value;
+  }
+  static void write_lane_words(void *wire, unsigned width,
+                               std::uint64_t value) {
+    std::uint64_t *w = static_cast<std::uint64_t *>(wire);
+    std::uint64_t mask = width >= 64 ? ~0ull : ((1ull << width) - 1);
+    w[0] = (w[0] & ~mask) | (value & mask);
+    for (unsigned k = 1; k * 64 < width; ++k)
+      w[k] = value >> (k * 64);
+  }
   // Applies pending lanes, writes q wires, returns per-lane dirty bitmap.
   const std::vector<std::uint64_t> &commit() {
     dirty_.assign(word_count(totalBits_), 0);
@@ -350,7 +384,7 @@ public:
         const std::uint64_t to = read_bits(nxt_, lane.offset, lane.width);
         if (from == to)
           continue;
-        *lane.q = Wire<64>(to);
+        write_lane_words(lane.q, lane.width, to);
         changed_[i] = true;
         dirty_[i >> 6] |= std::uint64_t{1} << (i & 63);
       }
