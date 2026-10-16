@@ -2174,17 +2174,19 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             // interface), with write-intent from the bank lane.
             if (lsb == 0 && width == storageWidth) {
               os << tapViewDecl;
+              const bool bankedW = tapWriteNext.rfind("delay_bank_", 0) == 0;
               os << "    reg.addRegLazyTap<" << width << ">(reg_path("
                  << cppStringLiteral(field) << "), " << tapViewRef << ", "
                  << tapDepth << "u, " << (bankPend.empty() ? ("&" + inst + "->pending") : bankPend)
-                 << ", &" << tapWriteNext << ");\n";
+                 << ", " << (bankedW ? tapWriteNext : ("&" + tapWriteNext)) << ");\n";
             } else {
               os << tapViewDecl;
+              const bool bankedW2 = tapWriteNext.rfind("delay_bank_", 0) == 0;
               os << "    reg.addRegLazyTapSlice<" << width << ", "
                  << storageWidth << ">(reg_path(" << cppStringLiteral(field)
                  << "), " << tapViewRef << ", " << tapDepth << "u, " << lsb
                  << "u, " << (bankPend.empty() ? ("&" + inst + "->pending") : bankPend)
-                 << ", &" << tapWriteNext << ");\n";
+                 << ", " << (bankedW2 ? tapWriteNext : ("&" + tapWriteNext)) << ");\n";
             }
             continue;
           }
