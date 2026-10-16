@@ -418,7 +418,7 @@ public:
     const std::uint64_t id = addImpl(std::move(path),
                    ProbeKind::Reg,
                    /*width_bits=*/W,
-                   static_cast<void *>(inst),
+                   const_cast<void *>(static_cast<const void *>(inst)),
                    write_valid,
                    static_cast<const void *>(write_data),
                    /*write_width_bits=*/W,
