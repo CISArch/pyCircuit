@@ -84,7 +84,7 @@ def test_parse_verilog_top_override() -> None:
         ('[module]\nname="m"\n', "at least one [[ports]] entry is required"),
         (
             '[module]\nname="m"\n[[ports]]\nname="a"\ndir="bidir"\nwidth=8\n',
-            'dir must be "in" or "out"',
+            'dir must be "in", "out", "clock" or "reset"',
         ),
         (
             '[module]\nname="m"\n[[ports]]\nname="a"\ndir="in"\nwidth=0\n',
@@ -210,3 +210,22 @@ def test_bind_width_mismatch_raises_too_wide() -> None:
     with pytest.raises(DesignError) as ei:
         bind(c, name="u", in_=x128, valid=1)
     assert "width mismatch" in str(ei.value)
+
+def test_parse_clock_reset_ports() -> None:
+    """Clocked modules declare dir="clock"/"reset" ports; they render as
+    !pyc.clock/!pyc.reset in the emitted function_type (ext_cache uses this)."""
+    text = (
+        '[module]\nname="m"\n'
+        '[[ports]]\nname="clk"\ndir="clock"\nwidth=1\n'
+        '[[ports]]\nname="rst"\ndir="reset"\nwidth=1\n'
+        '[[ports]]\nname="a"\ndir="in"\nwidth=8\n'
+        '[[ports]]\nname="y"\ndir="out"\nwidth=8\n'
+    )
+    decl = parse_manifest(_write_manifest(text))
+    assert [(p.name, p.dir) for p in decl.inputs] == [
+        ("clk", "clock"),
+        ("rst", "reset"),
+        ("a", "in"),
+    ]
+    text = ext_module_mlir(decl)
+    assert "(!pyc.clock, !pyc.reset, i8) -> (i8)" in text

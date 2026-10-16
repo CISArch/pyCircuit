@@ -56,7 +56,7 @@ class ExtModuleDecl:
 
     @property
     def inputs(self) -> tuple[ExtPort, ...]:
-        return tuple(p for p in self.ports if p.dir == "in")
+        return tuple(p for p in self.ports if p.dir in ("in", "clock", "reset"))
 
     @property
     def outputs(self) -> tuple[ExtPort, ...]:
@@ -87,8 +87,8 @@ def parse_manifest(path: str | Path) -> ExtModuleDecl:
         pwidth = int(entry.get("width", 0))
         if not pname or pname in seen:
             raise DesignError(f"{p}: port names must be unique and non-empty (got {pname!r})")
-        if pdir not in ("in", "out"):
-            raise DesignError(f"{p}: port {pname!r} dir must be \"in\" or \"out\"")
+        if pdir not in ("in", "out", "clock", "reset"):
+            raise DesignError(f"{p}: port {pname!r} dir must be \"in\", \"out\", \"clock\" or \"reset\"")
         if pwidth < 1 or pwidth > 4096:
             raise DesignError(f"{p}: port {pname!r} width must be in 1..4096")
         seen.add(pname)
@@ -111,8 +111,16 @@ def _mlir_str(s: str) -> str:
 
 def ext_module_mlir(decl: ExtModuleDecl) -> str:
     """Render the `pyc.ext_module` symbol declaration."""
-    in_tys = ", ".join(f"i{p.width}" for p in decl.inputs)
-    out_tys = ", ".join(f"i{p.width}" for p in decl.outputs)
+
+    def ty(p: ExtPort) -> str:
+        if p.dir == "clock":
+            return "!pyc.clock"
+        if p.dir == "reset":
+            return "!pyc.reset"
+        return f"i{p.width}"
+
+    in_tys = ", ".join(ty(p) for p in decl.inputs)
+    out_tys = ", ".join(ty(p) for p in decl.outputs)
     ft = f"({in_tys}) -> ({out_tys})"
 
     attrs: list[str] = [f"function_type = {ft}"]
@@ -156,6 +164,14 @@ def declare(target: Any, manifest_path: str | Path) -> Callable[..., Any]:
 
     def bind(circuit: Any, *, name: str, **ports: Any) -> Any:
         """Bind ports on `circuit` (a ModuleBuilder/Circuit) by keyword name."""
+
+        def type_str(p: ExtPort) -> str:
+            if p.dir == "clock":
+                return "!pyc.clock"
+            if p.dir == "reset":
+                return "!pyc.reset"
+            return f"i{p.width}"
+
         in_map: dict[str, Any] = {}
         for p in decl.inputs:
             key = p.name
@@ -174,6 +190,15 @@ def declare(target: Any, manifest_path: str | Path) -> Callable[..., Any]:
         operands: list[Signal] = []
         for p in decl.inputs:
             v = in_map[p.name]
+            tstr = type_str(p)
+            if tstr in ("!pyc.clock", "!pyc.reset"):
+                # Clock/reset ports take the domain's signals verbatim; they
+                # have no iN width to coerce.
+                v = v.sig if isinstance(v, Wire) else v
+                if not isinstance(v, Signal) and hasattr(v, "sig"):
+                    v = v.sig
+                operands.append(v)
+                continue
             if isinstance(v, int) and not isinstance(v, bool):
                 v = circuit.const(v, width=p.width)
             operands.append(_coerce(v, _type_for(p), p.name))

@@ -3549,7 +3549,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 
   auto emitTickCommitPart = [&](unsigned begin, unsigned end, unsigned partIdx) {
     os << "  inline void tick_commit_part_" << partIdx << "() {\n";
-    // Sub-modules.
+    // Sub-modules. Clocked external modules take clk as a manifest port and
+    // gate their own state update on a posedge inside tick_commit()
+    // (docs/external-modules.md); the call itself stays unconditional.
     for (unsigned i = begin; i < end && i < instInfos.size(); ++i) {
       os << "    pyc::cpp::ext_tick_commit(*" << instInfos[i].member << ");\n";
     }
@@ -3786,9 +3788,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     emitCommitWake(changed, sync.getOut());
   }
   if (!instInfos.empty()) {
-    os << "    // Force re-eval on next eval() only for stateful sub-modules.\n";
+    os << "    // Force re-eval on next eval() for stateful sub-modules and\n";
+    os << "    // external black boxes: both change outputs without their\n";
+    os << "    // instance input wires changing (state advanced in\n";
+    os << "    // tick_commit), so the input-fingerprint eval cache would go\n";
+    os << "    // stale (docs/external-modules.md).\n";
     for (unsigned i = 0; i < instInfos.size(); ++i) {
-      if (i < instHasSequentialCallee.size() && instHasSequentialCallee[i]) {
+      const bool stateful =
+          instInfos[i].isExt() ||
+          (i < instHasSequentialCallee.size() && instHasSequentialCallee[i]);
+      if (stateful) {
         os << "    " << instInfos[i].member << "_eval_cache_valid = false;\n";
       }
     }
