@@ -225,7 +225,7 @@ static llvm::cl::opt<bool> packedBank(
     "packed-bank",
     llvm::cl::desc("Lower SeqBank groups into contiguous PackedRegBank storage "
                    "(packing-equivalent locality without IR merging)"),
-    llvm::cl::init(false));
+    llvm::cl::init(true));
 
 static llvm::cl::opt<bool> noSeqBank(
     "no-seq-bank",
