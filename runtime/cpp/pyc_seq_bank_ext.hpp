@@ -274,4 +274,135 @@ private:
   bool clkPrev_ = false;
 };
 
+
+// PackedRegBank: one contiguous packed storage covering every scalar reg of a
+// clock domain (lanes ≤64 bit, bit-offset assigned in add order). Delivers
+// packing's wide-storage locality WITHOUT IR merging: per-lane dirty wake is
+// preserved (finer than IR packing's word granularity), and probes fall back
+// to write-intent-free addReg (trace write events disabled for packed lanes).
+class PackedRegBank {
+public:
+  struct Lane {
+    Wire<64> *q;
+    Wire<64> *d;
+    Wire<1> *rst;
+    Wire<1> *en;
+    const Wire<64> *init;
+    unsigned width;
+    unsigned offset;  // bit offset into the packed storage, assigned here
+  };
+
+  void add_lane(Lane lane) {
+    Lane l = lane;
+    l.offset = totalBits_;
+    totalBits_ += lane.width;
+    lanes_.push_back(l);
+    changed_.push_back(false);
+    pending_.push_back(0);
+    qView_.emplace_back();
+    resize();
+  }
+
+  std::size_t size() const { return lanes_.size(); }
+  unsigned totalBits() const { return totalBits_; }
+
+  // Caller guarantees a 0->1 edge just occurred on this bank's clock.
+  void compute_rise() {
+    clkPrev_ = true;
+    nxt_ = cur_;  // disabled lanes keep their held bits
+    for (std::size_t i = 0; i < lanes_.size(); ++i) {
+      const Lane &lane = lanes_[i];
+      const bool r = lane.rst->toBool();
+      const bool e = lane.en->toBool();
+      pending_[i] = static_cast<char>(r | e);
+      if (r)
+        write_bits(nxt_, lane.offset, lane.width, lane.init->value());
+      else if (e)
+        write_bits(nxt_, lane.offset, lane.width, lane.d->value());
+    }
+  }
+
+  void compute_generic(bool clkNow) {
+    const bool posedge = (!clkPrev_) & clkNow;
+    clkPrev_ = clkNow;
+    if (__builtin_expect(!posedge, 1)) {
+      pending_.assign(lanes_.size(), 0);
+      return;
+    }
+    compute_rise();
+  }
+
+  void negedge() { clkPrev_ = false; pending_.assign(lanes_.size(), 0); }
+
+  // Applies pending lanes, writes q wires, returns per-lane dirty bitmap.
+  const std::vector<std::uint64_t> &commit() {
+    dirty_.assign(word_count(totalBits_), 0);
+    const std::size_t words = word_count(totalBits_);
+    for (std::size_t w = 0; w < words; ++w) {
+      if (cur_[w] == nxt_[w])
+        continue;
+      // Only lanes overlapping this word need evaluation.
+      for (std::size_t i = 0; i < lanes_.size(); ++i) {
+        const Lane &lane = lanes_[i];
+        if (!(lane.offset < (w + 1) * 64 && lane.offset + lane.width > w * 64))
+          continue;
+        const std::uint64_t from = read_bits(cur_, lane.offset, lane.width);
+        const std::uint64_t to = read_bits(nxt_, lane.offset, lane.width);
+        if (from == to)
+          continue;
+        *lane.q = Wire<64>(to);
+        changed_[i] = true;
+        dirty_[i >> 6] |= std::uint64_t{1} << (i & 63);
+      }
+      cur_[w] = nxt_[w];
+    }
+    return dirty_;
+  }
+
+  // Probe view (write-intent v1: disabled for packed lanes).
+  bool *lane_pending(std::size_t) { return nullptr; }
+
+  static constexpr std::size_t word_count(unsigned bits) {
+    return (bits + 63) / 64;
+  }
+
+private:
+  static std::uint64_t read_bits(const std::vector<std::uint64_t> &v,
+                                 unsigned off, unsigned width) {
+    std::uint64_t value = 0;
+    unsigned got = 0;
+    while (got < width) {
+      unsigned w = (off + got) / 64, b = (off + got) % 64;
+      unsigned take = std::min<unsigned>(64 - b, width - got);
+      std::uint64_t mask = take == 64 ? ~0ull : ((1ull << take) - 1) << b;
+      value |= ((v[w] & mask) >> b) << got;
+      got += take;
+    }
+    return value;
+  }
+  static void write_bits(std::vector<std::uint64_t> &v, unsigned off,
+                         unsigned width, std::uint64_t value) {
+    unsigned put = 0;
+    while (put < width) {
+      unsigned w = (off + put) / 64, b = (off + put) % 64;
+      unsigned take = std::min<unsigned>(64 - b, width - put);
+      std::uint64_t mask = take == 64 ? ~0ull : ((1ull << take) - 1) << b;
+      v[w] = (v[w] & ~mask) | ((value >> put) << b & mask);
+      put += take;
+    }
+  }
+  void resize() {
+    cur_.assign(word_count(totalBits_), 0);
+    nxt_.assign(word_count(totalBits_), 0);
+  }
+
+  std::vector<Lane> lanes_;
+  std::vector<char> pending_;
+  std::vector<bool> changed_;
+  std::vector<Wire<64>> qView_;
+  std::vector<std::uint64_t> cur_, nxt_, dirty_;
+  unsigned totalBits_ = 0;
+  bool clkPrev_ = false;
+};
+
 }  // namespace pyc::cpp
