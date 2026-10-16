@@ -221,6 +221,13 @@ static llvm::cl::opt<bool> seqBank(
         "(use --no-seq-bank for the per-reg lowering)"),
     llvm::cl::init(true));
 
+static llvm::cl::opt<bool> packedBank(
+    "packed-bank",
+    llvm::cl::desc("Lower SeqBank groups into contiguous PackedRegBank storage "
+                   "(opt-in: DavinciTop measured SeqBank 3036.5 vs packed "
+                   "2645.6 cyc/s)"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> noSeqBank(
     "no-seq-bank",
     llvm::cl::desc("Disable SeqBank lowering; expand per-reg tick code"),
@@ -2972,6 +2979,10 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
+      // The --packed-bank cl::opt must reach the hierarchical (split-module)
+      // emission too; without this the flag silently defaulted to the header
+      // value and DavinciTop never lowered through PackedRegBank.
+      cppEmitOpts.packedBank = packedBank;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;

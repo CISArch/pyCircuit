@@ -71,9 +71,10 @@ struct CppEmitterOptions {
 
   SplitMode splitMode = SplitMode::None;
   /// Lower SeqBank groups into contiguous PackedRegBank storage.
-  /// Always-on: bit-packed storage delivers packing's locality at the
-  /// lowering level while keeping register-precision dirty wake.
-  bool packedBank = true;
+  /// Opt-in: DavinciTop baseline runs measured the SeqBank lowering at
+  /// 3036.5 cyc/s / P/V 0.680 while the packed lowering lands at 2645.6 /
+  /// 0.598 (-12.9%), so the default stays on the faster SeqBank path.
+  bool packedBank = false;
   unsigned shardThresholdLines = 120000;
   unsigned shardThresholdBytes = 4 * 1024 * 1024;
   // Chunk full-topology eval bodies to avoid mega-functions that are expensive
