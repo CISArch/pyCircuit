@@ -3,6 +3,8 @@
 # through the runtime thread pool. Sequential, pool-inline (PYC_THREADS=1) and
 # multi-thread (PYC_THREADS=4) runs must agree byte-for-byte, and the threaded
 # build must stay TSan-clean. Default flags must keep the sequential emission.
+# Section 5 additionally regression-checks the pool's load balance (tp_balance)
+# and that the PYC_TP_STATS probe stays opt-in.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -87,6 +89,47 @@ if "${CXX}" -std=c++17 -fsanitize=thread -pthread \
   fi
 else
   echo "note: TSan build unavailable, skipping (see ${OUT}/tsan_build.log)"
+fi
+
+# --- 5. Pool load-balance regression (tp_balance + opt-in stats probe). ------
+"${CXX}" -std=c++17 -O2 -pthread -I"${ROOT}/runtime" \
+  "${ROOT}/compiler/mlir/test/tp_balance.cpp" -o "${OUT}/tp_balance"
+
+# The stats probe must stay silent without an explicit opt-in.
+"${OUT}/tp_balance" uniform >/dev/null 2>"${OUT}/balance_nostats.err"
+if grep -q 'PYC_TP_STATS' "${OUT}/balance_nostats.err"; then
+  echo "fail: PYC_TP_STATS probe active without PYC_TP_STATS=1" >&2
+  exit 1
+fi
+
+if ! "${OUT}/tp_balance" --check; then
+  echo "fail: pool load-balance regression" >&2
+  exit 1
+fi
+
+cores="$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1)"
+cores=$((cores + 0))
+if (( cores >= 2 )); then
+  if (( cores > 4 )); then
+    cores=4
+  fi
+  PYC_TP_STATS=1 PYC_THREADS=${cores} "${OUT}/tp_balance" uniform \
+    >/dev/null 2>"${OUT}/balance_stats.raw"
+  # Every claimer must take part, and no thread may hog the dispatch.
+  grep 'PYC_TP_STATS: thread' "${OUT}/balance_stats.raw" \
+    > "${OUT}/balance_stats.txt"
+  awk '{
+         s = $NF; gsub(/%/, "", s);
+         if (s + 0 < 2 || s + 0 > 50) bad = 1;
+         n++;
+       }
+       END { exit (bad || n < 2) ? 1 : 0 }' "${OUT}/balance_stats.txt" || {
+    echo "fail: per-thread busy share outside [2%, 50%]:" >&2
+    cat "${OUT}/balance_stats.txt" >&2
+    exit 1
+  }
+else
+  echo "note: <2 cores, skipping per-thread share check"
 fi
 
 echo "ok: parallel tick smoke"

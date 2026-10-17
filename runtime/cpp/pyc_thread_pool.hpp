@@ -28,7 +28,9 @@
 // generated simulator kernels are noexcept by construction).
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <functional>
@@ -40,6 +42,29 @@ namespace pyc {
 namespace cpp {
 
 namespace detail {
+
+// Opt-in load-balance probe (enabled by PYC_TP_STATS=1 at process start).
+// Each thread that executes dispatch parts accumulates its part count and
+// busy time; the pool destructor prints a per-thread table. Disabled by
+// default and costs one relaxed load per dispatch when off.
+struct TpStatSlot {
+  std::atomic<unsigned long> parts{0};
+  std::atomic<unsigned long long> busyNs{0};
+};
+
+inline TpStatSlot tpStatSlots[64];
+inline std::atomic<int> tpStatNextSlot{0};
+inline std::atomic<bool> tpStatsEnabled{false};
+
+inline TpStatSlot *tpStatSlot() {
+  static thread_local TpStatSlot *slot = []() -> TpStatSlot * {
+    if (!tpStatsEnabled.load(std::memory_order_relaxed))
+      return nullptr;
+    int idx = tpStatNextSlot.fetch_add(1, std::memory_order_relaxed);
+    return idx < 64 ? &tpStatSlots[idx] : nullptr;
+  }();
+  return slot;
+}
 
 inline unsigned &threadOverride() {
   static unsigned value = 0;
@@ -117,6 +142,7 @@ private:
   }
 
   void drain() {
+    TpStatSlot *st = tpStatSlot();
     for (;;) {
       // Claim an index under the dispatch lock so {task_, next_, count_} are
       // read as one consistent snapshot. A lock-free fetch_add can straddle a
@@ -137,7 +163,18 @@ private:
         fn = task_;
         bound = count_;
       }
+      const auto t0 =
+          st ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       call(*fn, index);
+      if (st) {
+        st->busyNs.fetch_add(
+            static_cast<unsigned long long>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count()),
+            std::memory_order_relaxed);
+        st->parts.fetch_add(1, std::memory_order_relaxed);
+      }
       {
         // Completion must be published under the dispatch lock. The waiter's
         // cvDone_ predicate is only safe against lost wakeups if every change
@@ -166,6 +203,8 @@ private:
   }
 
   ForkJoinPool() {
+    if (const char *e = std::getenv("PYC_TP_STATS"))
+      tpStatsEnabled.store(e[0] == '1', std::memory_order_relaxed);
     unsigned threads = resolvedThreads();
     if (threads <= 1)
       return;
@@ -200,6 +239,26 @@ private:
     for (auto &w : workers_)
       if (w.joinable())
         w.join();
+    if (tpStatsEnabled.load(std::memory_order_relaxed)) {
+      unsigned long long total = 0;
+      for (const auto &s : tpStatSlots)
+        total += s.busyNs.load(std::memory_order_relaxed);
+      std::fprintf(stderr,
+                   "PYC_TP_STATS: total busy = %.1f ms across %d threads\n",
+                   static_cast<double>(total) / 1e6,
+                   tpStatNextSlot.load(std::memory_order_relaxed));
+      for (int i = 0; i < 64; ++i) {
+        const auto &s = tpStatSlots[i];
+        unsigned long p = s.parts.load(std::memory_order_relaxed);
+        unsigned long long b = s.busyNs.load(std::memory_order_relaxed);
+        if (!p)
+          continue;
+        std::fprintf(stderr,
+                     "PYC_TP_STATS: thread%-2d parts=%-6lu busy=%7.1f ms share=%5.1f%%\n",
+                     i, p, static_cast<double>(b) / 1e6,
+                     total ? 100.0 * static_cast<double>(b) / static_cast<double>(total) : 0.0);
+      }
+    }
   }
 
   std::mutex mutex_;
