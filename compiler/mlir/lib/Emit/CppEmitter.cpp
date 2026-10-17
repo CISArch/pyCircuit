@@ -3593,7 +3593,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // Large designs can produce enormous tick bodies (notably JanusBccBackendCompat), which
   // makes a single translation unit fragile and slow to compile. Split tick into helper
   // parts so --cpp-split=module can shard tick across multiple .cpp files.
-  constexpr unsigned kTickChunk = 256;
+  const unsigned kTickChunk = std::max(1u, opts.tickChunkInstances);
 
   auto emitStateTickCompute =
       [&](llvm::StringRef key, OperandRange operands, llvm::StringRef indent,
@@ -3654,8 +3654,22 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   os << "  void tick_compute() {\n";
   if (!instInfos.empty()) {
     os << "    // Sub-modules.\n";
-    for (unsigned i = 0; i < subParts; ++i)
-      os << "    tick_compute_part_" << i << "();\n";
+    // Tick parts cover disjoint instance sets and only read parent wires, so
+    // they can run as one fork-join dispatch; the pool degrades to a plain
+    // sequential loop when PYC_THREADS is unset/1 or the call is nested.
+    if (opts.parallelTick && subParts > 1) {
+      os << "    pyc::cpp::pyc_parallel_for(" << subParts
+         << "u, [this](unsigned _pyc_part) {\n";
+      os << "      switch (_pyc_part) {\n";
+      for (unsigned i = 0; i < subParts; ++i)
+        os << "      case " << i << "u: this->tick_compute_part_" << i
+           << "(); break;\n";
+      os << "      }\n";
+      os << "    });\n";
+    } else {
+      for (unsigned i = 0; i < subParts; ++i)
+        os << "    tick_compute_part_" << i << "();\n";
+    }
   }
   os << "    // Local sequential primitives.\n";
   auto emitEdgeCall = [&](const char *method, llvm::StringRef indent) {
@@ -3770,8 +3784,21 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   if (!instInfos.empty()) {
     os << "    // Sub-modules.\n";
     unsigned commitParts = (static_cast<unsigned>(instInfos.size()) + kTickChunk - 1) / kTickChunk;
-    for (unsigned i = 0; i < commitParts; ++i)
-      os << "    tick_commit_part_" << i << "();\n";
+    // Same disjoint-partition argument as tick_compute: instance commits write
+    // only their own SimObjects; parent state wakes run sequentially below.
+    if (opts.parallelTick && commitParts > 1) {
+      os << "    pyc::cpp::pyc_parallel_for(" << commitParts
+         << "u, [this](unsigned _pyc_part) {\n";
+      os << "      switch (_pyc_part) {\n";
+      for (unsigned i = 0; i < commitParts; ++i)
+        os << "      case " << i << "u: this->tick_commit_part_" << i
+           << "(); break;\n";
+      os << "      }\n";
+      os << "    });\n";
+    } else {
+      for (unsigned i = 0; i < commitParts; ++i)
+        os << "    tick_commit_part_" << i << "();\n";
+    }
   }
   os << "    // Local sequential primitives.\n";
   auto emitCommitWake = [&](llvm::StringRef condition, Value output,
@@ -4017,7 +4044,8 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   os << "#include <type_traits>\n";
   os << "#include <utility>\n";
   os << "#include <cpp/pyc_sim.hpp>\n";
-  os << "#include <cpp/pyc_change_scheduler.hpp>\n\n";
+  os << "#include <cpp/pyc_change_scheduler.hpp>\n";
+  os << "#include <cpp/pyc_thread_pool.hpp>\n\n";
   os << "namespace pyc::gen {\n\n";
 
   // Emit structs in dependency order so submodule types are defined before use.

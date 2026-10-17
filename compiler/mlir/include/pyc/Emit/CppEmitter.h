@@ -79,6 +79,15 @@ struct CppEmitterOptions {
   // downstream C++ TU cost even after file sharding.
   unsigned combChunkNodes = kDefaultCombChunkNodes;
   std::string probePlanPath{};
+  /// Dispatch submodule tick helper parts through the runtime thread pool
+  /// (pyc_thread_pool.hpp). Parts touch disjoint SimObjects (parent wires are
+  /// read-only during tick), so the fork-join is race-free; the actual thread
+  /// count is resolved at runtime via PYC_THREADS / pyc_set_threads().
+  bool parallelTick = false;
+  /// Submodule instances per tick helper part (default 256). Smaller chunks
+  /// give a finer parallel grain when parallelTick is enabled; the value also
+  /// controls tick TU sharding granularity for --cpp-split=module.
+  unsigned tickChunkInstances = 256;
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,
