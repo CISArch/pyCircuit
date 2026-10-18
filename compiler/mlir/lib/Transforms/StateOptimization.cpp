@@ -59,24 +59,6 @@ bool isStatefulConsumer(Operation *op) {
              pyc::AsyncFifoOp, pyc::CdcSyncOp, pyc::InstanceOp>(op);
 }
 
-std::optional<DelayChainMode> parseDelayChainMode(llvm::StringRef value) {
-  if (value == "generated")
-    return DelayChainMode::Generated;
-  if (value == "structural")
-    return DelayChainMode::Structural;
-  return std::nullopt;
-}
-
-llvm::StringRef stringifyDelayChainMode(DelayChainMode mode) {
-  switch (mode) {
-  case DelayChainMode::Generated:
-    return "generated";
-  case DelayChainMode::Structural:
-    return "structural";
-  }
-  llvm_unreachable("unknown delay-chain mode");
-}
-
 bool isCycleBalanceGenerated(Operation *op) {
   if (!op)
     return false;
@@ -197,36 +179,17 @@ bool equivalentStateValue(Value lhs, Value rhs) {
   return lhsConstant->getAttr("value") == rhsConstant->getAttr("value");
 }
 
-bool isStateOptimizationCandidate(pyc::RegOp reg, DelayChainMode mode) {
-  if (!reg)
-    return false;
-  if (mode == DelayChainMode::Generated)
-    return isCycleBalanceGenerated(reg);
-  return true;
-}
-
-bool isTransparentChainAlias(pyc::AliasOp alias, DelayChainMode mode) {
-  if (!alias)
-    return false;
-  if (mode == DelayChainMode::Generated)
-    return isCycleBalanceGenerated(alias);
-  return true;
-}
-
 std::optional<StateChainLink>
-matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
-                           DelayChainMode mode, bool allowReadOnlyFanout) {
+matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg) {
   Value value = consumer.getNext();
   StateChainLink link;
   while (auto alias = value.getDefiningOp<pyc::AliasOp>()) {
-    if (!isTransparentChainAlias(alias, mode))
-      return std::nullopt;
     link.aliasesFromConsumerToProducer.push_back(alias);
     value = alias.getIn();
   }
 
   auto predecessor = value.getDefiningOp<pyc::RegOp>();
-  if (!predecessor || !isStateOptimizationCandidate(predecessor, mode))
+  if (!predecessor)
     return std::nullopt;
   if (predecessor.getQ().getType() != keyReg.getQ().getType() ||
       !equivalentStateValue(predecessor.getClk(), keyReg.getClk()) ||
@@ -237,8 +200,6 @@ matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
 
   Value expectedProducer = predecessor.getQ();
   auto hasRequiredUser = [&](Value value, Operation *required) {
-    if (!allowReadOnlyFanout)
-      return value.hasOneUse() && *value.user_begin() == required;
     for (Operation *user : value.getUsers()) {
       if (user != required && isStatefulConsumer(user))
         return false;

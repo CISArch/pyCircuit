@@ -1,22 +1,28 @@
 // Regression fixture for delay-chain provenance and compile-stat reporting.
-// Two identical generated depth-2 chains must fold to one shared delay line.
+// Two identical generated depth-2 chains must merge to one register pair and
+// fold into one depth-2 delay line, with the tapped stage kept readable.
 //
 // CHECK-LABEL: func.func @delay_line_diagnostics
-// CHECK-DAG: pyc.stats.delay_chain_aliases_removed = 2 : i64
-// CHECK-DAG: pyc.stats.delay_chain_delay_lines_created = 2 : i64
-// CHECK-DAG: pyc.stats.delay_chain_delay_lines_merged = 1 : i64
-// CHECK-DAG: pyc.stats.delay_chain_regs_combined = 4 : i64
+// CHECK-DAG: pyc.stats.delay_chain_aliases_removed = 1 : i64
+// CHECK-DAG: pyc.stats.delay_chain_delay_lines_created = 1 : i64
+// CHECK-DAG: pyc.stats.delay_chain_delay_lines_merged = 0 : i64
+// CHECK-DAG: pyc.stats.delay_chain_regs_combined = 2 : i64
 // CHECK-DAG: pyc.stats.delay_chain_state_reads_after = 1 : i64
-// CHECK-DAG: pyc.stats.delay_chain_state_reads_before = 4 : i64
+// CHECK-DAG: pyc.stats.delay_chain_state_reads_before = 2 : i64
 // CHECK-DAG: pyc.stats.delay_chain_state_writes_after = 1 : i64
-// CHECK-DAG: pyc.stats.delay_chain_state_writes_before = 4 : i64
-// CHECK-DAG: pyc.stats.delay_chains_combined = 2 : i64
+// CHECK-DAG: pyc.stats.delay_chain_state_writes_before = 2 : i64
+// CHECK-DAG: pyc.stats.delay_chains_combined = 1 : i64
+// CHECK-DAG: pyc.stats.delay_chain_taps_created = 1 : i64
+// CHECK-DAG: pyc.stats.state_opt_regs_merged = 2 : i64
+// CHECK-DAG: pyc.stats.state_opt_reg_bits_removed = 16 : i64
 // CHECK: pyc.delay_line
 // CHECK-SAME: depth = 2 : i64
 // CHECK-SAME: pyc.generated = "cycle_balance"
-// CHECK-SAME: pyc.optimized_by = "combine_delay_chains"
-// CHECK-SAME: pyc.shared_chain_count = 2 : i64
-// CHECK-SAME: pyc.source_reg_count = 4 : i64
+// CHECK-SAME: pyc.optimized_by = "combine_delay_chains_structural"
+// CHECK-SAME: pyc.shared_chain_count = 1 : i64
+// CHECK-SAME: pyc.source_reg_count = 2 : i64
+// CHECK: pyc.delay_tap
+// CHECK-SAME: depth = 1 : i64
 // CHECK-NOT: pyc.reg
 
 module attributes {pyc.top = @delay_line_diagnostics, pyc.frontend.contract = "pycircuit"} {

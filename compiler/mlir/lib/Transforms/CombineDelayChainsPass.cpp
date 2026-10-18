@@ -1,8 +1,8 @@
-// Form compact delay-line state from proven serial register chains. The
-// generated mode preserves the original cycle-balance-only policy; structural
-// mode additionally merges equivalent state and admits untagged chains after
-// the same sequential proof. External observation identities are remapped onto
-// survivor / delay-line / delay-tap views instead of blocking the rewrite.
+// Form compact delay-line state from proven serial register chains. Every
+// register is a candidate once the sequential proof holds: equivalent state is
+// merged first, and untagged chains are admitted just like cycle-balance ones.
+// External observation identities are remapped onto survivor / delay-line /
+// delay-tap views instead of blocking the rewrite.
 
 #include "pyc/Transforms/Passes.h"
 #include "pyc/Transforms/StateOptimization.h"
@@ -26,7 +26,6 @@ namespace pyc {
 namespace {
 
 constexpr llvm::StringLiteral kOptimizedByAttr = "pyc.optimized_by";
-constexpr llvm::StringLiteral kCombineDelayChains = "combine_delay_chains";
 constexpr llvm::StringLiteral kStructuralCombineDelayChains =
     "combine_delay_chains_structural";
 constexpr llvm::StringLiteral kSourceRegCountAttr = "pyc.source_reg_count";
@@ -60,21 +59,10 @@ static int64_t stateBitWidth(Type type) {
   return 0;
 }
 
-static Value stripChainAliases(Value value, DelayChainMode mode) {
-  while (auto alias = value.getDefiningOp<pyc::AliasOp>()) {
-    if (!isTransparentChainAlias(alias, mode))
-      break;
+static Value stripChainAliases(Value value) {
+  while (auto alias = value.getDefiningOp<pyc::AliasOp>())
     value = alias.getIn();
-  }
   return value;
-}
-
-static bool isDelayCandidate(pyc::DelayLineOp delay, DelayChainMode mode) {
-  if (!delay)
-    return false;
-  if (mode == DelayChainMode::Generated)
-    return isCycleBalanceGenerated(delay);
-  return true;
 }
 
 static void mergeEquivalentStates(func::FuncOp function, CombineStats &stats) {
@@ -83,9 +71,6 @@ static void mergeEquivalentStates(func::FuncOp function, CombineStats &stats) {
 
   llvm::DenseMap<std::size_t, llvm::SmallVector<pyc::RegOp>> buckets;
   for (pyc::RegOp reg : regs) {
-    if (!isStateOptimizationCandidate(reg, DelayChainMode::Structural))
-      continue;
-
     auto &bucket = buckets[registerStateHash(reg)];
     pyc::RegOp survivor;
     for (pyc::RegOp existing : bucket) {
@@ -115,16 +100,11 @@ static void mergeEquivalentStates(func::FuncOp function, CombineStats &stats) {
   }
 }
 
-static void combineStateChains(func::FuncOp function, CombineStats &stats,
-                               DelayChainMode mode) {
+static void combineStateChains(func::FuncOp function, CombineStats &stats) {
   llvm::SmallVector<pyc::RegOp> regs;
-  function.walk([&](pyc::RegOp reg) {
-    if (isStateOptimizationCandidate(reg, mode))
-      regs.push_back(reg);
-  });
+  function.walk([&](pyc::RegOp reg) { regs.push_back(reg); });
 
   llvm::DenseSet<Operation *> erased;
-  const bool allowReadOnlyFanout = mode == DelayChainMode::Structural;
   for (pyc::RegOp tail : llvm::reverse(regs)) {
     if (erased.contains(tail.getOperation()))
       continue;
@@ -132,8 +112,7 @@ static void combineStateChains(func::FuncOp function, CombineStats &stats,
     llvm::SmallVector<pyc::RegOp> chainFromTail{tail};
     llvm::SmallVector<StateChainLink> linksFromTail;
     pyc::RegOp cursor = tail;
-    while (auto link = matchStateChainPredecessor(
-               cursor, tail, mode, allowReadOnlyFanout)) {
+    while (auto link = matchStateChainPredecessor(cursor, tail)) {
       if (erased.contains(link->predecessor.getOperation()))
         break;
       linksFromTail.push_back(*link);
@@ -198,18 +177,14 @@ static void combineStateChains(func::FuncOp function, CombineStats &stats,
     auto delay = builder.create<pyc::DelayLineOp>(
         tail.getLoc(), tail.getQ().getType(), head.getClk(), head.getRst(),
         head.getEn(),
-        stripChainAliases(head.getNext(), mode),
+        stripChainAliases(head.getNext()),
         head.getInit());
     delay->setAttr("depth", builder.getI64IntegerAttr(depth));
     if (allGenerated)
       delay->setAttr("pyc.generated",
                      builder.getStringAttr("cycle_balance"));
-    const bool legacyGeneratedRewrite =
-        allGenerated && mode == DelayChainMode::Generated;
     delay->setAttr(kOptimizedByAttr,
-                   builder.getStringAttr(legacyGeneratedRewrite
-                                             ? kCombineDelayChains
-                                             : kStructuralCombineDelayChains));
+                   builder.getStringAttr(kStructuralCombineDelayChains));
     delay->setAttr(kSourceRegCountAttr,
                    builder.getI64IntegerAttr(depth));
     delay->setAttr(kSharedChainCountAttr, builder.getI64IntegerAttr(1));
@@ -276,14 +251,12 @@ static void combineStateChains(func::FuncOp function, CombineStats &stats,
 
     ++stats.chainsCombined;
     stats.regsCombined += depth;
+    stats.structuralChainsCombined += 1;
+    stats.structuralRegsCombined += depth;
     ++stats.delayLinesCreated;
     for (const StateChainLink &link : linksFromTail)
       stats.aliasesRemoved +=
           static_cast<int64_t>(link.aliasesFromConsumerToProducer.size());
-    if (mode == DelayChainMode::Structural) {
-      ++stats.structuralChainsCombined;
-      stats.structuralRegsCombined += depth;
-    }
 
     tail.getQ().replaceAllUsesWith(delay.getQ());
 
@@ -301,13 +274,9 @@ static void combineStateChains(func::FuncOp function, CombineStats &stats,
 }
 
 static void shareEquivalentDelayLines(func::FuncOp function,
-                                      CombineStats &stats,
-                                      DelayChainMode mode) {
+                                      CombineStats &stats) {
   llvm::SmallVector<pyc::DelayLineOp> delays;
-  function.walk([&](pyc::DelayLineOp delay) {
-    if (isDelayCandidate(delay, mode))
-      delays.push_back(delay);
-  });
+  function.walk([&](pyc::DelayLineOp delay) { delays.push_back(delay); });
 
   llvm::DenseMap<std::size_t, llvm::SmallVector<pyc::DelayLineOp>> buckets;
   for (pyc::DelayLineOp delay : delays) {
@@ -347,7 +316,7 @@ static void shareEquivalentDelayLines(func::FuncOp function,
 
 static void writeCombineStats(func::FuncOp function, const CombineStats &stats,
                               bool accumulate, bool cascadeRound,
-                              DelayChainMode mode, bool performedMergeRound) {
+                              bool performedMergeRound) {
   auto write = [&](llvm::StringRef name, int64_t value) {
     if (accumulate)
       value += getI64Attr(function, name, 0);
@@ -374,8 +343,7 @@ static void writeCombineStats(func::FuncOp function, const CombineStats &stats,
         stats.structuralRegsCombined);
   write("pyc.stats.state_opt_cascade_regs_merged",
         cascadeRound && performedMergeRound ? stats.stateRegsMerged : 0);
-  write("pyc.stats.state_opt_merge_rounds",
-        mode == DelayChainMode::Structural && performedMergeRound ? 1 : 0);
+  write("pyc.stats.state_opt_merge_rounds", performedMergeRound ? 1 : 0);
   write("pyc.stats.delay_chain_taps_created", stats.delayTapsCreated);
   write("pyc.stats.delay_chain_tap_uses_rewritten",
         stats.delayTapUsesRewritten);
@@ -389,9 +357,7 @@ struct CombineDelayChainsPass
   CombineDelayChainsPass() = default;
   CombineDelayChainsPass(const CombineDelayChainsPass &other)
       : PassWrapper(other) {}
-  CombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
-                         bool cascadeRound) {
-    modeOption = stringifyDelayChainMode(mode).str();
+  CombineDelayChainsPass(bool accumulateStats, bool cascadeRound) {
     accumulateStatsOption = accumulateStats;
     cascadeRoundOption = cascadeRound;
   }
@@ -401,10 +367,6 @@ struct CombineDelayChainsPass
     return "Merge equivalent state and form proven fixed-depth delay lines";
   }
 
-  Option<std::string> modeOption{
-      *this, "mode",
-      llvm::cl::desc("Candidate policy: generated|structural"),
-      llvm::cl::init("generated")};
   Option<bool> accumulateStatsOption{
       *this, "accumulate-stats",
       llvm::cl::desc("Add rewrite statistics to an earlier optimization round"),
@@ -414,33 +376,21 @@ struct CombineDelayChainsPass
       llvm::cl::desc("Attribute equivalent-state merges to cascade refinement"),
       llvm::cl::init(false)};
   void runOnOperation() override {
-    auto mode = parseDelayChainMode(modeOption);
-    if (!mode) {
-      getOperation().emitError()
-          << "invalid delay-chain mode '" << modeOption
-          << "' (expected generated|structural)";
-      signalPassFailure();
-      return;
-    }
-
     func::FuncOp function = getOperation();
     CombineStats stats;
-    if (*mode == DelayChainMode::Structural)
-      mergeEquivalentStates(function, stats);
-    combineStateChains(function, stats, *mode);
-    shareEquivalentDelayLines(function, stats, *mode);
+    mergeEquivalentStates(function, stats);
+    combineStateChains(function, stats);
+    shareEquivalentDelayLines(function, stats);
     writeCombineStats(function, stats, accumulateStatsOption,
-                      cascadeRoundOption, *mode,
-                      *mode == DelayChainMode::Structural);
+                      cascadeRoundOption, /*performedMergeRound=*/true);
   }
 };
 
 } // namespace
 
 std::unique_ptr<::mlir::Pass>
-createCombineDelayChainsPass(DelayChainMode mode, bool accumulateStats,
-                             bool cascadeRound) {
-  return std::make_unique<CombineDelayChainsPass>(mode, accumulateStats,
+createCombineDelayChainsPass(bool accumulateStats, bool cascadeRound) {
+  return std::make_unique<CombineDelayChainsPass>(accumulateStats,
                                                   cascadeRound);
 }
 
@@ -449,17 +399,15 @@ void runDelayChainMergeRound(func::FuncOp function, bool cascadeRound,
   CombineStats stats;
   mergeEquivalentStates(function, stats);
   writeCombineStats(function, stats, accumulateStats, cascadeRound,
-                    DelayChainMode::Structural,
                     /*performedMergeRound=*/true);
 }
 
 void runDelayChainFormAndShare(func::FuncOp function, bool accumulateStats) {
   CombineStats stats;
-  combineStateChains(function, stats, DelayChainMode::Structural);
-  shareEquivalentDelayLines(function, stats, DelayChainMode::Structural);
+  combineStateChains(function, stats);
+  shareEquivalentDelayLines(function, stats);
   writeCombineStats(function, stats, accumulateStats,
-                    /*cascadeRound=*/false, DelayChainMode::Structural,
-                    /*performedMergeRound=*/false);
+                    /*cascadeRound=*/false, /*performedMergeRound=*/false);
 }
 
 static PassRegistration<CombineDelayChainsPass> pass;

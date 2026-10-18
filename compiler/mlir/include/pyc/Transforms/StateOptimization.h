@@ -46,9 +46,6 @@ bool isStatefulConsumer(mlir::Operation *op);
 /// Semantic hash of a value (resolved through aliases; constants by literal).
 std::size_t semanticValueHash(mlir::Value value);
 
-std::optional<DelayChainMode> parseDelayChainMode(llvm::StringRef value);
-llvm::StringRef stringifyDelayChainMode(DelayChainMode mode);
-
 bool isCycleBalanceGenerated(mlir::Operation *op);
 bool shouldKeepStateOptimization(mlir::Operation *op);
 /// True when `pyc.observe_lazy` marks an undeclared name as on-read lookup.
@@ -83,18 +80,17 @@ void remapStateOpIdentity(mlir::OpBuilder &builder, mlir::Operation *oldState,
 mlir::Value stripStateAliases(mlir::Value value);
 bool equivalentStateValue(mlir::Value lhs, mlir::Value rhs);
 
-bool isStateOptimizationCandidate(pyc::RegOp reg, DelayChainMode mode);
-bool isTransparentChainAlias(pyc::AliasOp alias, DelayChainMode mode);
-
 struct StateChainLink {
   pyc::RegOp predecessor;
   llvm::SmallVector<pyc::AliasOp> aliasesFromConsumerToProducer;
 };
 
+/// Match a proven serial state chain: `consumer.next` reaches `keyReg`'s q
+/// only through transparent aliases, with equivalent clock/reset/enable/init.
+/// Read-only fanout off intermediate stages is allowed; the rewrite turns it
+/// into fixed-depth delay taps.
 std::optional<StateChainLink>
-matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
-                           DelayChainMode mode,
-                           bool allowReadOnlyFanout = false);
+matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg);
 
 bool equivalentRegisterState(pyc::RegOp lhs, pyc::RegOp rhs);
 bool equivalentDelayLineState(pyc::DelayLineOp lhs, pyc::DelayLineOp rhs);

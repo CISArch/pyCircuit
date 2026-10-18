@@ -1,21 +1,5 @@
 // Stage 1 regression fixture for provenance-independent state optimization.
 //
-// GENERATED-LABEL: func.func @merge_untagged
-// GENERATED: %[[M0:.*]] = pyc.reg
-// GENERATED: %[[M1:.*]] = pyc.reg
-// GENERATED: return %[[M0]], %[[M1]]
-// GENERATED-LABEL: func.func @form_untagged_chain
-// GENERATED: pyc.reg
-// GENERATED: pyc.reg
-// GENERATED: pyc.reg
-// GENERATED-NOT: pyc.delay_line
-// GENERATED-LABEL: func.func @form_generated_chain
-// GENERATED: pyc.delay_line
-// GENERATED-SAME: depth = 2 : i64
-// GENERATED-NOT: pyc.reg
-// GENERATED-LABEL: func.func @merge_aliased_controls
-// GENERATED-COUNT-2: pyc.reg
-//
 // STRUCTURAL-LABEL: func.func @merge_untagged
 // STRUCTURAL-SAME: pyc.stats.state_opt_reg_bits_removed = 8 : i64
 // STRUCTURAL-SAME: pyc.stats.state_opt_regs_merged = 1 : i64

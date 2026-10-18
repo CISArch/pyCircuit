@@ -8,11 +8,6 @@
 
 namespace pyc {
 
-enum class DelayChainMode {
-  Generated,
-  Structural,
-};
-
 std::unique_ptr<::mlir::Pass> createCombCanonicalizePass();
 std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
@@ -21,8 +16,7 @@ std::unique_ptr<::mlir::Pass>
 createRetimePipelinesPass(unsigned maxStages = 0,
                           bool accumulateStats = false);
 std::unique_ptr<::mlir::Pass>
-createCombineDelayChainsPass(DelayChainMode mode = DelayChainMode::Generated,
-                             bool accumulateStats = false,
+createCombineDelayChainsPass(bool accumulateStats = false,
                              bool cascadeRound = false);
 std::unique_ptr<::mlir::Pass>
 createPackStateLanesPass(unsigned maxWidth = 192);

@@ -39,18 +39,12 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
 
 "${PYC_OPT}" "${INPUT}" \
   --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains))' \
-  -o "${TMP_DIR}/generated.mlir"
-"${FILECHECK_BIN}" "${INPUT}" --check-prefix=GENERATED \
-  --input-file="${TMP_DIR}/generated.mlir"
-
-"${PYC_OPT}" "${INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains{mode=structural}))' \
   -o "${TMP_DIR}/structural.mlir"
 "${FILECHECK_BIN}" "${INPUT}" --check-prefix=STRUCTURAL \
   --input-file="${TMP_DIR}/structural.mlir"
 
 "${PYC_OPT}" "${INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains{mode=structural}))' \
+  --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains))' \
   -o "${TMP_DIR}/aggressive.mlir"
 "${FILECHECK_BIN}" "${INPUT}" --check-prefix=AGGRESSIVE \
   --input-file="${TMP_DIR}/aggressive.mlir"
@@ -71,26 +65,8 @@ fi
 "${FILECHECK_BIN}" "${OBSERVABILITY_INPUT}" --check-prefix=KEEP \
   --input-file="${TMP_DIR}/kept-observability.mlir"
 
-set +e
-"${PYC_OPT}" "${INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains{mode=invalid}))' \
-  -o "${TMP_DIR}/invalid.mlir" >"${TMP_DIR}/invalid.stdout" \
-  2>"${TMP_DIR}/invalid.stderr"
-INVALID_RC=$?
-set -e
-if [[ ${INVALID_RC} -eq 0 ]]; then
-  echo "fail: invalid delay-chain mode was accepted" >&2
-  exit 1
-fi
-if ! grep -q "invalid delay-chain mode 'invalid' (expected generated|structural)" \
-  "${TMP_DIR}/invalid.stderr"; then
-  echo "fail: invalid delay-chain mode diagnostic is missing" >&2
-  cat "${TMP_DIR}/invalid.stderr" >&2
-  exit 1
-fi
-
 "${PYC_OPT}" "${STAGE15_STAGE2_INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains{mode=structural}),cse,func.func(pyc-combine-delay-chains{mode=structural accumulate-stats=true cascade-round=true}))' \
+  --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains),cse,func.func(pyc-combine-delay-chains{accumulate-stats=true cascade-round=true}))' \
   -o "${TMP_DIR}/cascade.mlir"
 "${FILECHECK_BIN}" "${STAGE15_STAGE2_INPUT}" --check-prefix=CASCADE \
   --input-file="${TMP_DIR}/cascade.mlir"

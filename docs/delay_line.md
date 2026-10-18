@@ -121,8 +121,9 @@ logical state bits     = N × W
 ### 3.2 Provenance 不是正确性证明
 
 早期实现把 `pyc.generated = "cycle_balance"` 当作候选资格，安全但覆盖有限。
-当前设计中 marker 仍用于来源统计；`pyc-opt` 的 generated 兼容模式仍会看它。
-`pycc` 固定走 structural，正确性来自完整状态转移条件，而不是来源名字。
+现在只有一套候选策略：由完整状态转移条件决定，不依赖 marker；marker 仅用于
+来源统计/诊断。`pycc` 的 C++ 路径和 `pyc-opt` 的 `pyc-combine-delay-chains` 走同一
+套证明。
 
 ### 3.3 区分四类指标
 
@@ -261,7 +262,7 @@ pyc.state_merged_count
 
 ### 7.2 Provenance-independent 串行链识别
 
-structural 模式逆序选择 tail，并沿 consumer 的 `next` 向前寻找 predecessor。
+收链阶段逆序选择 tail，并沿 consumer 的 `next` 向前寻找 predecessor。
 每条链边必须满足：
 
 1. 中间只经过透明 `pyc.alias`；
@@ -282,8 +283,8 @@ controls   = head clock/reset/enable/init
 replacement= tail.q → delay_line.q
 ```
 
-`generated` 模式还额外要求所有 reg 和透明 alias 都带
-`pyc.generated="cycle_balance"`。structural 模式不要求该 marker。
+候选资格不再依赖来源 marker：任何 `pyc.reg` 只要通过上述状态转移证明就会参与
+合并和收链，`pyc.generated="cycle_balance"` 只作为来源统计保留。
 
 ### 7.3 中间只读 fanout 与 delay tap
 
@@ -382,7 +383,7 @@ chain、共享 history 和生成 tap。这样既不会让局部 retiming 抢占�
 fixed point。
 统计字段：
 
-- `state_opt_merge_rounds`：structural 模式实际合并轮数；
+- `state_opt_merge_rounds`：实际合并轮数；
 - `state_opt_cascade_regs_merged`：第二轮新增的等价状态合并数。
 
 Stage 1.5 只共享已经因状态合并而等价的组合锥，不移动组合逻辑穿过寄存器边界。
@@ -485,7 +486,7 @@ i1 lane。（早期草稿中的"显式观测保留模式"已删除，见第 6 �
 Retiming 由 [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimePipelinesPass.cpp)
 实现，由 `pyc-state-optimize`（`pycc` C++ 路径的统一状态优化 pass）作为内部
 阶段调用；也可用 `pyc-opt` 单独跑 `pyc-retime-pipelines`。它不依赖
-`pyc.generated="cycle_balance"`，默认在 structural 性能模式中开启。
+`pyc.generated="cycle_balance"`，默认在 C++ 性能路径中开启。
 
 ### 10.0 收益模型：跨拍融合，不是位宽差
 
@@ -675,8 +676,8 @@ C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读
 因此：
 
 - 功能回归、内部 `dut.read` 和 probe 清单都走默认 C++ 路径；
-- 需要拆开 generated 兼容改写时用 `pyc-opt` 指定 `pyc-combine-delay-chains`
-  或 `pyc-state-optimize` 的单个阶段；`pycc` 不再提供 off / generated /
+- 需要只跑某一阶段做诊断时用 `pyc-opt` 指定 `pyc-combine-delay-chains` 或
+  `pyc-state-optimize`；两条路径共用同一套候选策略。`pycc` 不提供 off /
   retime-off / preserve-observability 开关。
 
 ## 14. 统计和诊断
@@ -804,7 +805,7 @@ pyc4.0 value-model hardening。Yosys/目标综合器的 FF/LUT/memory 数据也�
 当前方案可以概括为：
 
 1. `delay_line` 是固定周期历史的一等状态语义，不是省略硬件周期；
-2. structural 模式依据状态转移证明，而不是依赖 frontend marker；
+2. 候选资格依据状态转移证明，而不是依赖 frontend marker；
 3. Stage 1 减少等价状态、形成严格串行历史并共享重复历史；
 4. Stage 1.5 用一次有界 canonicalize/CSE 捕获级联机会；
 5. Stage 2 将独立窄状态集中为较少的宽 storage，重点降低 C++ primitive 调度；
