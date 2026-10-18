@@ -4,10 +4,6 @@
 // CHECK-LABEL: func.func @precombined_delay_lines
 // CHECK-DAG: pyc.stats.delay_chain_delay_lines_created = 0 : i64
 // CHECK-DAG: pyc.stats.delay_chain_delay_lines_merged = 1 : i64
-// CHECK-DAG: pyc.stats.delay_chain_state_reads_after = 0 : i64
-// CHECK-DAG: pyc.stats.delay_chain_state_reads_before = 0 : i64
-// CHECK-DAG: pyc.stats.delay_chain_state_writes_after = 0 : i64
-// CHECK-DAG: pyc.stats.delay_chain_state_writes_before = 0 : i64
 // CHECK: pyc.delay_line
 // CHECK-NOT: pyc.delay_line
 

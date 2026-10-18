@@ -308,19 +308,11 @@ static void writeCombineStats(func::FuncOp function, const CombineStats &stats,
       value += getI64Attr(function, name, 0);
     setI64Attr(function, name, value);
   };
-  const int64_t stateOpsAfter =
-      stats.delayLinesCreated > stats.delayLinesMerged
-          ? stats.delayLinesCreated - stats.delayLinesMerged
-          : 0;
   write("pyc.stats.delay_chains_combined", stats.chainsCombined);
   write("pyc.stats.delay_chain_regs_combined", stats.regsCombined);
   write("pyc.stats.delay_chain_aliases_removed", stats.aliasesRemoved);
   write("pyc.stats.delay_chain_delay_lines_created", stats.delayLinesCreated);
   write("pyc.stats.delay_chain_delay_lines_merged", stats.delayLinesMerged);
-  write("pyc.stats.delay_chain_state_reads_before", stats.regsCombined);
-  write("pyc.stats.delay_chain_state_reads_after", stateOpsAfter);
-  write("pyc.stats.delay_chain_state_writes_before", stats.regsCombined);
-  write("pyc.stats.delay_chain_state_writes_after", stateOpsAfter);
   write("pyc.stats.state_opt_regs_merged", stats.stateRegsMerged);
   write("pyc.stats.state_opt_reg_bits_removed", stats.stateRegBitsRemoved);
   write("pyc.stats.state_opt_cascade_regs_merged",

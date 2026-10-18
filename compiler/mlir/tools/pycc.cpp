@@ -2037,10 +2037,6 @@ struct CompileStatsSummary {
   int64_t delayChainAliasesRemoved = 0;
   int64_t delayChainDelayLinesCreated = 0;
   int64_t delayChainDelayLinesMerged = 0;
-  int64_t delayChainStateReadsBefore = 0;
-  int64_t delayChainStateReadsAfter = 0;
-  int64_t delayChainStateWritesBefore = 0;
-  int64_t delayChainStateWritesAfter = 0;
   int64_t delayChainTapsCreated = 0;
   int64_t delayChainTapUsesRewritten = 0;
   int64_t retimeRegionsRewritten = 0;
@@ -2115,18 +2111,6 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.delayChainDelayLinesMerged =
         satAdd(s.delayChainDelayLinesMerged,
                getI64Attr(f, "pyc.stats.delay_chain_delay_lines_merged", 0));
-    s.delayChainStateReadsBefore =
-        satAdd(s.delayChainStateReadsBefore,
-               getI64Attr(f, "pyc.stats.delay_chain_state_reads_before", 0));
-    s.delayChainStateReadsAfter =
-        satAdd(s.delayChainStateReadsAfter,
-               getI64Attr(f, "pyc.stats.delay_chain_state_reads_after", 0));
-    s.delayChainStateWritesBefore =
-        satAdd(s.delayChainStateWritesBefore,
-               getI64Attr(f, "pyc.stats.delay_chain_state_writes_before", 0));
-    s.delayChainStateWritesAfter =
-        satAdd(s.delayChainStateWritesAfter,
-               getI64Attr(f, "pyc.stats.delay_chain_state_writes_after", 0));
     s.delayChainTapsCreated = satAdd(
         s.delayChainTapsCreated,
         getI64Attr(f, "pyc.stats.delay_chain_taps_created", 0));
@@ -2256,10 +2240,17 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["delay_chain_aliases_removed"] = s.delayChainAliasesRemoved;
   obj["delay_chain_delay_lines_created"] = s.delayChainDelayLinesCreated;
   obj["delay_chain_delay_lines_merged"] = s.delayChainDelayLinesMerged;
-  obj["delay_chain_state_reads_before"] = s.delayChainStateReadsBefore;
-  obj["delay_chain_state_reads_after"] = s.delayChainStateReadsAfter;
-  obj["delay_chain_state_writes_before"] = s.delayChainStateWritesBefore;
-  obj["delay_chain_state_writes_after"] = s.delayChainStateWritesAfter;
+  // The reads/writes view has one value before and one after per direction;
+  // derive them from the combined-reg and created/merged counters instead of
+  // carrying four more IR attributes.
+  const int64_t delayStateOpsAfter =
+      s.delayChainDelayLinesCreated > s.delayChainDelayLinesMerged
+          ? s.delayChainDelayLinesCreated - s.delayChainDelayLinesMerged
+          : 0;
+  obj["delay_chain_state_reads_before"] = s.delayChainRegsCombined;
+  obj["delay_chain_state_reads_after"] = delayStateOpsAfter;
+  obj["delay_chain_state_writes_before"] = s.delayChainRegsCombined;
+  obj["delay_chain_state_writes_after"] = delayStateOpsAfter;
   obj["delay_chain_taps_created"] = s.delayChainTapsCreated;
   obj["delay_chain_tap_uses_rewritten"] =
       s.delayChainTapUsesRewritten;
