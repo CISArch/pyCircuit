@@ -707,7 +707,7 @@ static bool finalizeRegion(PipelineRegion &region, RetimeStats &stats) {
 
 static std::optional<PipelineRegion>
 findRegionFromTail(pyc::RegOp tail, const llvm::DenseSet<Operation *> &claimed,
-                   unsigned maxStages, RetimeStats &stats) {
+                   RetimeStats &stats) {
   PipelineRegion region;
   llvm::SmallVector<pyc::RegOp> regsFromTail{tail};
   llvm::SmallVector<PipelineLink> linksFromTail;
@@ -715,7 +715,7 @@ findRegionFromTail(pyc::RegOp tail, const llvm::DenseSet<Operation *> &claimed,
   pyc::RegOp cursor = tail;
   bool hasComb = false;
 
-  while (maxStages == 0 || regsFromTail.size() < maxStages) {
+  while (true) {
     ConeMatch match = matchPipelineLink(cursor, tail);
     if (!match.link)
       break;
@@ -841,7 +841,7 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
   stats.stateBitsRemoved += region.stateBitsRemoved;
 }
 
-static RetimeStats runRetiming(func::FuncOp function, unsigned maxStages) {
+static RetimeStats runRetiming(func::FuncOp function) {
   RetimeStats stats;
   runCommonDelaySinking(function, stats);
   llvm::SmallVector<pyc::RegOp> regs;
@@ -853,7 +853,7 @@ static RetimeStats runRetiming(func::FuncOp function, unsigned maxStages) {
   llvm::DenseSet<Operation *> noClaims;
   llvm::SmallVector<PipelineRegion> candidates;
   for (pyc::RegOp tail : llvm::reverse(regs)) {
-    auto region = findRegionFromTail(tail, noClaims, maxStages, stats);
+    auto region = findRegionFromTail(tail, noClaims, stats);
     if (region)
       candidates.push_back(std::move(*region));
   }
@@ -882,30 +882,23 @@ static RetimeStats runRetiming(func::FuncOp function, unsigned maxStages) {
   return stats;
 }
 
-static void writeStats(func::FuncOp function, const RetimeStats &stats,
-                       bool accumulate = false) {
-  setAccumI64Attr(function, "pyc.stats.retime_regions_rewritten",
-                stats.regionsRetimed, accumulate);
-  setAccumI64Attr(function, "pyc.stats.retime_regs_rewritten", stats.regsRetimed,
-             accumulate);
-  setAccumI64Attr(function, "pyc.stats.retime_state_primitives_removed",
-             stats.statePrimitivesRemoved, accumulate);
-  setAccumI64Attr(function, "pyc.stats.retime_taps_created", stats.tapsCreated,
-             accumulate);
-  setAccumI64Attr(function, "pyc.stats.retime_comb_ops_cloned", stats.combOpsCloned,
-             accumulate);
-  setAccumI64Attr(function, "pyc.stats.retime_common_delay_sinks",
-             stats.commonDelaySinks, accumulate);
-  setAccumI64Attr(function, "pyc.stats.retime_common_delay_source_states",
-             stats.commonDelaySourceStates, accumulate);
-  setAccumI64Attr(function, "pyc.stats.retime_comb_ops_moved", stats.combOpsMoved,
-             accumulate);
-  setAccumI64Attr(function, "pyc.stats.retime_state_bits_removed",
-             stats.stateBitsRemoved, accumulate);
-  setAccumI64Attr(function, "pyc.stats.retime_blocked_init", stats.blockedInit,
-             accumulate);
-  setAccumI64Attr(function, "pyc.stats.retime_blocked_cost", stats.blockedCost,
-             accumulate);
+static void writeStats(func::FuncOp function, const RetimeStats &stats) {
+  setI64Attr(function, "pyc.stats.retime_regions_rewritten",
+             stats.regionsRetimed);
+  setI64Attr(function, "pyc.stats.retime_regs_rewritten", stats.regsRetimed);
+  setI64Attr(function, "pyc.stats.retime_state_primitives_removed",
+             stats.statePrimitivesRemoved);
+  setI64Attr(function, "pyc.stats.retime_taps_created", stats.tapsCreated);
+  setI64Attr(function, "pyc.stats.retime_comb_ops_cloned", stats.combOpsCloned);
+  setI64Attr(function, "pyc.stats.retime_common_delay_sinks",
+             stats.commonDelaySinks);
+  setI64Attr(function, "pyc.stats.retime_common_delay_source_states",
+             stats.commonDelaySourceStates);
+  setI64Attr(function, "pyc.stats.retime_comb_ops_moved", stats.combOpsMoved);
+  setI64Attr(function, "pyc.stats.retime_state_bits_removed",
+             stats.stateBitsRemoved);
+  setI64Attr(function, "pyc.stats.retime_blocked_init", stats.blockedInit);
+  setI64Attr(function, "pyc.stats.retime_blocked_cost", stats.blockedCost);
 }
 
 struct RetimePipelinesPass
@@ -914,10 +907,6 @@ struct RetimePipelinesPass
 
   RetimePipelinesPass() = default;
   RetimePipelinesPass(const RetimePipelinesPass &other) : PassWrapper(other) {}
-  RetimePipelinesPass(unsigned maxStages, bool accumulateStats) {
-    maxStagesOption = maxStages;
-    accumulateStatsOption = accumulateStats;
-  }
 
   StringRef getArgument() const override { return "pyc-retime-pipelines"; }
   StringRef getDescription() const override {
@@ -926,32 +915,21 @@ struct RetimePipelinesPass
            "with the producing combinational logic";
   }
 
-  Option<unsigned> maxStagesOption{
-      *this, "max-stages",
-      llvm::cl::desc("Maximum registers per retimed region (0 is unlimited)"),
-      llvm::cl::init(0)};
-  Option<bool> accumulateStatsOption{
-      *this, "accumulate-stats",
-      llvm::cl::desc("Add rewrite statistics to an earlier retiming round"),
-      llvm::cl::init(false)};
-
   void runOnOperation() override {
-    RetimeStats stats = runRetiming(getOperation(), maxStagesOption);
-    writeStats(getOperation(), stats, accumulateStatsOption);
+    RetimeStats stats = runRetiming(getOperation());
+    writeStats(getOperation(), stats);
   }
 };
 
 } // namespace
 
-std::unique_ptr<::mlir::Pass>
-createRetimePipelinesPass(unsigned maxStages, bool accumulateStats) {
-  return std::make_unique<RetimePipelinesPass>(maxStages, accumulateStats);
+std::unique_ptr<::mlir::Pass> createRetimePipelinesPass() {
+  return std::make_unique<RetimePipelinesPass>();
 }
 
-void runRetimePipelines(func::FuncOp function, unsigned maxStages,
-                        bool accumulateStats) {
-  RetimeStats stats = runRetiming(function, maxStages);
-  writeStats(function, stats, accumulateStats);
+void runRetimePipelines(func::FuncOp function) {
+  RetimeStats stats = runRetiming(function);
+  writeStats(function, stats);
 }
 
 static PassRegistration<RetimePipelinesPass> retimePass;

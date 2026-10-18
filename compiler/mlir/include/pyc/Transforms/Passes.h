@@ -12,9 +12,7 @@ std::unique_ptr<::mlir::Pass> createCombCanonicalizePass();
 std::unique_ptr<::mlir::Pass> createInlineFunctionsPass();
 std::unique_ptr<::mlir::Pass> createFuseCombPass();
 std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
-std::unique_ptr<::mlir::Pass>
-createRetimePipelinesPass(unsigned maxStages = 0,
-                          bool accumulateStats = false);
+std::unique_ptr<::mlir::Pass> createRetimePipelinesPass();
 std::unique_ptr<::mlir::Pass>
 createCombineDelayChainsPass(bool accumulateStats = false,
                              bool cascadeRound = false);
@@ -26,8 +24,7 @@ void runDelayChainMergeRound(::mlir::func::FuncOp function, bool cascadeRound,
                              bool accumulateStats);
 void runDelayChainFormAndShare(::mlir::func::FuncOp function,
                                bool accumulateStats);
-void runRetimePipelines(::mlir::func::FuncOp function, unsigned maxStages,
-                        bool accumulateStats);
+void runRetimePipelines(::mlir::func::FuncOp function);
 void runPackStateLanes(::mlir::func::FuncOp function, unsigned maxWidth);
 void runEliminateDeadState(::mlir::func::FuncOp function);
 /// Unified C++-only structural state optimization pipeline. Replaces the
@@ -35,7 +32,6 @@ void runEliminateDeadState(::mlir::func::FuncOp function);
 /// dead-state -> form/share-chains -> pack sequence in pycc with one
 /// func-level pass that runs the same phases in order.
 struct StateOptimizeTunables {
-  unsigned retimeMaxStages = 0;
   unsigned packMaxWidth = 192; // 0 disables packing
 };
 std::unique_ptr<::mlir::Pass>

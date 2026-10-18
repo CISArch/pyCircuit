@@ -23,15 +23,6 @@ inline void setI64Attr(mlir::Operation *op, llvm::StringRef name,
                         mlir::IntegerType::get(op->getContext(), 64), value));
 }
 
-inline void setAccumI64Attr(mlir::Operation *op, llvm::StringRef name,
-                            std::int64_t value, bool accumulate = true) {
-  if (accumulate) {
-    if (auto old = op->getAttrOfType<mlir::IntegerAttr>(name))
-      value += old.getInt();
-  }
-  setI64Attr(op, name, value);
-}
-
 inline std::int64_t getI64Attr(mlir::Operation *op, llvm::StringRef name,
                                std::int64_t fallback = 0) {
   if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(name))

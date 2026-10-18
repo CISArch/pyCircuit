@@ -204,11 +204,6 @@ static llvm::cl::opt<bool> unrollVector(
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
     llvm::cl::init(false));
 
-static llvm::cl::opt<unsigned> stateRetimeMaxStages(
-    "state-retime-max-stages",
-    llvm::cl::desc("Maximum registers per retimed region (0 is unlimited)"),
-    llvm::cl::init(0));
-
 static llvm::cl::opt<bool> noStateOpt(
     "no-state-opt",
     llvm::cl::desc("Disable the structural state optimization pipeline (keep the plain netlist)"),
@@ -2646,7 +2641,6 @@ int main(int argc, char **argv) {
     // (with in-pass canonicalize/CSE between them), retiming, direct-chain
     // formation/history sharing, and lane packing in one func-level pass.
     pyc::StateOptimizeTunables stateTunables;
-    stateTunables.retimeMaxStages = stateRetimeMaxStages;
     stateTunables.packMaxWidth = statePackWidth;
     pm.addNestedPass<func::FuncOp>(
         pyc::createStateOptimizePass(stateTunables));

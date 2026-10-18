@@ -50,6 +50,26 @@ struct PackStats {
 
 void packBlockImpl(Block &block, PackStats &stats, unsigned maxWidth);
 
+static void packBlocks(func::FuncOp function, unsigned maxWidth,
+                       PackStats &stats) {
+  if (maxWidth == 0)
+    return;
+  for (Block &block : function.getBody())
+    packBlockImpl(block, stats, maxWidth);
+}
+
+static void writePackStats(func::FuncOp function, const PackStats &stats) {
+  setI64Attr(function, "pyc.stats.state_opt_pack_groups", stats.groups);
+  setI64Attr(function, "pyc.stats.state_opt_pack_reg_groups", stats.regGroups);
+  setI64Attr(function, "pyc.stats.state_opt_pack_delay_groups",
+             stats.delayGroups);
+  setI64Attr(function, "pyc.stats.state_opt_packed_state_ops",
+             stats.packedStateOps);
+  setI64Attr(function, "pyc.stats.state_opt_state_primitives_removed",
+             stats.primitivesRemoved);
+  setI64Attr(function, "pyc.stats.state_opt_pack_bits", stats.packedBits);
+}
+
 static std::size_t controlHash(const StateLane &lane) {
   return static_cast<std::size_t>(llvm::hash_combine(
       lane.isDelay, lane.depth, semanticValueHash(lane.clk), semanticValueHash(lane.rst),
@@ -285,26 +305,8 @@ public:
   void runOnOperation() override {
     func::FuncOp function = getOperation();
     PackStats stats;
-    if (maxWidthOption != 0) {
-      for (Block &block : function.getBody())
-        packBlock(block, stats);
-    }
-
-    setI64Attr(function, "pyc.stats.state_opt_pack_groups", stats.groups);
-    setI64Attr(function, "pyc.stats.state_opt_pack_reg_groups",
-               stats.regGroups);
-    setI64Attr(function, "pyc.stats.state_opt_pack_delay_groups",
-               stats.delayGroups);
-    setI64Attr(function, "pyc.stats.state_opt_packed_state_ops",
-               stats.packedStateOps);
-    setI64Attr(function, "pyc.stats.state_opt_state_primitives_removed",
-               stats.primitivesRemoved);
-    setI64Attr(function, "pyc.stats.state_opt_pack_bits", stats.packedBits);
-  }
-
-private:
-  void packBlock(Block &block, PackStats &stats) {
-    packBlockImpl(block, stats, maxWidthOption);
+    packBlocks(function, maxWidthOption, stats);
+    writePackStats(function, stats);
   }
 };
 
@@ -404,20 +406,8 @@ createPackStateLanesPass(unsigned maxWidth) {
 
 void runPackStateLanes(func::FuncOp function, unsigned maxWidth) {
   PackStats stats;
-  if (maxWidth != 0) {
-    for (Block &block : function.getBody())
-      packBlockImpl(block, stats, maxWidth);
-  }
-  setI64Attr(function, "pyc.stats.state_opt_pack_groups", stats.groups);
-  setI64Attr(function, "pyc.stats.state_opt_pack_reg_groups",
-             stats.regGroups);
-  setI64Attr(function, "pyc.stats.state_opt_pack_delay_groups",
-             stats.delayGroups);
-  setI64Attr(function, "pyc.stats.state_opt_packed_state_ops",
-             stats.packedStateOps);
-  setI64Attr(function, "pyc.stats.state_opt_state_primitives_removed",
-             stats.primitivesRemoved);
-  setI64Attr(function, "pyc.stats.state_opt_pack_bits", stats.packedBits);
+  packBlocks(function, maxWidth, stats);
+  writePackStats(function, stats);
 }
 
 static PassRegistration<PackStateLanesPass> pass;

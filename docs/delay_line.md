@@ -50,7 +50,6 @@ b@4 ─────────────────────────�
 
 ```text
 --state-pack-width=192
---state-retime-max-stages=0
 ```
 
 retiming 不设组合规模预算：组合锥按合法性（纯白名单、无反馈、无锥外 fanout）整体
@@ -165,12 +164,9 @@ pyc-state-optimize（单个 pass，内部按以下阶段顺序执行）
 comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 ```
 
-`pycc` 在 C++ 路径上的状态优化预算开关（Verilog / `--emit=none` 不跑这组 pass）：
+`pycc` 在 C++ 路径上的状态优化开关（Verilog / `--emit=none` 不跑这组 pass）：
 
 ```text
---state-retime-max-stages=0
-    单个 computed pipeline 的最大寄存器级数；0 表示不单独限制
-
 --state-pack-width=192
     Stage 2 单个 packed storage 的默认最大宽度
 
@@ -699,7 +695,7 @@ C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读
 | `state_opt_policy` | `--emit=cpp` 为 `structural`，其它 emit 为 `off` |
 | `state_retime_policy` | `--emit=cpp` 为 `pipeline`，其它 emit 为 `off` |
 | `observe_named` | `--emit=cpp` 为 `demand`（默认）或 `all`；其它 emit 为 `off` |
-| `observe_named_names_lazy` | 与 `observe_named_names_stripped` 相同，新名字 |
+| `observe_named_names_lazy` | demand 模式下改按名懒查找（保留 `pyc.observe_lazy`）的 `pyc.name` 数 |
 | `observe_named_names_kept` | demand 模式下因 @probe/trace/IR 属性保持急切的 `pyc.name` 数 |
 | `state_opt_pack_width` | 实际 Stage 2 width 上限 |
 | `state_opt_regs_merged` | 两轮实际合并的 reg 数 |
@@ -720,7 +716,7 @@ C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读
 | `retime_common_delay_sinks` | 成功执行的共同 delay 下沉数 |
 | `retime_comb_ops_cloned/moved` | 重建前缀和跨状态移动的组合 op 数 |
 | `retime_state_bits_removed` | retiming 净减少的逻辑 state bits |
-| `retime_blocked_init/cost` | 因 init 证明或收益/深度预算拒绝的候选数 |
+| `retime_blocked_init/cost` | 因 init 证明或 state-bit 不增 guard 拒绝的候选数 |
 
 `delay_chain_state_reads/writes_before/after` 描述生成 C++ model 每拍需要静态调度的
 状态 primitive 数，不是 CPU load/store、MLIR MemoryEffects 或 RTL 物理端口数。

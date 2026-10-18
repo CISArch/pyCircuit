@@ -71,8 +71,7 @@ struct StateOptimizePass
     // Retime after the two low-risk merge-only rounds: a local retime must
     // not consume a state that has a more profitable global equivalent-state
     // or direct-chain rewrite.
-    runRetimePipelines(function, tunables.retimeMaxStages,
-                       /*accumulateStats=*/false);
+    runRetimePipelines(function);
     // Sinking moves consumer cones onto source.next, placing them in the
     // same combinational cone as the producers of next. The fusion win
     // (shared subexpressions, one scheduled comb region) only materializes

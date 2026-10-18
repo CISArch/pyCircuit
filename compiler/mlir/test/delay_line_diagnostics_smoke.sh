@@ -50,7 +50,7 @@ PROFILE_JSON="${TMP_DIR}/profile.json"
   --input-file="${PRECOMBINED_OPTIMIZED}"
 
 for flag in --combine-delay-chains --state-delay-opt --state-retime \
-           --state-opt-preserve-observability; do
+           --state-retime-max-stages --state-opt-preserve-observability; do
   if "${PYCC}" --help 2>&1 | grep -E -- "${flag}(=|<|[[:space:]]|$)" >/dev/null; then
     echo "fail: deleted policy flag still advertised: ${flag}" >&2
     exit 1
