@@ -66,6 +66,14 @@ for flag in --combine-delay-chains --state-delay-opt --state-retime \
   fi
 done
 
+# Verifier coverage: these fixtures carry expected-error directives (or no
+# diagnostics for the valid case) and are otherwise never reached by a gate.
+for verify_case in delay_line_verify_valid delay_line_verify_invalid \
+                   delay_tap_verify_invalid delay_tap_verify_invalid_source; do
+  "${PYC_OPT}" "${ROOT}/compiler/mlir/test/${verify_case}.mlir" \
+    --verify-diagnostics -o /dev/null
+done
+
 "${PYCC}" "${INPUT}" --emit=cpp \
   --profile-json="${PROFILE_JSON}" -o "${MODEL}" 2>"${STDERR_LOG}"
 

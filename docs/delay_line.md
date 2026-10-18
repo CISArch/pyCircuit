@@ -255,7 +255,6 @@ survivor q，并记录：
 
 ```text
 pyc.optimized_by = "merge_equivalent_state"
-pyc.state_merged_count
 ```
 
 这类优化会真实减少 logical state bits，因为两个状态机从初值开始在每个周期都相同。

@@ -30,7 +30,6 @@ constexpr llvm::StringLiteral kStructuralCombineDelayChains =
     "combine_delay_chains_structural";
 constexpr llvm::StringLiteral kSourceRegCountAttr = "pyc.source_reg_count";
 constexpr llvm::StringLiteral kSharedChainCountAttr = "pyc.shared_chain_count";
-constexpr llvm::StringLiteral kStateMergedCountAttr = "pyc.state_merged_count";
 
 struct CombineStats {
   int64_t chainsCombined = 0;
@@ -40,8 +39,6 @@ struct CombineStats {
   int64_t delayLinesMerged = 0;
   int64_t stateRegsMerged = 0;
   int64_t stateRegBitsRemoved = 0;
-  int64_t structuralChainsCombined = 0;
-  int64_t structuralRegsCombined = 0;
   int64_t delayTapsCreated = 0;
   int64_t delayTapUsesRewritten = 0;
 };
@@ -57,12 +54,6 @@ static int64_t stateBitWidth(Type type) {
       return lanes * static_cast<int64_t>(element.getWidth());
   }
   return 0;
-}
-
-static Value stripChainAliases(Value value) {
-  while (auto alias = value.getDefiningOp<pyc::AliasOp>())
-    value = alias.getIn();
-  return value;
 }
 
 static void mergeEquivalentStates(func::FuncOp function, CombineStats &stats) {
@@ -88,9 +79,6 @@ static void mergeEquivalentStates(func::FuncOp function, CombineStats &stats) {
     builder.setInsertionPointAfter(survivor);
     remapStateOpIdentity(builder, reg.getOperation(), survivor.getQ());
     reg.getQ().replaceAllUsesWith(survivor.getQ());
-    const int64_t survivorCount =
-        getI64Attr(survivor, kStateMergedCountAttr, 1);
-    setI64Attr(survivor, kStateMergedCountAttr, survivorCount + 1);
     survivor->setAttr(kOptimizedByAttr,
                       StringAttr::get(function.getContext(),
                                       "merge_equivalent_state"));
@@ -177,7 +165,7 @@ static void combineStateChains(func::FuncOp function, CombineStats &stats) {
     auto delay = builder.create<pyc::DelayLineOp>(
         tail.getLoc(), tail.getQ().getType(), head.getClk(), head.getRst(),
         head.getEn(),
-        stripChainAliases(head.getNext()),
+        stripStateAliases(head.getNext()),
         head.getInit());
     delay->setAttr("depth", builder.getI64IntegerAttr(depth));
     if (allGenerated)
@@ -251,8 +239,6 @@ static void combineStateChains(func::FuncOp function, CombineStats &stats) {
 
     ++stats.chainsCombined;
     stats.regsCombined += depth;
-    stats.structuralChainsCombined += 1;
-    stats.structuralRegsCombined += depth;
     ++stats.delayLinesCreated;
     for (const StateChainLink &link : linksFromTail)
       stats.aliasesRemoved +=
@@ -337,10 +323,6 @@ static void writeCombineStats(func::FuncOp function, const CombineStats &stats,
   write("pyc.stats.delay_chain_state_writes_after", stateOpsAfter);
   write("pyc.stats.state_opt_regs_merged", stats.stateRegsMerged);
   write("pyc.stats.state_opt_reg_bits_removed", stats.stateRegBitsRemoved);
-  write("pyc.stats.state_opt_structural_chains_combined",
-        stats.structuralChainsCombined);
-  write("pyc.stats.state_opt_structural_chain_regs_combined",
-        stats.structuralRegsCombined);
   write("pyc.stats.state_opt_cascade_regs_merged",
         cascadeRound && performedMergeRound ? stats.stateRegsMerged : 0);
   write("pyc.stats.state_opt_merge_rounds", performedMergeRound ? 1 : 0);

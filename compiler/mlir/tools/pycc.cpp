@@ -2059,12 +2059,8 @@ struct CompileStatsSummary {
   int64_t retimeStateBitsRemoved = 0;
   int64_t retimeBlockedInit = 0;
   int64_t retimeBlockedCost = 0;
-  int64_t stateOptStructuralChains = 0;
-  int64_t stateOptStructuralChainRegs = 0;
   int64_t stateOptRegsMerged = 0;
   int64_t stateOptRegBitsRemoved = 0;
-  int64_t stateOptStructuralChainsCombined = 0;
-  int64_t stateOptStructuralChainRegsCombined = 0;
   int64_t stateOptMergeRounds = 0;
   int64_t stateOptCascadeRegsMerged = 0;
   int64_t stateOptPackGroups = 0;
@@ -2175,24 +2171,12 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.retimeBlockedCost = satAdd(
         s.retimeBlockedCost,
         getI64Attr(f, "pyc.stats.retime_blocked_cost", 0));
-    s.stateOptStructuralChains = satAdd(
-        s.stateOptStructuralChains,
-        getI64Attr(f, "pyc.stats.state_opt_structural_chains", 0));
-    s.stateOptStructuralChainRegs = satAdd(
-        s.stateOptStructuralChainRegs,
-        getI64Attr(f, "pyc.stats.state_opt_structural_chain_regs", 0));
     s.stateOptRegsMerged = satAdd(
         s.stateOptRegsMerged,
         getI64Attr(f, "pyc.stats.state_opt_regs_merged", 0));
     s.stateOptRegBitsRemoved = satAdd(
         s.stateOptRegBitsRemoved,
         getI64Attr(f, "pyc.stats.state_opt_reg_bits_removed", 0));
-    s.stateOptStructuralChainsCombined = satAdd(
-        s.stateOptStructuralChainsCombined,
-        getI64Attr(f, "pyc.stats.state_opt_structural_chains_combined", 0));
-    s.stateOptStructuralChainRegsCombined = satAdd(
-        s.stateOptStructuralChainRegsCombined,
-        getI64Attr(f, "pyc.stats.state_opt_structural_chain_regs_combined", 0));
     s.stateOptMergeRounds = std::max(
         s.stateOptMergeRounds,
         getI64Attr(f, "pyc.stats.state_opt_merge_rounds", 0));
@@ -2297,13 +2281,12 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["retime_state_bits_removed"] = s.retimeStateBitsRemoved;
   obj["retime_blocked_init"] = s.retimeBlockedInit;
   obj["retime_blocked_cost"] = s.retimeBlockedCost;
-  obj["state_opt_structural_chains"] = s.stateOptStructuralChains;
-  obj["state_opt_structural_chain_regs"] = s.stateOptStructuralChainRegs;
   obj["state_opt_regs_merged"] = s.stateOptRegsMerged;
   obj["state_opt_reg_bits_removed"] = s.stateOptRegBitsRemoved;
-  obj["state_opt_structural_chains_combined"] = s.stateOptStructuralChainsCombined;
-  obj["state_opt_structural_chain_regs_combined"] =
-      s.stateOptStructuralChainRegsCombined;
+  // Kept for JSON compatibility: with a single delay-chain policy these are
+  // the ordinary delay-chain counters.
+  obj["state_opt_structural_chains_combined"] = s.delayChainsCombined;
+  obj["state_opt_structural_chain_regs_combined"] = s.delayChainRegsCombined;
   obj["state_opt_merge_rounds"] = s.stateOptMergeRounds;
   obj["state_opt_cascade_regs_merged"] = s.stateOptCascadeRegsMerged;
   obj["state_opt_pack_groups"] = s.stateOptPackGroups;

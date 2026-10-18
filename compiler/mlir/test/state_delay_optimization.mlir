@@ -14,8 +14,8 @@
 // STRUCTURAL: pyc.name = "copy_b"
 // STRUCTURAL: return
 // STRUCTURAL-LABEL: func.func @form_untagged_chain
-// STRUCTURAL-SAME: pyc.stats.state_opt_structural_chain_regs_combined = 3 : i64
-// STRUCTURAL-SAME: pyc.stats.state_opt_structural_chains_combined = 1 : i64
+// STRUCTURAL-SAME: pyc.stats.delay_chain_regs_combined = 3 : i64
+// STRUCTURAL-SAME: pyc.stats.delay_chains_combined = 1 : i64
 // STRUCTURAL: pyc.delay_line
 // STRUCTURAL-SAME: depth = 3 : i64
 // STRUCTURAL-SAME: pyc.optimized_by = "combine_delay_chains_structural"
