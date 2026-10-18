@@ -207,6 +207,7 @@ static llvm::cl::opt<bool> unrollVector(
 static llvm::cl::opt<bool> noStateOpt(
     "no-state-opt",
     llvm::cl::desc("Disable the structural state optimization pipeline (keep the plain netlist)"),
+    llvm::cl::Hidden,
     llvm::cl::init(false));
 
 static llvm::cl::opt<unsigned> statePackWidth(

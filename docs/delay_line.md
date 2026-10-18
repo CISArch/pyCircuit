@@ -720,6 +720,9 @@ C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读
 
 `delay_chain_state_reads/writes_before/after` 描述生成 C++ model 每拍需要静态调度的
 状态 primitive 数，不是 CPU load/store、MLIR MemoryEffects 或 RTL 物理端口数。
+四项在 JSON 中分别由 `delay_chain_regs_combined`（before）与
+`delay_chain_delay_lines_created - delay_chain_delay_lines_merged`（after）派生，
+不再写入 IR attr。
 
 查看 pass 前后 IR：
 
