@@ -602,7 +602,7 @@ unsigned head = 0;
 
 Verilog 后端保持未优化网表契约，**不实现** delay-line lowering：IR 中出现
 `pyc.delay_line` / `pyc.delay_tap` 时 emitter 以明确诊断拒绝
-（delay lines 为 C++ 专属；如需 Verilog 对照请用 `--no-state-opt` 关闭状态优化）。
+（delay lines 为 C++ 专属；Verilog 路径本身保持未优化网表，可作为对照）。
 
 ### 11.3 Packed state 的 probe/trace
 

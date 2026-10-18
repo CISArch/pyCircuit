@@ -32,24 +32,16 @@ def result(command: list[str]) -> tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-def emit(
-    pycc: Path, source: Path, output: Path, extra: list[str] | None = None
-) -> dict[str, object]:
+def emit(pycc: Path, source: Path, output: Path) -> dict[str, object]:
     run([
         str(pycc), str(source), "--emit=cpp", "--state-pack-width=0",
-        *(extra or []), "-o", str(output),
+        "-o", str(output),
     ])
     return json.loads(Path(f"{output}.stats.json").read_text(encoding="utf-8"))
 
 
-def compile_cpp(
-    cxx: str,
-    header: Path,
-    binary: Path,
-    driver: Path,
-    extra: list[str] | None = None,
-) -> None:
+def compile_cpp(cxx: str, header: Path, binary: Path, driver: Path) -> None:
     run([
-        cxx, "-std=c++17", "-O2", *(extra or []), f"-I{ROOT / 'runtime'}",
+        cxx, "-std=c++17", "-O2", f"-I{ROOT / 'runtime'}",
         f'-DMODEL_HEADER="{header}"', str(driver), "-o", str(binary),
     ])

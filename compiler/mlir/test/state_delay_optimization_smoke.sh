@@ -85,8 +85,9 @@ fi
 
 "${PYCC}" "${DEFAULT_INPUT}" --emit=cpp \
   -o "${TMP_DIR}/default.hpp" 2>"${TMP_DIR}/default.stderr"
-"${PYCC}" "${DEFAULT_INPUT}" --emit=cpp --no-state-opt \
-  -o "${TMP_DIR}/default-plain.hpp" 2>"${TMP_DIR}/default-plain.stderr"
+# Verilog keeps the pre-optimization netlist; use its stats as the plain arm.
+"${PYCC}" "${DEFAULT_INPUT}" --emit=verilog --include-primitives=false \
+  -o "${TMP_DIR}/default-plain.v" 2>"${TMP_DIR}/default-plain.stderr"
 "${PYCC}" "${DEFAULT_INPUT}" --emit=none \
   --probe-manifest="${TMP_DIR}/default-probes.json" \
   -o /dev/null 2>"${TMP_DIR}/default-probes.stderr"
@@ -173,7 +174,7 @@ fi
 "${TMP_DIR}/state-pack-probe-runtime"
 
 python3 - "${TMP_DIR}/default.hpp.stats.json" \
-  "${TMP_DIR}/default-plain.hpp.stats.json" \
+  "${TMP_DIR}/default-plain.v.stats.json" \
   "${TMP_DIR}/default-probes.json" \
   "${TMP_DIR}/packed-probes.json" <<'PY'
 import json

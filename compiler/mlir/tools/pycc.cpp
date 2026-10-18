@@ -204,12 +204,6 @@ static llvm::cl::opt<bool> unrollVector(
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
     llvm::cl::init(false));
 
-static llvm::cl::opt<bool> noStateOpt(
-    "no-state-opt",
-    llvm::cl::desc("Disable the structural state optimization pipeline (keep the plain netlist)"),
-    llvm::cl::Hidden,
-    llvm::cl::init(false));
-
 static llvm::cl::opt<unsigned> statePackWidth(
     "state-pack-width",
     llvm::cl::desc(
@@ -2623,8 +2617,8 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
   // State merge, retiming, and packing stay on the C++ emit path only so
   // Verilog keeps the pre-optimization netlist.
-  const bool enableStateDelayOptimization = (emitKind == "cpp") && !noStateOpt;
-  if (enableStateDelayOptimization) {
+  const bool isCppEmit = emitKind == "cpp";
+  if (isCppEmit) {
     // Unified structural state optimization: equivalent-state merge rounds
     // (with in-pass canonicalize/CSE between them), retiming, direct-chain
     // formation/history sharing, and lane packing in one func-level pass.
@@ -2696,12 +2690,10 @@ int main(int argc, char **argv) {
   }
 
   CompileStatsSummary compileStats = collectCompileStats(*module, static_cast<int64_t>(logicDepthLimit));
-  compileStats.stateOptimizationPolicy =
-      enableStateDelayOptimization ? "structural" : "off";
-  compileStats.stateRetimePolicy =
-      enableStateDelayOptimization ? "pipeline" : "off";
+  compileStats.stateOptimizationPolicy = isCppEmit ? "structural" : "off";
+  compileStats.stateRetimePolicy = isCppEmit ? "pipeline" : "off";
   compileStats.stateOptPackWidth =
-      enableStateDelayOptimization ? static_cast<int64_t>(statePackWidth) : 0;
+      isCppEmit ? static_cast<int64_t>(statePackWidth) : 0;
   compileStats.fuseCombEnabled = enableFuseComb;
   compileStats.observeNamedPolicy =
       emitKind == "cpp" ? std::string(observeNamed) : std::string("off");
