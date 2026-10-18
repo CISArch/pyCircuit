@@ -2,6 +2,7 @@
 # Fused-comb dirty scheduling: inactivity, semantic publish filtering, direct
 # fanout/reconvergence, first eval, post-commit, and removed-mode hard break.
 set -euo pipefail
+trap 'rc=$?; [[ ${rc} -ne 0 ]] && echo "::error title=comb-dirty::smoke failed (exit ${rc})"' EXIT
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PYCC="${PYCC:-${ROOT}/.pycircuit_out/toolchain/build/bin/pycc}"
@@ -100,13 +101,25 @@ mkdir -p "${state_dir}"
 "${PYCC}" "${OUT}/comb_dirty_state.pyc" --emit=cpp \
   -o "${state_dir}/comb_dirty_state.cpp" "${common[@]}"
 state_cpp="${state_dir}/comb_dirty_state.cpp"
-if grep -q '_pyc_comb_1_input_0' "${state_cpp}"; then
+# Temp numbering shifts with benign pipeline changes (the comb-wake merge
+# shifted this register from 4 to 5), so match the patterns, not specific
+# pyc_reg_N names. The comb must not snapshot the register Q directly --
+# that is polling; it must re-evaluate from a commit-changed signal.
+if grep -qE '_pyc_comb_[0-9]+_input_[0-9]+ != pyc_reg_[0-9]+_inst->q' \
+    "${state_cpp}"; then
   echo "fail: dirty comb still polls register Q instead of commit fanout" >&2
   exit 1
 fi
-grep -q '_pyc_commit_changed_pyc_reg_4_inst' "${state_cpp}"
-grep -q 'if (_pyc_commit_changed_pyc_reg_4_inst)' "${state_cpp}"
-grep -q '_pyc_comb_dirty.markWordUnchecked' "${state_cpp}"
+for required in \
+  '_pyc_commit_changed_pyc_reg_[0-9]+_inst' \
+  'if \(_pyc_commit_changed_pyc_reg_[0-9]+_inst\)' \
+  '_pyc_direct_fanout_pyc_reg_[0-9]+' \
+  '_pyc_comb_dirty\.markWordUnchecked'; do
+  if ! grep -qE "${required}" "${state_cpp}"; then
+    echo "fail: state model missing pattern ${required}" >&2
+    exit 1
+  fi
+done
 "${CXX}" -std=c++17 -O0 \
   -I"${state_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \
   "${STATE_DRIVER}" \
