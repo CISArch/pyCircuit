@@ -17,14 +17,20 @@ namespace pyc {
 namespace {
 
 // In-pass replacement for the upstream canonicalize+CSE pass pair pycc used
-// between merge rounds: greedy folding absorbs every op's canonicalization
-// patterns and folders, then explicit CSE dedupes the exposed equivalents.
+// between merge rounds: load the same canonicalization patterns that the
+// upstream Canonicalizer initializes, run greedy folding on top of them, then
+// dedupe the exposed equivalents with explicit CSE.
 static LogicalResult canonicalizeAndCSE(func::FuncOp function) {
-  if (failed(applyPatternsAndFoldGreedily(function, RewritePatternSet(
-                                                    function.getContext()),
+  MLIRContext *context = function.getContext();
+  RewritePatternSet patterns(context);
+  for (Dialect *dialect : context->getLoadedDialects())
+    dialect->getCanonicalizationPatterns(patterns);
+  for (RegisteredOperationName op : context->getRegisteredOperations())
+    op.getCanonicalizationPatterns(patterns, context);
+  if (failed(applyPatternsAndFoldGreedily(function, std::move(patterns),
                                           GreedyRewriteConfig())))
     return failure();
-  IRRewriter rewriter(function.getContext());
+  IRRewriter rewriter(context);
   DominanceInfo domInfo(function);
   eliminateCommonSubExpressions(rewriter, domInfo, function);
   return success();

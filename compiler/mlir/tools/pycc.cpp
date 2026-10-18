@@ -2278,10 +2278,6 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["retime_blocked_cost"] = s.retimeBlockedCost;
   obj["state_opt_regs_merged"] = s.stateOptRegsMerged;
   obj["state_opt_reg_bits_removed"] = s.stateOptRegBitsRemoved;
-  // Kept for JSON compatibility: with a single delay-chain policy these are
-  // the ordinary delay-chain counters.
-  obj["state_opt_structural_chains_combined"] = s.delayChainsCombined;
-  obj["state_opt_structural_chain_regs_combined"] = s.delayChainRegsCombined;
   obj["state_opt_merge_rounds"] = s.stateOptMergeRounds;
   obj["state_opt_cascade_regs_merged"] = s.stateOptCascadeRegsMerged;
   obj["state_opt_pack_groups"] = s.stateOptPackGroups;

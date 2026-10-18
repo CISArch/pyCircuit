@@ -68,16 +68,11 @@ struct PipelineRegion {
 };
 
 struct RetimeStats {
-  int64_t regsSeen = 0;
-  int64_t candidateRegions = 0;
-  int64_t candidateRegs = 0;
-  int64_t candidateCombOps = 0;
   int64_t regionsRetimed = 0;
   int64_t regsRetimed = 0;
   int64_t statePrimitivesRemoved = 0;
   int64_t tapsCreated = 0;
   int64_t combOpsCloned = 0;
-  int64_t commonDelayCandidates = 0;
   int64_t commonDelaySinks = 0;
   int64_t commonDelaySourceStates = 0;
   int64_t combOpsMoved = 0;
@@ -614,10 +609,6 @@ static void runCommonDelaySinking(func::FuncOp function, RetimeStats &stats) {
       };
       collectNextCone(collectNextCone, source.next);
     }
-    ++stats.candidateRegions;
-    stats.candidateRegs += region.sources.size();
-    stats.candidateCombOps += region.coneOps.size();
-    ++stats.commonDelayCandidates;
     rewriteCommonDelayRegion(region, stats);
   }
 }
@@ -845,10 +836,7 @@ static RetimeStats runRetiming(func::FuncOp function) {
   RetimeStats stats;
   runCommonDelaySinking(function, stats);
   llvm::SmallVector<pyc::RegOp> regs;
-  function.walk([&](pyc::RegOp reg) {
-    regs.push_back(reg);
-    ++stats.regsSeen;
-  });
+  function.walk([&](pyc::RegOp reg) { regs.push_back(reg); });
 
   llvm::DenseSet<Operation *> noClaims;
   llvm::SmallVector<PipelineRegion> candidates;
@@ -872,9 +860,6 @@ static RetimeStats runRetiming(func::FuncOp function) {
           return claimed.contains(reg.getOperation());
         }))
       continue;
-    ++stats.candidateRegions;
-    stats.candidateRegs += static_cast<int64_t>(region.regs.size());
-    stats.candidateCombOps += region.uniqueCombOps;
     for (pyc::RegOp reg : region.regs)
       claimed.insert(reg.getOperation());
   rewriteRegion(region, stats);
