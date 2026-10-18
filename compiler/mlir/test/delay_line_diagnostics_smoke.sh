@@ -66,10 +66,10 @@ for flag in --combine-delay-chains --state-delay-opt --state-retime \
   fi
 done
 
-# Verifier coverage: these fixtures carry expected-error directives (or no
-# diagnostics for the valid case) and are otherwise never reached by a gate.
-for verify_case in delay_line_verify_valid delay_line_verify_invalid \
-                   delay_tap_verify_invalid delay_tap_verify_invalid_source; do
+# Verifier coverage: the delay-line fixture combines the valid module with a
+# rejected depth; the two tap fixtures each carry one expected-error directive.
+for verify_case in delay_line_verify delay_tap_verify_invalid \
+                   delay_tap_verify_invalid_source; do
   "${PYC_OPT}" "${ROOT}/compiler/mlir/test/${verify_case}.mlir" \
     --verify-diagnostics -o /dev/null
 done

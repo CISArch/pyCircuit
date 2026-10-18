@@ -4,67 +4,33 @@
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
+import os
 import tempfile
 from pathlib import Path
 
+from _state_model_check import DEFAULT_BUILD, compile_cpp, emit, result
+
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[2]
-DEFAULT_BUILD = ROOT / ".pycircuit_out/toolchain/build/bin"
-RESULT_RE = __import__("re").compile(r"cycles=(\d+) checksum=(\d+)")
-
-
-def run(command: list[str], *, env: dict[str, str] | None = None) -> str:
-    return subprocess.run(
-        command, cwd=ROOT, check=True, text=True, capture_output=True, env=env
-    ).stdout
-
-
-def result(command: list[str]) -> tuple[int, int]:
-    match = RESULT_RE.search(run(command))
-    if not match:
-        raise RuntimeError(f"missing model result: {command}")
-    return int(match.group(1)), int(match.group(2))
-
-
-def emit(pycc: Path, output: Path, kind: str) -> dict[str, object]:
-    run([
-        str(pycc), str(HERE / "state_retime_codegen.mlir"), f"--emit={kind}",
-        "--state-pack-width=0", "-o", str(output),
-    ])
-    return json.loads(Path(f"{output}.stats.json").read_text(encoding="utf-8"))
-
-
-def compile_cpp(cxx: str, header: Path, binary: Path) -> None:
-    run([
-        cxx, "-std=c++17", "-O2", f"-I{ROOT / 'runtime'}",
-        f'-DMODEL_HEADER="{header}"', str(HERE / "state_retime_model.cpp"),
-        "-o", str(binary),
-    ])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pycc", type=Path, default=DEFAULT_BUILD / "pycc")
-    parser.add_argument("--cxx", default=__import__("os").environ.get("CXX", "c++"))
+    parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
     args = parser.parse_args()
 
+    source = HERE / "state_retime_codegen.mlir"
     with tempfile.TemporaryDirectory(prefix="pyc-retime-", dir="/tmp") as path:
         temp = Path(path)
         opt_cpp = temp / "opt.hpp"
         plain_cpp = temp / "plain.hpp"
         observed: dict[str, tuple[int, int]] = {}
-        cpp_stats = emit(args.pycc, opt_cpp, "cpp")
+        cpp_stats = emit(args.pycc, source, opt_cpp)
         # Unoptimized reference: state optimization is C++-path-only; disabling
         # it keeps the plain register netlist for the equivalence reference.
-        run([
-            str(args.pycc), str(HERE / "state_retime_codegen.mlir"),
-            "--emit=cpp", "--state-pack-width=0",
-            "--observe-named=all", "--no-state-opt", "-o", str(plain_cpp),
-        ])
-        plain_stats = json.loads(
-            Path(f"{plain_cpp}.stats.json").read_text(encoding="utf-8")
+        plain_stats = emit(
+            args.pycc, source, plain_cpp,
+            ["--observe-named=all", "--no-state-opt"],
         )
         if (cpp_stats.get("reg_count") != 5 or cpp_stats.get("reg_bits") != 33):
             raise AssertionError(f"cpp: logical state changed: {cpp_stats}")
@@ -98,9 +64,10 @@ def main() -> None:
                 f"plain: retime policy is not off: {plain_stats}"
             )
 
-        compile_cpp(args.cxx, opt_cpp, temp / "opt_bin")
+        driver = HERE / "state_retime_model.cpp"
+        compile_cpp(args.cxx, opt_cpp, temp / "opt_bin", driver)
         observed["opt"] = result([str(temp / "opt_bin")])
-        compile_cpp(args.cxx, plain_cpp, temp / "plain_bin")
+        compile_cpp(args.cxx, plain_cpp, temp / "plain_bin", driver)
         observed["plain"] = result([str(temp / "plain_bin")])
         if len(set(observed.values())) != 1:
             raise AssertionError(f"retiming model mismatch: {observed}")

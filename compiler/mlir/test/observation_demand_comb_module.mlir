@@ -1,4 +1,14 @@
 // pycc fixture: undeclared combinational names become lazy addWire lookups.
+// The same module is also the pyc-opt pass fixture for observation demand.
+//
+// COMB-LABEL: func.func @observation_demand_comb_module
+// COMB: pyc.lazy_probe_wires
+// COMB-SAME: name = "ready_state"
+// COMB-SAME: name = "ready_alias"
+// COMB: pyc.name = "ready_state"
+// COMB-SAME: pyc.observe_lazy
+// COMB: pyc.name = "ready_alias"
+// COMB-SAME: pyc.observe_lazy
 
 module attributes {pyc.top = @observation_demand_comb_module,
                    pyc.frontend.contract = "pycircuit"} {

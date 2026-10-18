@@ -4,46 +4,13 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
-import subprocess
 import tempfile
 from pathlib import Path
 
+from _state_model_check import DEFAULT_BUILD, compile_cpp, emit, result
+
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[2]
-DEFAULT_BUILD = ROOT / ".pycircuit_out/toolchain/build/bin"
-RESULT_RE = re.compile(r"cycles=(\d+) checksum=(\d+)")
-
-
-def run(command: list[str], *, env: dict[str, str] | None = None) -> str:
-    return subprocess.run(
-        command, cwd=ROOT, check=True, text=True, capture_output=True, env=env
-    ).stdout
-
-
-def result(command: list[str]) -> tuple[int, int]:
-    match = RESULT_RE.search(run(command))
-    if not match:
-        raise RuntimeError(f"missing result for {command}")
-    return int(match.group(1)), int(match.group(2))
-
-
-def emit(pycc: Path, source: Path, output: Path, extra: list[str]) -> dict[str, object]:
-    run([
-        str(pycc), str(source), "--emit=cpp",
-        "--state-pack-width=0", *extra, "-o", str(output),
-    ])
-    return json.loads(Path(f"{output}.stats.json").read_text(encoding="utf-8"))
-
-
-def compile_cpp(cxx: str, header: Path, binary: Path) -> None:
-    run([
-        cxx, "-std=c++17", "-O2", "-DNDEBUG", f"-I{ROOT / 'runtime'}",
-        f'-DMODEL_HEADER="{header}"', str(HERE / "state_delay_tap_model.cpp"),
-        "-o", str(binary),
-    ])
 
 
 def main() -> None:
@@ -58,7 +25,7 @@ def main() -> None:
         opt_cpp = temp / "opt.hpp"
         plain_cpp = temp / "plain.hpp"
         observed: dict[str, tuple[int, int]] = {}
-        opt_stats = emit(args.pycc, source, opt_cpp, [])
+        opt_stats = emit(args.pycc, source, opt_cpp)
         plain_stats = emit(args.pycc, source, plain_cpp, ["--no-state-opt"])
         if opt_stats.get("delay_chain_taps_created") != 1:
             raise AssertionError(f"opt: unexpected tap stats: {opt_stats}")
@@ -76,9 +43,12 @@ def main() -> None:
         if plain_stats.get("state_opt_policy") != "off":
             raise AssertionError(f"plain: policy is not off: {plain_stats}")
 
-        compile_cpp(args.cxx, opt_cpp, temp / "opt_bin")
+        driver = HERE / "state_delay_tap_model.cpp"
+        compile_cpp(args.cxx, opt_cpp, temp / "opt_bin", driver,
+                    ["-DNDEBUG"])
         observed["opt"] = result([str(temp / "opt_bin")])
-        compile_cpp(args.cxx, plain_cpp, temp / "plain_bin")
+        compile_cpp(args.cxx, plain_cpp, temp / "plain_bin", driver,
+                    ["-DNDEBUG"])
         observed["plain"] = result([str(temp / "plain_bin")])
         if len(set(observed.values())) != 1:
             raise AssertionError(f"delay tap backend mismatch: {observed}")

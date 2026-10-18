@@ -96,10 +96,10 @@ fi
 "${FILECHECK_BIN}" "${ROOT}/compiler/mlir/test/observation_demand.mlir" \
   --check-prefix=DEMAND \
   --input-file="${TMP_DIR}/observation-demand.mlir"
-"${PYC_OPT}" "${ROOT}/compiler/mlir/test/observation_demand_comb.mlir" \
+"${PYC_OPT}" "${ROOT}/compiler/mlir/test/observation_demand_comb_module.mlir" \
   --pass-pipeline="builtin.module(pyc-apply-observation-demand)" \
   -o "${TMP_DIR}/observation-demand-comb.mlir"
-"${FILECHECK_BIN}" "${ROOT}/compiler/mlir/test/observation_demand_comb.mlir" \
+"${FILECHECK_BIN}" "${ROOT}/compiler/mlir/test/observation_demand_comb_module.mlir" \
   --check-prefix=COMB \
   --input-file="${TMP_DIR}/observation-demand-comb.mlir"
 
