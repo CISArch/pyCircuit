@@ -568,8 +568,41 @@ static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &
     os << "    " << nt.get(result) << " = " << ess.str() << ";\n";
 }
 
+inline const llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>>
+    kEmptyDelayBanks{};
+
+// Bank-aware delay tap read. Empty delayBanked = per-object expression.
+static std::string delayTapReadExpr(
+    pyc::DelayLineOp delay, unsigned depth, NameTable &nt,
+    const llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>> &delayBanked) {
+  const std::string inst = nt.get(delay.getQ()) + "_inst";
+  if (auto idAttr = delay->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
+    if (!isa<VectorType>(delay.getQ().getType())) {
+      const int64_t raw = idAttr.getValue().getSExtValue();
+      const unsigned dw = bitWidth(delay.getQ().getType());
+      if (auto da = delay->getAttrOfType<IntegerAttr>("depth")) {
+        const int64_t key = raw * 65536 + static_cast<int64_t>(dw) * 256 +
+                            da.getValue().getZExtValue();
+        auto it = delayBanked.find(key);
+        if (it != delayBanked.end()) {
+          long lane = 0;
+          for (pyc::DelayLineOp c : it->second) {
+            if (c == delay)
+              break;
+            ++lane;
+          }
+          return "delay_bank_" + std::to_string(key) + ".lane_tap(" +
+                 std::to_string(lane) + "u, " + std::to_string(depth) + "u)";
+        }
+      }
+    }
+  }
+  return inst + "->tap(" + std::to_string(depth) + "u)";
+}
+
 static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTable &nt,
-                                    CppEmitterPlacementState *ps = nullptr) {
+                                    CppEmitterPlacementState *ps = nullptr,
+                                    const llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>> *delayBanked = nullptr) {
   if (ps) {
     for (Value v : op.getOperands())
       (void)ps->emitLocalDeclIfNeeded(v, v.getType(), nt.get(v), os);
@@ -849,8 +882,11 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
       return tap.emitError("invalid delay tap source or depth");
     assignExpr(tap.getTap(), tap.getTap().getType(), os, nt,
                [&](llvm::raw_ostream &e) {
-                 e << nt.get(delay.getQ()) << "_inst->tap("
-                   << depth.getInt() << "u)";
+                 e << delayTapReadExpr(delay,
+                                       static_cast<unsigned>(depth.getInt()),
+                                       nt,
+                                       delayBanked ? *delayBanked
+                                                   : kEmptyDelayBanks);
                },
                ps);
     return success();
@@ -1220,7 +1256,9 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
                                     const CppEmitterOptions &opts,
                                     const EmissionSchedule &schedule,
                                     const llvm::DenseMap<Operation *, unsigned>
-                                        &combIndices) {
+                                        &combIndices,
+                                    const llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>>
+                                        *delayBanked = nullptr) {
   if (comb.getBody().empty())
     return comb.emitError("pyc.comb must have a non-empty region");
 
@@ -1262,7 +1300,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
       os << "  inline void " << partName << "() {\n";
       placement.beginMethod(partName);
       for (Operation *op : part.second) {
-        if (failed(emitCombAssign(*op, os, nt, &placement)))
+        if (failed(emitCombAssign(*op, os, nt, &placement, delayBanked)))
           return failure();
       }
       os << "  }\n\n";
@@ -1291,7 +1329,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   placement.beginMethod(methodName);
   emitCombInputGuard(comb, os, nt, idx);
   for (Operation *op : combOps) {
-    if (failed(emitCombAssign(*op, os, nt, &placement)))
+    if (failed(emitCombAssign(*op, os, nt, &placement, delayBanked)))
       return failure();
   }
 
@@ -1428,7 +1466,140 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  " << cppType(tap.getTap().getType()) << " " << nt.get(tap.getTap())
        << "_qNext{};\n";
 
+  const bool packedBank = opts.packedBank;
+  llvm::DenseMap<void *, unsigned> packedBankOffset;
+  llvm::DenseMap<int64_t, unsigned> packedBankBits;
+  // SeqBank grouping: scalar regs carrying pyc.seq_bank_id lower into
+  // per-bank pyc::cpp::SeqBank<W> members; everything else keeps the
+  // per-reg expansion. Map: bank id -> (width, regs in IR order).
+  llvm::DenseMap<int64_t, unsigned> seqBankWidth;
+  llvm::DenseMap<int64_t, llvm::SmallVector<pyc::RegOp>> seqBanked;
+  llvm::SmallVector<pyc::RegOp> unbankedRegs;
+  for (pyc::RegOp r : regs) {
+    auto idAttr = r->getAttrOfType<IntegerAttr>("pyc.seq_bank_id");
+    if (isa<VectorType>(r.getQ().getType()) || !idAttr) {
+      unbankedRegs.push_back(r);
+      continue;
+    }
+    const int64_t id = idAttr.getValue().getSExtValue();
+    unsigned w = bitWidth(r.getQ().getType());
+    // Regs rewritten by earlier passes (retiming/packing) may carry a width
+    // different from the partition-time majority; split into a per-width
+    // sub-bank keyed (id, width) so SeqBank<W>'s single template width holds.
+    const int64_t key = id * 4096 + static_cast<int64_t>(w);
+    seqBankWidth.try_emplace(key, w);
+    seqBanked[key].push_back(r);
+    r->setAttr("pyc.seq_bank_id",
+               IntegerAttr::get(IntegerType::get(r->getContext(), 64), key));
+  }
+  llvm::SmallVector<int64_t> seqBankIds;
+  for (auto &kv : seqBanked)
+    seqBankIds.push_back(kv.first);
+  std::sort(seqBankIds.begin(), seqBankIds.end());
+  // --packed-bank: lower SeqBank groups into PackedRegBank (contiguous
+  // bit-packed storage) instead of per-lane qNext vectors. Bit offset is
+  // assigned in lane order; widths are per-lane so no depth/wide restriction.
+  if (packedBank) {
+    for (int64_t bankId : seqBankIds) {
+      unsigned off = 0;
+      for (pyc::RegOp r : seqBanked[bankId]) {
+        packedBankOffset[r->getResult(0).getAsOpaquePointer()] = off;
+        off += bitWidth(r.getQ().getType());
+      }
+      packedBankBits[bankId] = off;
+    }
+  }
+  // Rewrite the reg list so the per-reg paths skip banked regs.
+  regs.clear();
+  for (pyc::RegOp r : unbankedRegs)
+    regs.push_back(r);
+
+  // DelayBank buckets: key = (clk, width, depth); vector delays stay per-object.
+  llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>> delayBanked;
+  llvm::DenseMap<int64_t, std::pair<unsigned, unsigned>> delayBankShape;
+  llvm::SmallVector<pyc::DelayLineOp> unbankedDelays;
+  for (pyc::DelayLineOp dl : delayLines) {
+    auto idAttr = dl->getAttrOfType<IntegerAttr>("pyc.seq_bank_id");
+    auto depthAttr = dl->getAttrOfType<IntegerAttr>("depth");
+    if (isa<VectorType>(dl.getQ().getType()) || !idAttr || !depthAttr) {
+      unbankedDelays.push_back(dl);
+      continue;
+    }
+    unsigned w = bitWidth(dl.getQ().getType());
+    const int64_t raw = idAttr.getValue().getSExtValue();
+    const int64_t key = raw * 65536 + static_cast<int64_t>(w) * 256 +
+                        depthAttr.getValue().getZExtValue();
+    delayBankShape.try_emplace(key, std::make_pair(w, depthAttr.getValue().getZExtValue()));
+    delayBanked[key].push_back(dl);
+  }
+  llvm::SmallVector<int64_t> delayBankIds;
+  for (auto &kv : delayBanked)
+    delayBankIds.push_back(kv.first);
+  std::sort(delayBankIds.begin(), delayBankIds.end());
+  delayLines.clear();
+  for (pyc::DelayLineOp dl : unbankedDelays)
+    delayLines.push_back(dl);
+
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
+  // DelayBank-aware binding text: {inst, pending, qNext}. inst is empty when
+  // banked; callers use the accessors (pointer-returning) verbatim.
+  auto delayBinding = [&](pyc::DelayLineOp delay)
+      -> std::tuple<std::string, std::string, std::string> {
+    const std::string inst = nt.get(delay.getQ()) + "_inst";
+    if (auto idAttr = delay->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
+      if (!isa<VectorType>(delay.getQ().getType())) {
+        const int64_t raw = idAttr.getValue().getSExtValue();
+        const unsigned dw = bitWidth(delay.getQ().getType());
+        if (auto da = delay->getAttrOfType<IntegerAttr>("depth")) {
+          const int64_t key = raw * 65536 + static_cast<int64_t>(dw) * 256 +
+                              da.getValue().getZExtValue();
+          auto it = delayBanked.find(key);
+          if (it != delayBanked.end()) {
+            long lane = 0;
+            for (pyc::DelayLineOp c : it->second) {
+              if (c == delay)
+                break;
+              ++lane;
+            }
+            const std::string bank = "delay_bank_" + std::to_string(key);
+            return {"", bank + ".lane_pending(" + std::to_string(lane) + "u)",
+                    bank + ".lane_qnext(" + std::to_string(lane) + "u)"};
+          }
+        }
+      }
+    }
+    return {inst, inst + "->pending", inst + "->qNext"};
+  };
+  // Probe write-intent binding for a scalar reg: either its pyc_reg inst
+  // (unbanked) or the owning SeqBank's lane storage. Returns the C++ text
+  // for `&...pending` and `&...qNext`.
+  auto probePendingNext = [&](pyc::RegOp r) -> std::pair<std::string, std::string> {
+    if (auto idAttr = r->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
+      if (!isa<VectorType>(r.getQ().getType())) {
+        const int64_t id = idAttr.getValue().getSExtValue();
+        // Lane index within the bank = position in seqBanked[id].
+        long lane = 0;
+        if (auto it = seqBanked.find(id); it != seqBanked.end()) {
+          for (pyc::RegOp cand : it->second) {
+            if (cand == r)
+              break;
+            ++lane;
+          }
+        }
+        if (packedBank)
+          return {"packed_bank_" + std::to_string(id) + ".lane_pending(" +
+                      std::to_string(lane) + "u)",
+                  "&" + nt.get(r.getQ())};
+        std::string bank = "seq_bank_" + std::to_string(id);
+        // lane_pending/lane_qnext return pointers; keep the '&' at the call
+        // site out of this string (callers concatenate it verbatim after &).
+        return {bank + ".lane_pending(" + std::to_string(lane) + "u)",
+                bank + ".lane_qnext(" + std::to_string(lane) + "u)"};
+      }
+    }
+    return {nt.get(r.getQ()) + "_inst->pending",
+            nt.get(r.getQ()) + "_inst->qNext"};
+  };
   auto delayKey = [&](pyc::DelayLineOp delay) { return nt.get(delay.getQ()); };
   auto delayTapKey = [&](pyc::DelayTapOp tap) { return nt.get(tap.getTap()); };
   auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
@@ -1705,12 +1876,53 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         if (!seenNamedFields.insert(fieldPath).second)
           return;
         auto regQ = findStateStorageSource(value);
-        std::string regInst =
-            regQ ? (nt.get(regQ->q) + "_inst") : std::string();
+        std::string regInst;
         std::string regNext;
-        if (regQ)
-          regNext = regQ->tap ? (nt.get(regQ->tap) + "_qNext")
-                              : (regInst + "->qNext");
+        if (regQ) {
+          // SeqBank lanes carry the pending/qNext storage for their reg.
+          pyc::RegOp srcReg;
+          if (!regQ->tap) {
+            Value qVal = regQ->q;
+            if (auto *def = qVal.getDefiningOp())
+              if (auto alias = dyn_cast<pyc::AliasOp>(def))
+                qVal = alias.getOperand();
+            if (auto *d2 = qVal.getDefiningOp())
+              srcReg = dyn_cast<pyc::RegOp>(d2);
+          }
+          if (srcReg) {
+            auto pn = probePendingNext(srcReg);
+            regInst = pn.first;   // full `&expr` text
+            regNext = pn.second;
+          } else if (auto srcDelayOnly =
+                         dyn_cast<pyc::DelayLineOp>(regQ->storage)) {
+            // Banked/unbanked delay tail probe (no tap indirection).
+            auto [dinst, dpend, dnext] = delayBinding(srcDelayOnly);
+            if (dinst.empty()) {
+              regInst = dpend;
+              regNext = dnext;
+            } else {
+              regInst = "&" + dpend;
+              regNext = "&" + dnext;
+            }
+          } else if (regQ->tap) {
+            // Delay-tap probe: pending lives on the source delay; route
+            // through DelayBank when banked (TapView static, pointer text).
+            if (auto srcDelay = regQ->tap.getDefiningOp<pyc::DelayLineOp>()) {
+              auto [dinst, dpend, dnext] = delayBinding(srcDelay);
+              if (dinst.empty()) {
+                regInst = dpend;  // banked accessor (pointer, no &)
+              } else {
+                regInst = "&" + dpend;
+              }
+            } else {
+              regInst = "&" + nt.get(regQ->q) + "_inst->pending";
+            }
+            regNext = "&" + nt.get(regQ->tap) + "_qNext";
+          } else {
+            regInst = "&" + nt.get(regQ->q) + "_inst->pending";
+            regNext = "&" + nt.get(regQ->q) + "_inst->qNext";
+          }
+        }
         namedProbes.push_back(NamedProbeInfo{
             fieldPath,
             nt.get(value),
@@ -1774,6 +1986,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		      return f.emitError("invalid input port width for ProbeRegistry: ") << getPortCanonicalFieldPath(f, i, /*isResult=*/false);
 		    emitWireProbes(os, arg.getType(), w, inCanon[static_cast<unsigned>(i)], inNames[static_cast<unsigned>(i)]);
 		  }
+		  // Per-function dedup for packed-bank probe view decls. Bank ids are
+		  // numbered per FuncOp by the partition pass, so the same id appears
+		  // in many submodules; the set must reset for every emitFunc call
+		  // (a function-level static would skip declarations in later
+		  // submodules and break their probe compile).
+		  llvm::DenseSet<int64_t> packedViewDecls;
 		  for (unsigned i = 0; i < f.getNumResults(); ++i) {
 		    unsigned w = bitWidth(f.getResultTypes()[i]);
 		    if (w == 0)
@@ -1781,19 +1999,123 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 			    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
 		      const auto &source = *outRegQ[i];
 		      const unsigned storageWidth = bitWidth(source.q.getType());
+		      // Resolve the owning pyc.reg (if any) for SeqBank lane bindings.
+		      pyc::RegOp srcReg;
+		      if (!source.tap) {
+		        Value qVal = source.q;
+		        if (auto *def = qVal.getDefiningOp())
+		          if (auto alias = dyn_cast<pyc::AliasOp>(def))
+		            qVal = alias.getOperand();
+		        if (auto *d2 = qVal.getDefiningOp())
+		          srcReg = dyn_cast<pyc::RegOp>(d2);
+		      }
+		      std::string refP, refN;
+		      std::string pendBase = nt.get(source.q) + "_inst->pending";
+		      std::string nextBase = source.tap
+		                                         ? (nt.get(source.tap) + "_qNext")
+		                                         : (nt.get(source.q) + "_inst->qNext");
+		      if (srcReg) {
+		        auto pn = probePendingNext(srcReg);
+		        pendBase = pn.first;
+		        nextBase = pn.second;
+		      } else if (auto tailDelay =
+		                     dyn_cast<pyc::DelayLineOp>(source.storage)) {
+		        auto [dinst, dpend, dnext] = delayBinding(tailDelay);
+		        if (dinst.empty()) {
+		          pendBase = dpend;
+		          nextBase = dnext;
+		        }
+		      } else if (source.tap) {
+		        if (auto srcDelay = dyn_cast<pyc::DelayLineOp>(source.storage)) {
+		          auto [dinst, dpend, dnext] = delayBinding(srcDelay);
+		          if (dinst.empty()) {
+		            pendBase = dpend;  // banked accessor (pointer)
+		            nextBase = "&" + nt.get(source.tap) + "_qNext";
+		            nextBase = dnext;  // banked qNext accessor (pointer)
+		          }
+		        }
+		      }
+		      const auto pendNext = std::pair<std::string, std::string>{pendBase, nextBase};
+		      const bool banked = pendNext.first.rfind("seq_bank_", 0) == 0 ||
+		                              pendNext.first.rfind("delay_bank_", 0) == 0 ||
+		                              pendNext.first.rfind("packed_bank_", 0) == 0;
+		      // Packed-bank: slice probes' write-data must view the packed
+		      // storage (lane q wires are written back from it). Generate a
+		      // reinterpret of the owning bank's storage; lsb becomes the lane's
+		      // bit offset.
+		      std::string packedViewDecl;
+		      std::string packedViewRef;
+		      unsigned packedLsb = source.lsb;
+		      llvm::DenseSet<int64_t> &packedViewDeclsEmitted = packedViewDecls;
+		      if (packedBank && source.storage) {
+		        if (auto srcRegPK = dyn_cast<pyc::RegOp>(source.storage)) {
+		          if (auto idAttr = srcRegPK->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
+		            const int64_t pid = idAttr.getValue().getSExtValue();
+		            unsigned bitOff = 0;
+		            if (auto it = seqBanked.find(pid); it != seqBanked.end())
+		              for (pyc::RegOp c : it->second) {
+		                if (c == srcRegPK)
+		                  break;
+		                bitOff += bitWidth(c.getQ().getType());
+		              }
+		            // Declare once per bank (static local; idempotent).
+		            if (!packedViewDeclsEmitted.contains(pid)) {
+		              packedViewDeclsEmitted.insert(pid);
+		              packedViewDecl =
+		                  "    pyc::cpp::PackedRegBank *_pyc_pbank_v_" +
+		                  std::to_string(pid) + " = &packed_bank_" +
+		                  std::to_string(pid) + ";\n";
+		            }
+		            packedViewRef =
+		                "reinterpret_cast<pyc::cpp::Wire<" +
+		                std::to_string(storageWidth) + ">*>(_pyc_pbank_v_" +
+		                std::to_string(pid) + "->storage_data())";
+		            long pl = 0;
+		            for (pyc::RegOp c : seqBanked[pid]) {
+		              if (c == srcRegPK)
+		                break;
+		              ++pl;
+		            }
+		            // pending/qnext for this lane (pointers, no & needed).
+		            refP = "packed_bank_" + std::to_string(pid) +
+		                   ".lane_pending(" + std::to_string(pl) + "u)";
+		            refN = packedViewRef;
+		            packedLsb = source.lsb + bitOff;
+		          }
+		        }
+		      }
+		      // Packed-bank mode: write-data for slice probes is the packed
+		      // storage itself (lanes are packed in bit order, so a 16-bit
+		      // view covers adjacent lanes; lsb positions the slice).
+		      if (packedBank && source.storage) {
+		        if (auto srcRegPK = dyn_cast<pyc::RegOp>(source.storage)) {
+		          if (auto idAttr = srcRegPK->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
+		            const int64_t pid = idAttr.getValue().getSExtValue();
+		            unsigned acc = 0;
+		            if (auto it = seqBanked.find(pid); it != seqBanked.end())
+		              for (pyc::RegOp c : it->second) {
+		                if (c == srcRegPK)
+		                  break;
+		                acc += bitWidth(c.getQ().getType());
+		              }
+		            // packedViewDecl/Ref already computed above for this bank.
+		            // adjust lsb to the lane's bit offset in the packed storage
+		          }
+		        }
+		      }
+		      refP = banked ? pendNext.first : "&" + pendNext.first;
+		      refN = banked ? pendNext.second : "&" + pendNext.second;
 		      if (source.lsb != 0 || storageWidth != w) {
+			        os << packedViewDecl;
 			        os << "    reg.addRegSlice<" << w << ", " << storageWidth
 			           << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &"
-			           << outNames[i] << ", &" << nt.get(source.q)
-			           << "_inst->pending, &"
-                       << (source.tap ? nt.get(source.tap) + "_qNext"
-                                      : nt.get(source.q) + "_inst->qNext")
-                       << ", " << source.lsb << "u);\n";
+			           << outNames[i] << ", " << refP << ", "
+                       << (packedViewRef.empty() ? refN : packedViewRef)
+                       << ", " << packedLsb << "u);\n";
 			      } else {
 			        os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
-			           << ", &" << nt.get(source.q) << "_inst->pending, &"
-                       << (source.tap ? nt.get(source.tap) + "_qNext"
-                                      : nt.get(source.q) + "_inst->qNext")
+			           << ", " << refP << ", "
+                       << refN
                        << ");\n";
 		      }
 		    } else {
@@ -1802,17 +2124,24 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		  }
       for (const auto &named : namedProbes) {
         if (named.isReg && !isa<VectorType>(named.type)) {
+          const bool bankedN = named.cppRegInst.rfind("seq_bank_", 0) == 0 ||
+                       named.cppRegInst.rfind("delay_bank_", 0) == 0 ||
+                       named.cppRegInst.rfind("packed_bank_", 0) == 0;
           if (named.stateLsb != 0 ||
               named.stateStorageWidth != named.width) {
             os << "    reg.addRegSlice<" << named.width << ", "
                << named.stateStorageWidth << ">(reg_path("
                << cppStringLiteral(named.fieldPath) << "), &"
-               << named.cppValue << ", &" << named.cppRegInst
-               << "->pending, &" << named.cppRegNext << ", "
+               << named.cppValue << ", "
+               << (bankedN ? named.cppRegInst : "&" + named.cppRegInst)
+               << ", " << named.cppRegNext << ", "
                << named.stateLsb << "u);\n";
           } else {
-            os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
-               << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegNext << ");\n";
+            os << "    reg.addReg<" << named.width << ">(reg_path("
+               << cppStringLiteral(named.fieldPath) << "), &"
+               << named.cppValue << ", "
+               << (bankedN ? named.cppRegInst : "&" + named.cppRegInst)
+               << ", " << named.cppRegNext << ");\n";
           }
         } else {
           emitWireProbes(os, named.type, named.width, named.fieldPath, named.cppValue);
@@ -1829,6 +2158,29 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         if (storageWidth == 0)
           return storage->emitError("lazy probe storage has empty width");
         const std::string inst = nt.get(q) + "_inst";
+        // SeqBank lane bindings when the storage is a banked reg's q: the q
+        // wire address is shared with the bank lane, so only pending/qNext
+        // switch to the bank accessors.
+        std::string pendText = "&" + inst + "->pending";
+        std::string nextText = "&" + inst + "->qNext";
+        std::string qText = "&" + inst + "->q";
+        {
+          Value qVal = q;
+          if (auto *def = qVal.getDefiningOp())
+            if (auto alias = dyn_cast<pyc::AliasOp>(def))
+              qVal = alias.getOperand();
+          if (auto *d2 = qVal.getDefiningOp())
+            if (auto srcReg = dyn_cast<pyc::RegOp>(d2)) {
+              auto pn = probePendingNext(srcReg);
+              if (pn.first.rfind("seq_bank_", 0) == 0 ||
+                  pn.first.rfind("packed_bank_", 0) == 0) {
+                pendText = pn.first;
+                nextText = "&" + nt.get(q);  // shared q wire (packed has no
+                                             // per-lane qNext storage)
+                qText = "&" + nt.get(q);
+              }
+            }
+        }
         for (Attribute item : slices) {
           auto dict = dyn_cast<DictionaryAttr>(item);
           if (!dict)
@@ -1861,31 +2213,100 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                 break;
               }
             }
-            std::string tapWriteNext =
-                matchingTap ? (nt.get(matchingTap.getTap()) + "_qNext")
-                            : (inst + "->qNext");
+            std::string tapWriteNext;
+            // Banked detection for the fallback write-next.
+            std::string bankPend;
+            std::string bankQNext;
+            std::string tapViewDecl;
+            std::string tapViewRef;
+            {
+              Value qv = q;
+              if (auto *def = qv.getDefiningOp())
+                if (auto alias = dyn_cast<pyc::AliasOp>(def))
+                  qv = alias.getOperand();
+              if (auto *d2 = qv.getDefiningOp())
+                if (auto srcDelay = dyn_cast<pyc::DelayLineOp>(d2)) {
+                  auto [dinst, dpend, dnext] = delayBinding(srcDelay);
+                  if (dinst.empty()) {
+                    if (auto idAttr = srcDelay->getAttrOfType<IntegerAttr>(
+                            "pyc.seq_bank_id")) {
+                      const int64_t raw = idAttr.getValue().getSExtValue();
+                      const unsigned dw = bitWidth(srcDelay.getQ().getType());
+                      if (auto da = srcDelay->getAttrOfType<IntegerAttr>("depth")) {
+                        const int64_t key = raw * 65536 +
+                                            static_cast<int64_t>(dw) * 256 +
+                                            da.getValue().getZExtValue();
+                        if (auto it = delayBanked.find(key);
+                            it != delayBanked.end()) {
+                          long lane = 0;
+                          for (pyc::DelayLineOp c : it->second) {
+                            if (c == srcDelay)
+                              break;
+                            ++lane;
+                          }
+                          const std::string bank =
+                              "delay_bank_" + std::to_string(key);
+                          bankPend = bank + ".lane_pending(" +
+                                     std::to_string(lane) + "u)";
+                          bankQNext = bank + ".lane_qnext(" +
+                                      std::to_string(lane) + "u)";
+                          tapViewDecl =
+                              "    static const pyc::cpp::DelayBank<" +
+                              std::to_string(dw) + ">::TapView _pyc_tvw_" +
+                              std::to_string(key) + "_" +
+                              std::to_string(lane) + "{&" + bank + ", " +
+                              std::to_string(lane) + "u};\n";
+                          tapViewRef = "&_pyc_tvw_" + std::to_string(key) +
+                                       "_" + std::to_string(lane);
+                        }
+                      }
+                    }
+                  }
+                }
+            }
+            if (matchingTap)
+              tapWriteNext = nt.get(matchingTap.getTap()) + "_qNext";
+            else if (!bankQNext.empty())
+              tapWriteNext = bankQNext;
+            else
+              tapWriteNext = inst + "->qNext";
+            if (tapViewDecl.empty()) {
+              tapViewDecl = "";
+              tapViewRef = inst;
+              if (bankPend.empty())
+                bankPend = "&" + inst + "->pending";
+            }
+            // Banked source delay: emit a static DelayBank::TapView and pass
+            // its pointer as the DelayInst argument (same tap()/pending
+            // interface), with write-intent from the bank lane.
             if (lsb == 0 && width == storageWidth) {
+              os << tapViewDecl;
+              const bool bankedW = tapWriteNext.rfind("delay_bank_", 0) == 0;
               os << "    reg.addRegLazyTap<" << width << ">(reg_path("
-                 << cppStringLiteral(field) << "), " << inst << ", " << tapDepth
-                 << "u, &" << inst << "->pending, &" << tapWriteNext << ");\n";
+                 << cppStringLiteral(field) << "), " << tapViewRef << ", "
+                 << tapDepth << "u, " << (bankPend.empty() ? ("&" + inst + "->pending") : bankPend)
+                 << ", " << (bankedW ? tapWriteNext : ("&" + tapWriteNext)) << ");\n";
             } else {
+              os << tapViewDecl;
+              const bool bankedW2 = tapWriteNext.rfind("delay_bank_", 0) == 0;
               os << "    reg.addRegLazyTapSlice<" << width << ", "
                  << storageWidth << ">(reg_path(" << cppStringLiteral(field)
-                 << "), " << inst << ", " << tapDepth << "u, " << lsb
-                 << "u, &" << inst << "->pending, &" << tapWriteNext << ");\n";
+                 << "), " << tapViewRef << ", " << tapDepth << "u, " << lsb
+                 << "u, " << (bankPend.empty() ? ("&" + inst + "->pending") : bankPend)
+                 << ", " << (bankedW2 ? tapWriteNext : ("&" + tapWriteNext)) << ");\n";
             }
             continue;
           }
           if (lsb == 0 && width == storageWidth) {
             os << "    reg.addReg<" << width << ">(reg_path("
-               << cppStringLiteral(field) << "), &" << inst << "->q, &" << inst
-               << "->pending, &" << inst << "->qNext);\n";
+               << cppStringLiteral(field) << "), " << qText << ", "
+               << pendText << ", " << nextText << ");\n";
             continue;
           }
           os << "    reg.addRegLazySlice<" << width << ", " << storageWidth
-             << ">(reg_path(" << cppStringLiteral(field) << "), &" << inst
-             << "->q, " << lsb << "u, &" << inst << "->pending, &" << inst
-             << "->qNext);\n";
+             << ">(reg_path(" << cppStringLiteral(field) << "), " << qText
+             << ", " << lsb << "u, " << pendText << ", " << nextText
+             << ");\n";
         }
         return success();
       };
@@ -1998,6 +2419,19 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     else
       os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
   }
+  for (int64_t bankId : seqBankIds) {
+    if (packedBank)
+      os << "  pyc::cpp::PackedRegBank packed_bank_" << bankId << ";\n";
+    else
+      os << "  pyc::cpp::SeqBank<" << seqBankWidth[bankId] << "> seq_bank_"
+         << bankId << ";\n";
+  }
+  // (packed lane registration happens in the ctor loop below via
+  //  packedBankOffset lookups; see the per-reg new site.)
+  for (int64_t dbk : delayBankIds) {
+    os << "  pyc::cpp::DelayBank<" << delayBankShape[dbk].first
+       << "> delay_bank_" << dbk << ";\n";
+  }
   std::string fastClkName;
   bool fastClkUnique = true;
   auto noteFastClk = [&](Value clk) {
@@ -2011,6 +2445,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     noteFastClk(r.getClk());
   for (auto delay : delayLines)
     noteFastClk(delay.getClk());
+  for (int64_t bankId : seqBankIds)
+    for (pyc::RegOp r : seqBanked[bankId])
+      noteFastClk(r.getClk());
   const bool fastEdge = fastClkUnique && !fastClkName.empty();
   if (fastEdge) {
     os << "  bool _pyc_clk_prev = false;\n";
@@ -2322,6 +2759,45 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
        << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
   }
+  for (int64_t bankId : seqBankIds) {
+    if (packedBank) {
+      for (pyc::RegOp r : seqBanked[bankId]) {
+        void *opKey = r->getResult(0).getAsOpaquePointer();
+        os << "    packed_bank_" << bankId << ".add_lane(pyc::cpp::PackedRegBank::Lane{"
+           << "&" << nt.get(r.getQ()) << ", &" << nt.get(r.getNext()) << ", &"
+           << nt.get(r.getRst()) << ", &" << nt.get(r.getEn()) << ", &"
+           << nt.get(r.getInit()) << ", " << bitWidth(r.getQ().getType())
+           << "u, " << packedBankOffset[opKey] << "u});\n";
+      }
+      continue;
+    }
+    os << "    seq_bank_" << bankId << ".add_lanes({";
+    bool firstLane = true;
+    for (pyc::RegOp r : seqBanked[bankId]) {
+      if (!firstLane)
+        os << ", ";
+      firstLane = false;
+      os << "{&" << nt.get(r.getQ()) << ", &" << nt.get(r.getNext()) << ", &"
+         << nt.get(r.getRst()) << ", &" << nt.get(r.getEn()) << ", &"
+         << nt.get(r.getInit()) << "}";
+    }
+    os << "});\n";
+  }
+  for (int64_t dbk : delayBankIds) {
+    os << "    delay_bank_" << dbk << ".add_lanes({";
+    bool firstDL = true;
+    for (pyc::DelayLineOp dl : delayBanked[dbk]) {
+      if (!firstDL)
+        os << ", ";
+      firstDL = false;
+      auto da = dl->getAttrOfType<IntegerAttr>("depth");
+      os << "{&" << nt.get(dl.getQ()) << ", &" << nt.get(dl.getNext())
+         << ", &" << nt.get(dl.getRst()) << ", &" << nt.get(dl.getEn())
+         << ", &" << nt.get(dl.getInit()) << ", "
+         << da.getValue().getZExtValue() << "u}";
+    }
+    os << "});\n";
+  }
   for (auto delay : delayLines) {
     unsigned w = bitWidth(delay.getQ().getType());
     auto depth = delay->getAttrOfType<IntegerAttr>("depth").getValue().getZExtValue();
@@ -2379,7 +2855,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // Emit fused comb helpers. Indices match body order (same as placement).
   for (auto [i, comb] : llvm::enumerate(combs)) {
     if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts,
-                              *schedule, combIndex)))
+                              *schedule, combIndex, &delayBanked)))
       return failure();
   }
 
@@ -2648,7 +3124,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       // combs, and downstream combs regardless of dirty state, so it must
       // never sit inside a wordClean guard group.
       closeGuardGroup();
-      if (failed(emitCombAssign(*op, os, nt)))
+      if (failed(emitCombAssign(*op, os, nt, /*ps=*/nullptr, &delayBanked)))
         return failure();
       ++opIdx;
       continue;
@@ -3202,7 +3678,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             pyc::VAndReduceOp,
             pyc::VAddReduceOp,
             arith::SelectOp>(*op)) {
-      if (failed(emitCombAssign(*op, os, nt)))
+      if (failed(emitCombAssign(*op, os, nt, /*ps=*/nullptr, &delayBanked)))
         return failure();
       return success();
     }
@@ -3670,9 +4146,38 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       auto depth = tap->getAttrOfType<IntegerAttr>("depth");
       if (!delay || !depth)
         return tap.emitError("invalid delay tap source or depth");
-      os << indent << nt.get(tap.getTap()) << "_qNext = "
-         << nt.get(delay.getQ()) << "_inst->tap_next(" << depth.getInt()
-         << "u);\n";
+      std::string tapExpr;
+      if (auto idAttr = delay->getAttrOfType<IntegerAttr>("pyc.seq_bank_id")) {
+        if (!isa<VectorType>(delay.getQ().getType())) {
+          // Locate the owning bank by (raw, width); the tap's own depth is
+          // NOT part of the bank key (it indexes the stage, not the bank).
+          const int64_t raw = idAttr.getValue().getSExtValue();
+          const unsigned w = bitWidth(delay.getQ().getType());
+          for (int64_t dbk : delayBankIds) {
+            if (delayBankShape[dbk].first != w)
+              continue;
+            auto it = delayBanked.find(dbk);
+            if (it == delayBanked.end())
+              continue;
+            long lane = 0;
+            bool hit = false;
+            for (pyc::DelayLineOp c : it->second) {
+              if (c == delay) { hit = true; break; }
+              ++lane;
+            }
+            if (!hit)
+              continue;
+            tapExpr = "delay_bank_" + std::to_string(dbk) +
+                      ".lane_tap_next(" + std::to_string(lane) + "u, " +
+                      std::to_string(depth.getValue().getZExtValue()) + "u)";
+            break;
+          }
+        }
+      }
+      if (tapExpr.empty())
+        tapExpr = nt.get(delay.getQ()) + "_inst->tap_next(" +
+                  std::to_string(depth.getInt()) + "u)";
+      os << indent << nt.get(tap.getTap()) << "_qNext = " << tapExpr << ";\n";
     }
     return success();
   };
@@ -3685,18 +4190,42 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "      bool _pyc_fall = _pyc_clk_prev && !_pyc_now;\n";
     os << "      _pyc_clk_prev = _pyc_now;\n";
     os << "      if (_pyc_rise) {\n";
+    for (int64_t bankId : seqBankIds) {
+      if (packedBank)
+        os << "        packed_bank_" << bankId << ".compute_rise();\n";
+      else
+        os << "        seq_bank_" << bankId << ".compute_rise();\n";
+    }
+    for (int64_t dbk : delayBankIds)
+      os << "        delay_bank_" << dbk << ".compute_rise();\n";
     emitEdgeCall("posedge_tick_compute", "        ");
     if (failed(emitTapUpdates("        ")))
       return failure();
     os << "        _pyc_seq_armed = true;\n";
     os << "      } else if (_pyc_fall) {\n";
     os << "        if (_pyc_seq_armed) {\n";
+    for (int64_t bankId : seqBankIds) {
+      if (packedBank)
+        os << "          packed_bank_" << bankId << ".negedge();\n";
+      else
+        os << "          seq_bank_" << bankId << ".negedge();\n";
+    }
+    for (int64_t dbk : delayBankIds)
+      os << "          delay_bank_" << dbk << ".negedge();\n";
     emitEdgeCall("negedge_update", "          ");
     os << "          _pyc_seq_armed = false;\n";
     os << "        }\n";
     if (failed(emitTapUpdates("        ")))
       return failure();
     os << "      } else {\n";
+    for (int64_t bankId : seqBankIds) {
+      if (packedBank)
+        os << "        packed_bank_" << bankId << ".compute_generic(_pyc_now);\n";
+      else
+        os << "        seq_bank_" << bankId << ".compute_generic(_pyc_now);\n";
+    }
+    for (int64_t dbk : delayBankIds)
+      os << "        delay_bank_" << dbk << ".compute_generic(_pyc_now);\n";
     emitEdgeCall("tick_compute", "        ");
     if (failed(emitTapUpdates("        ")))
       return failure();
@@ -3716,6 +4245,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                            [&](llvm::StringRef indent) {
                              os << indent << key << "->tick_compute();\n";
                            });
+    }
+    for (int64_t dbk : delayBankIds) {
+      llvm::StringRef clkName =
+          fastClkName.empty()
+              ? nt.get(delayBanked[dbk].front().getClk())
+              : llvm::StringRef(fastClkName);
+      os << "    delay_bank_" << dbk << ".compute_generic(" << clkName
+         << ".toBool());\n";
     }
     if (failed(emitTapUpdates("    ")))
       return failure();
@@ -3781,6 +4318,84 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                            (indent + "  ").str());
     os << indent << "}\n";
   };
+  // DelayBank commit: tail-dirty wakes q consumers, advanced wakes tap
+  // consumers (every enabled edge shifts every tap).
+  for (int64_t dbk : delayBankIds) {
+    std::string bank = "delay_bank_" + std::to_string(dbk);
+    os << "    const auto &_pyc_dbank_res_" << dbk << " = " << bank
+       << ".commit();\n";
+    os << "    const auto &_pyc_dbank_tail_" << dbk
+       << " = _pyc_dbank_res_" << dbk << ".tailDirty;\n";
+    os << "    const auto &_pyc_dbank_adv_" << dbk
+       << " = _pyc_dbank_res_" << dbk << ".advanced;\n";
+    unsigned lane = 0;
+    for (pyc::DelayLineOp dl : delayBanked[dbk]) {
+      const std::string condT = "((_pyc_dbank_tail_" + std::to_string(dbk) +
+          "[" + std::to_string(lane >> 6) + "u] >> " +
+          std::to_string(lane & 63) + "u) & 1u)";
+      const std::string condA = "((_pyc_dbank_adv_" + std::to_string(dbk) +
+          "[" + std::to_string(lane >> 6) + "u] >> " +
+          std::to_string(lane & 63) + "u) & 1u)";
+      os << "    if (" << condT << ") {\n";
+      emitMetadataCombFanout(dl.getQ(), os, *schedule, combIndex, nt, "      ");
+      os << "    }\n";
+      for (auto tap : delayTaps) {
+        auto src = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+        if (src == dl) {
+          os << "    if (" << condA << ") {\n";
+          emitMetadataCombFanout(tap.getTap(), os, *schedule, combIndex, nt,
+                                 "      ");
+          os << "    }\n";
+        }
+      }
+      ++lane;
+    }
+  }
+  // PackedBank commit: same per-lane dirty wake as SeqBank; the packed
+  // storage updates word-at-a-time inside commit().
+  for (int64_t bankId : seqBankIds) {
+    if (packedBank) {
+      std::string bank = "packed_bank_" + std::to_string(bankId);
+      os << "    const auto &_pyc_pbank_dirty_" << bankId << " = " << bank
+         << ".commit();\n";
+      unsigned lane = 0;
+      for (pyc::RegOp r : seqBanked[bankId]) {
+        // Named per-lane commit-changed alias keeps the comb-dirty smoke
+        // assertions meaningful under the packed lowering.  The `_inst` suffix
+        // mirrors the non-banked path (below) so the smoke gate's
+        // `_pyc_commit_changed_pyc_reg_[0-9]+_inst` pattern still matches.
+        std::string key = nt.get(r.getQ()) + "_inst";
+        std::string changed = "_pyc_commit_changed_" + key;
+        os << "    const bool " << changed << " = ((_pyc_pbank_dirty_"
+           << bankId << "[" << (lane >> 6) << "u] >> " << (lane & 63)
+           << "u) & 1u);\n";
+        os << "    if (" << changed << ") {\n";
+        emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt, "      ");
+        os << "    }\n";
+        ++lane;
+      }
+      continue;
+    }
+    const unsigned w = seqBankWidth[bankId];
+    std::string bank = "seq_bank_" + std::to_string(bankId);
+    os << "    const auto &_pyc_bank_dirty_" << bankId << " = " << bank
+       << ".commit();\n";
+    unsigned lane = 0;
+    for (pyc::RegOp r : seqBanked[bankId]) {
+      // Named per-lane commit-changed alias keeps the comb-dirty smoke
+      // assertions meaningful under the banked lowering (same pattern as
+      // the packed and per-reg paths); the condition is unchanged.
+      std::string changed =
+          "_pyc_commit_changed_" + nt.get(r.getQ()) + "_inst";
+      os << "    const bool " << changed << " = ((_pyc_bank_dirty_" << bankId
+         << "[" << (lane >> 6) << "u] >> " << (lane & 63) << "u) & 1u);\n";
+      os << "    if (" << changed << ") {\n";
+      emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt, "      ");
+      os << "    }\n";
+      ++lane;
+    }
+    (void)w;
+  }
   for (auto r : regs) {
     std::string key = nt.get(r.getQ()) + "_inst";
     std::string changed = "_pyc_commit_changed_" + key;
@@ -4017,6 +4632,8 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   os << "#include <type_traits>\n";
   os << "#include <utility>\n";
   os << "#include <cpp/pyc_sim.hpp>\n";
+  os << "#include <cpp/pyc_seq_bank.hpp>\n";
+  os << "#include <cpp/pyc_seq_bank_ext.hpp>\n";
   os << "#include <cpp/pyc_change_scheduler.hpp>\n\n";
   os << "namespace pyc::gen {\n\n";
 

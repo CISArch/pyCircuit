@@ -204,11 +204,30 @@ static llvm::cl::opt<bool> unrollVector(
     llvm::cl::desc("Unroll vector operations to scalars at IR level before optimization passes"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> seqBank(
+    "seq-bank",
+    llvm::cl::desc(
+        "Lower same-clock registers into per-clock SeqBank update loops "
+        "(use --no-seq-bank for the per-reg lowering)"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<bool> packedBank(
+    "packed-bank",
+    llvm::cl::desc("Lower SeqBank groups into contiguous PackedRegBank storage "
+                   "(opt-in: DavinciTop measured SeqBank 3036.5 vs packed "
+                   "2645.6 cyc/s)"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<bool> noSeqBank(
+    "no-seq-bank",
+    llvm::cl::desc("Disable SeqBank lowering; expand per-reg tick code"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<unsigned> statePackWidth(
     "state-pack-width",
     llvm::cl::desc(
         "Maximum packed state-lane width in structural mode (0 disables Stage 2)"),
-    llvm::cl::init(192));
+    llvm::cl::init(1024));
 
 static llvm::cl::opt<bool> noInline(
     "noinline",
@@ -2632,6 +2651,10 @@ int main(int argc, char **argv) {
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+  // SeqBank partition runs after all state rewrites so banks cover the final
+  // reg set; the C++ emitter reads the ids. fuse-comb does not move state.
+  if (emitKind == "cpp" && seqBank && !noSeqBank)
+    pm.addNestedPass<func::FuncOp>(pyc::createSeqBankPartitionPass());
   // Demand mode drops undemanded pyc.name after identities were remapped,
   // before fuse-comb treats leftover names as barriers.
   if (emitKind == "cpp" && llvm::StringRef(observeNamed) == "demand")
@@ -2900,6 +2923,10 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
+      // The --packed-bank cl::opt must reach the hierarchical (split-module)
+      // emission too; without this the flag silently defaulted to the header
+      // value and DavinciTop never lowered through PackedRegBank.
+      cppEmitOpts.packedBank = packedBank;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -2939,6 +2966,7 @@ int main(int argc, char **argv) {
         os << "#include <string>\n";
         os << "#include <type_traits>\n";
         os << "#include <cpp/pyc_sim.hpp>\n";
+        os << "#include <cpp/pyc_seq_bank.hpp>\n#include <cpp/pyc_seq_bank_ext.hpp>\n";
         os << "#include <cpp/pyc_change_scheduler.hpp>\n";
       };
 
@@ -3167,6 +3195,7 @@ int main(int argc, char **argv) {
           hos << "#include <memory>\n";
           hos << "#include <type_traits>\n";
           hos << "#include <cpp/pyc_sim.hpp>\n";
+          hos << "#include <cpp/pyc_seq_bank.hpp>\n#include <cpp/pyc_seq_bank_ext.hpp>\n";
           hos << "#include <cpp/pyc_change_scheduler.hpp>\n";
           for (const std::string &dep : deps[f.getSymName()])
             hos << "#include \"" << dep << ".hpp\"\n";

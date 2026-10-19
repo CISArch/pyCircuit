@@ -54,6 +54,7 @@ static void forceLinkPycPasses() {
   (void)pyc::createPackStateLanesPass();
   (void)pyc::createStateOptimizePass();
   (void)pyc::createPackI1RegsPass();
+  (void)pyc::createSeqBankPartitionPass();
   (void)pyc::createApplyObservationDemandPass();
   (void)pyc::createLowerSCFToPYCStaticPass();
   (void)pyc::createCheckFlatTypesPass();

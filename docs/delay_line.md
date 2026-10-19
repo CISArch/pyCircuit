@@ -51,7 +51,7 @@ b@4 ─────────────────────────�
 仍可调的预算是：
 
 ```text
---state-pack-width=192
+--state-pack-width=1024
 ```
 
 retiming 不设组合规模预算：组合锥按合法性（纯白名单、无反馈、无锥外 fanout）整体
@@ -179,8 +179,9 @@ IR；要观察内部阶段，需用 `pyc-opt` 单独运行对应 pass（见第 1
 `pycc` 在 C++ 路径上的状态优化开关（Verilog / `--emit=none` 不跑这组 pass）：
 
 ```text
---state-pack-width=192
-    Stage 2 单个 packed storage 的默认最大宽度
+--state-pack-width=1024
+    Stage 2 单个 packed storage 的默认最大宽度；组宽超过会跨更多
+    64bit 字并拉长 emitted concat 的变参模板链
 
 --state-pack-width=0
     禁用 Stage 2；state-opt 之后运行的 pyc-pack-i1-regs 仍会执行
@@ -192,7 +193,7 @@ IR；要观察内部阶段，需用 `pyc-opt` 单独运行对应 pass（见第 1
 {
   "state_opt_policy": "structural",
   "state_retime_policy": "pipeline",
-  "state_opt_pack_width": 192
+  "state_opt_pack_width": 0
 }
 ```
 
@@ -477,10 +478,10 @@ Packing：
 直接成为模块输出的 packed slice 仍被 probe manifest 分类为 state。有运行时读取需求
 的具名逻辑 state 可通过 slice alias 和 `addRegSlice` 保持逻辑 probe 映射。
 
-### 9.4 为什么默认宽度是 192
+### 9.4 打包宽度的选择（默认 1024）
 
 更宽的 storage 会减少 primitive 数，但超宽 `Bits<W>` 的 concat/extract、copy 和
-更新成本也会上升。默认值不是“越宽越好”，而是由 C++ 微基准选择。
+更新成本也会上升。该结论来自 C++ 微基准，且明显依赖 workload：
 
 128 个独立 8-bit state、500,000 cycles、每种宽度 3 次取中位数：
 
@@ -491,8 +492,13 @@ Packing：
 | 192 | 4,362.49 | 6 | 40,979 |
 | 256 | 6,051.11 | 4 | 38,052 |
 
-192-bit 相对不打包快 32.8%，相对 128-bit 快 10.8%。256-bit 虽然 primitive 更少，
-但超宽运算成本抵消了调度收益，因此默认选择 192。
+在该微基准上 192-bit 相对不打包快 32.8%，相对 128-bit 快 10.8%。DavinciTop
+34 trace 的成对实测显示打包是大幅净收益（封顶 192 的 2560.5 cyc/s 对比禁用
+打包 1310.0，禁用 **-48.8%**）；但完全不设上限会把上千个窄 lane 拼进一根
+超宽状态，emitted concat 的 `SumWidth` 递归模板超过 clang 1024 层上限，
+host 编译直接失败（2026-10-15 实测，全 34 trace 编译失败）。**当前默认
+`--state-pack-width=1024`**：保留封顶作为 host 编译器安全护栏，同时允许比
+192 更宽的组；上限族谱正整数可调（128/192/256/...）。
 
 `pycc` 在 state-opt 之后、`pyc-comb-canonicalize` 和 clock-domain gate 之后，对所有
 emit 路径运行旧 `pyc-pack-i1-regs`，收集通用 dependency-aware packer 留下的 i1
@@ -864,9 +870,9 @@ delay-line（见 11.2），因此这条优化只存在于 C++ 路径。尚未实
 
 ### 17.3 没有基于综合反馈的目标相关 pack cost model
 
-192 是当前 C++ workload 上的默认折中，不代表所有 host、数据宽度和 RTL 目标都最优。
-后续可根据 backend、lane width 分布和真实 benchmark 选择不同上限，但不能只以
-primitive 数最少为目标。
+192 是微基准测得的 C++ workload 折中（Stage 2 默认关闭，见 9.4），不代表所有
+host、数据宽度和 RTL 目标都最优。后续可根据 backend、lane width 分布和真实
+benchmark 选择不同上限，但不能只以 primitive 数最少为目标。
 
 ### 17.4 X-state 和综合资源仍需独立评估
 
