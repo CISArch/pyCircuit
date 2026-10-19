@@ -79,6 +79,7 @@ add_library(pyc_transforms
   lib/Transforms/CheckClockDomainsPass.cpp
   lib/Transforms/ChangeDrivenSchedulePass.cpp
   lib/Transforms/CombCanonicalizePass.cpp
+  lib/Transforms/CombineDelayChainsPass.cpp
   lib/Transforms/CollectCompileStatsPass.cpp
   lib/Transforms/EliminateDeadInstancesPass.cpp
   lib/Transforms/EliminateDeadStatePass.cpp
@@ -91,6 +92,8 @@ add_library(pyc_transforms
   lib/Transforms/LowerSCFToPYCStaticPass.cpp
   lib/Transforms/PrunePortsPass.cpp
   lib/Transforms/SLPPackWiresPass.cpp
+  lib/Transforms/StateOptimization.cpp
+  lib/Transforms/StateOptimizePass.cpp
   lib/Support/PassIRDumper.cpp
   lib/Transforms/VectorUnrollPass.cpp
 )

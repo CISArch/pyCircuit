@@ -2359,6 +2359,10 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
+  // State rewrites (delay-line formation) run on the C++ emit path only so
+  // Verilog keeps the pre-optimization register netlist.
+  if (emitKind == "cpp")
+    pm.addNestedPass<func::FuncOp>(pyc::createStateOptimizePass());
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
