@@ -157,3 +157,35 @@ pyCircuit 把电路编译成 C++ 仿真模型（`pycc --emit=cpp`）。项目目
 1. **性能退化的处理 = 先分析并优化银行轮询，再判定。** 若「关 pack + bank」实测低于对照基线 3145.3 的 −3%，先分析原因并在本分支优化银行轮询（可能修改 `runtime/cpp/pyc_seq_bank_ext.hpp`、`CppEmitter.cpp`，如按脏位图跳过整字空闲 lane），重测；优化后仍低于 −3% 则退回「默认不改、仅提供显式旗标 + 实测报告」。后果：范围可能扩大到银行运行时与发射器；默认值只在达标后才改。
 2. **`PackI1RegsPass` 全局默认关闭（含 Verilog）。** 新增 `--pack-i1-regs` 旗标，默认 off，对 cpp 与 verilog 一致生效。后果：Verilog 网表会变化，需要 Verilator 对拍、面积综合与相关测试快照一起验证；这是此次决策带来的额外验证成本。
 3. **新目录 `pyCircuit-no-pack-bank/`，分支 `ldz/feat/no-pack-bank`，基于 `zxy/feat/cycle-combine@e4c5e82f`。** 后果：与已测对照基线（3145.3 / 0.717）同源，A/B 干净；若有收益可直接提 PR 给 cycle-combine。
+
+## 实施与实测记录（2026-10-19）
+
+分支 `ldz/feat/no-pack-bank`（基于 `zxy/feat/cycle-combine@e4c5e82f`），已推送远端。提交：
+
+| 提交 | 内容 |
+|---|---|
+| `cca01133` | 本规划文档 |
+| `4bd4f556` | `--state-pack-width` 默认 1024→0（步骤 1） |
+| `2df2beb1` | `--pack-i1-regs` 旗标，默认关，cpp 与 verilog 一致（步骤 2，含测试与文档） |
+
+本地验证：`make tools && make install && make smoke`（examples + sims）通过；`state_delay_optimization_smoke.sh`（含新增的默认不打包 / i1 打包旗标门）、`delay_line_diagnostics_smoke.sh`、`comb_dirty_scheduler_smoke.sh` 全部 PASS。
+
+auto_perf（DavinciTop 34 trace，每个配置 3 次，宿主空闲，全部 34/34 `pass` 且 `common_metrics_match` 全真）：
+
+| 配置 | 提交 | 3 次 gm cycles/s | 中位数 | 相对基线 3145.3 |
+|---|---|---|---|---|
+| 基线：pack 1024 + i1 pack + SeqBank | `e4c5e82f` | 3145.3（该家族另测 3211.9、3241.3） | 3145.3 | — |
+| pack① 关、i1 pack 开 + bank | `4bd4f556` | 1916.3 / 1996.5 / 1975.8 | 1975.8 | **−37.2%**（34/34 全慢） |
+| pack①、i1 pack 全关 + bank | `2df2beb1` | 2977.8 / 2948.9 / 3035.3 | 2977.8 | **−5.3%**（每次快 5/4/12、慢 29/30/22 条） |
+
+结论（对照验收标准）：
+
+- A1 通过：两个配置均 34/34 MATCH。
+- A2 **未通过**：最终配置（`2df2beb1`）中位数 −5.3%，落在 −3% 噪声带之外（基线家族自身波动约 ±3%）。
+- 新发现：只关 pack①、保留 i1 pack 时（`4bd4f556`）最差（−37%）。保留 i1 pack 时它会把更多相邻 i1 寄存器拼成宽寄存器，再叠加 bank，慢得多；i1 pack 一并关闭后立刻恢复到 −5%。因此「去掉所有 reg pack」必须两处同时关，单关 pack① 是更差的中间态。
+- 按待确认 1 的决策：先分析并优化银行轮询，再重测；优化后仍低于 −3% 则不改默认。**银行轮询优化尚未做**（需要在新配置下对生成的 DavinciTop C++ 做采样剖析，确认剩余 5% 的来源，见下）。
+
+## 剩余差距的初步判断（待剖析验证，未经实测）
+
+- `SeqBank::compute_rise()` 与 `commit()` 对**所有 lane** 每个周期各遍历一次（采样时读 `rst/en/d` 三个指针目标，提交时检查 `pending_`），`lane` 的 `q/d/rst/en` 都是指向模型结构体里分散位置的指针；不打包后 lane 数更多，遍历与指针追逐的成本随 lane 数线性上升，与寄存器是否变化无关。
+- 候选优化方向（均需剖析确认后再选）：① 对静止 lane（`en==0 && rst==0`）不读 `d`、不写 `qNext_`；② 按脏位图按字跳过整字空闲 lane；③ 让 lane 的 `d/en/rst/q` 在银行内连续存放以减少指针追逐。
