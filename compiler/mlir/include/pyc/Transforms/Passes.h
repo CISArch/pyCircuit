@@ -16,8 +16,6 @@ std::unique_ptr<::mlir::Pass> createRetimePipelinesPass();
 std::unique_ptr<::mlir::Pass>
 createCombineDelayChainsPass(bool accumulateStats = false,
                              bool cascadeRound = false);
-std::unique_ptr<::mlir::Pass>
-createPackStateLanesPass(unsigned maxWidth = 192);
 /// Phase runners shared with the unified StateOptimizePass. Defined next to
 /// the passes whose cores they drive.
 void runDelayChainMergeRound(::mlir::func::FuncOp function, bool cascadeRound,
@@ -25,18 +23,12 @@ void runDelayChainMergeRound(::mlir::func::FuncOp function, bool cascadeRound,
 void runDelayChainFormAndShare(::mlir::func::FuncOp function,
                                bool accumulateStats);
 void runRetimePipelines(::mlir::func::FuncOp function);
-void runPackStateLanes(::mlir::func::FuncOp function, unsigned maxWidth);
 void runEliminateDeadState(::mlir::func::FuncOp function);
 /// Unified C++-only structural state optimization pipeline. Replaces the
 /// explicit merge -> canonicalize/CSE -> cascade-merge -> retime ->
-/// dead-state -> form/share-chains -> pack sequence in pycc with one
+/// dead-state -> form/share-chains sequence in pycc with one
 /// func-level pass that runs the same phases in order.
-struct StateOptimizeTunables {
-  unsigned packMaxWidth = 1024; // 0 disables packing
-};
-std::unique_ptr<::mlir::Pass>
-createStateOptimizePass(const StateOptimizeTunables &tunables = {});
-std::unique_ptr<::mlir::Pass> createPackI1RegsPass();
+std::unique_ptr<::mlir::Pass> createStateOptimizePass();
 /// After C++ state opt remaps identities, drop pyc.name values that are not
 /// in the runtime observation demand set (@probe source, trace fields, or
 /// debug_keep/observable/probe*/trace*).

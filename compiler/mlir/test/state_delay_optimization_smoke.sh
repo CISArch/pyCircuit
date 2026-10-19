@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Gate for structural state optimization, delay taps, packing, and retiming.
+# Gate for structural state optimization, delay taps, and retiming.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -7,8 +7,7 @@ PYC_OPT="${PYC_OPT:-${ROOT}/.pycircuit_out/toolchain/build/bin/pyc-opt}"
 PYCC="${PYCC:-${ROOT}/.pycircuit_out/toolchain/build/bin/pycc}"
 INPUT="${ROOT}/compiler/mlir/test/state_delay_optimization.mlir"
 DEFAULT_INPUT="${ROOT}/compiler/mlir/test/state_delay_default_structural.mlir"
-STAGE15_STAGE2_INPUT="${ROOT}/compiler/mlir/test/state_optimization_stage15_stage2.mlir"
-PACK_PROBE_INPUT="${ROOT}/compiler/mlir/test/state_pack_probe.mlir"
+STAGE15_INPUT="${ROOT}/compiler/mlir/test/state_optimization_stage15.mlir"
 OBSERVABILITY_INPUT="${ROOT}/compiler/mlir/test/state_observability_performance.mlir"
 RETIME_INPUT="${ROOT}/compiler/mlir/test/state_retime_pipeline.mlir"
 
@@ -50,7 +49,7 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
   --input-file="${TMP_DIR}/aggressive.mlir"
 
 # The unified pycc pipeline pass: one invocation must produce the same
-# delay-line folding as the staged combine/retime/pack sequence.
+# delay-line folding as the staged combine/retime sequence.
 "${PYC_OPT}" "${INPUT}" \
   --pass-pipeline='builtin.module(func.func(pyc-state-optimize))' \
   -o "${TMP_DIR}/unified.mlir"
@@ -65,25 +64,13 @@ fi
 "${FILECHECK_BIN}" "${OBSERVABILITY_INPUT}" --check-prefix=KEEP \
   --input-file="${TMP_DIR}/kept-observability.mlir"
 
-"${PYC_OPT}" "${STAGE15_STAGE2_INPUT}" \
+"${PYC_OPT}" "${STAGE15_INPUT}" \
   --pass-pipeline='builtin.module(func.func(pyc-combine-delay-chains),cse,func.func(pyc-combine-delay-chains{accumulate-stats=true cascade-round=true}))' \
   -o "${TMP_DIR}/cascade.mlir"
-"${FILECHECK_BIN}" "${STAGE15_STAGE2_INPUT}" --check-prefix=CASCADE \
+"${FILECHECK_BIN}" "${STAGE15_INPUT}" --check-prefix=CASCADE \
   --input-file="${TMP_DIR}/cascade.mlir"
 
-"${PYC_OPT}" "${STAGE15_STAGE2_INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-pack-state-lanes{max-width=256}))' \
-  -o "${TMP_DIR}/packed.mlir"
-"${FILECHECK_BIN}" "${STAGE15_STAGE2_INPUT}" --check-prefix=PACK \
-  --input-file="${TMP_DIR}/packed.mlir"
-
-"${PYC_OPT}" "${STAGE15_STAGE2_INPUT}" \
-  --pass-pipeline='builtin.module(func.func(pyc-pack-state-lanes{max-width=12}))' \
-  -o "${TMP_DIR}/packed-cap12.mlir"
-"${FILECHECK_BIN}" "${STAGE15_STAGE2_INPUT}" --check-prefix=CAP \
-  --input-file="${TMP_DIR}/packed-cap12.mlir"
-
-"${PYCC}" "${DEFAULT_INPUT}" --emit=cpp --state-pack-width=192 \
+"${PYCC}" "${DEFAULT_INPUT}" --emit=cpp \
   -o "${TMP_DIR}/default.hpp" 2>"${TMP_DIR}/default.stderr"
 # Verilog keeps the pre-optimization netlist; use its stats as the plain arm.
 "${PYCC}" "${DEFAULT_INPUT}" --emit=verilog --include-primitives=false \
@@ -129,54 +116,9 @@ if ! "${TMP_DIR}/observation-demand-comb-runtime"; then
   exit 1
 fi
 
-"${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp --state-pack-width=192 \
-  --observe-named=demand \
-  -o "${TMP_DIR}/packed-probes-demand.hpp" 2>"${TMP_DIR}/packed-probes-demand.stderr"
-if grep -qE 'lane0_state[[:space:]]*=|lane1_state[[:space:]]*=' \
-  "${TMP_DIR}/packed-probes-demand.hpp"; then
-  echo "fail: demand mode still assigned undemanded packed lane names" >&2
-  exit 1
-fi
-if ! grep -q 'addRegLazySlice<8, 16>' "${TMP_DIR}/packed-probes-demand.hpp"; then
-  echo "fail: demand mode missing lazy packed lane lookups" >&2
-  exit 1
-fi
-if ! grep -q 'lane0_state' "${TMP_DIR}/packed-probes-demand.hpp" ||
-   ! grep -q 'lane1_state' "${TMP_DIR}/packed-probes-demand.hpp"; then
-  echo "fail: demand mode dropped packed lane lookup names" >&2
-  exit 1
-fi
-if [[ $(grep -c 'addRegSlice<8, 16>' "${TMP_DIR}/packed-probes-demand.hpp") -ge 4 ]]; then
-  echo "fail: demand mode still registered undemanded packed lane slices" >&2
-  exit 1
-fi
-"${CXX:-c++}" -std=c++17 -O2 -I"${ROOT}/runtime" \
-  -DMODEL_HEADER="\"${TMP_DIR}/packed-probes-demand.hpp\"" \
-  "${ROOT}/compiler/mlir/test/state_pack_probe_demand_runtime.cpp" \
-  -o "${TMP_DIR}/state-pack-probe-demand-runtime"
-if ! "${TMP_DIR}/state-pack-probe-demand-runtime"; then
-  echo "fail: demand lazy findByPath/readU64 did not match packed lane values" >&2
-  exit 1
-fi
-
-"${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp --state-pack-width=192 \
-  --observe-named=all \
-  --probe-manifest="${TMP_DIR}/packed-probes.json" \
-  -o "${TMP_DIR}/packed-probes.hpp" 2>"${TMP_DIR}/packed-probes.stderr"
-if [[ $(grep -c 'addRegSlice<8, 16>' "${TMP_DIR}/packed-probes.hpp") -lt 4 ]]; then
-  echo "fail: packed state outputs or named lanes are missing sliced ProbeRegistry entries" >&2
-  exit 1
-fi
-"${CXX:-c++}" -std=c++17 -O2 -I"${ROOT}/runtime" \
-  -DMODEL_HEADER="\"${TMP_DIR}/packed-probes.hpp\"" \
-  "${ROOT}/compiler/mlir/test/state_pack_probe_runtime.cpp" \
-  -o "${TMP_DIR}/state-pack-probe-runtime"
-"${TMP_DIR}/state-pack-probe-runtime"
-
 python3 - "${TMP_DIR}/default.hpp.stats.json" \
   "${TMP_DIR}/default-plain.v.stats.json" \
-  "${TMP_DIR}/default-probes.json" \
-  "${TMP_DIR}/packed-probes.json" <<'PY'
+  "${TMP_DIR}/default-probes.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -184,7 +126,6 @@ from pathlib import Path
 default = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 default_plain = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 probe_manifest = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
-packed_probe_manifest = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
 keys = ("reg_count", "reg_bits", "state_opt_regs_merged",
         "state_opt_reg_bits_removed")
 default_view = {key: default.get(key) for key in keys}
@@ -204,8 +145,6 @@ if default.get("state_retime_policy") != "pipeline":
     raise AssertionError("default retiming policy is not pipeline")
 if "state_opt_preserve_observability" in default:
     raise AssertionError("removed preserve-observability flag leaked into stats")
-if default.get("state_opt_pack_width") != 192:
-    raise AssertionError("default state pack width is not 192")
 if default.get("observe_named") != "demand":
     raise AssertionError("default C++ observe_named is not demand")
 if default_plain.get("state_opt_policy") != "off":
@@ -223,18 +162,7 @@ output_probes = {
 }
 for name in ("out0", "out1"):
     if output_probes[name].get("kind") != "state":
-        raise AssertionError(f"packed optimization changed {name} probe semantics")
-packed_outputs = {
-    probe["field_path"]: probe
-    for probe in packed_probe_manifest["probes"]
-    if probe.get("dir") == "out"
-}
-aggressive_entries = {
-    probe["field_path"]: probe for probe in packed_probe_manifest["probes"]
-}
-for name in ("out0", "out1", "lane0_state", "lane1_state"):
-    if aggressive_entries[name].get("kind") != "state":
-        raise AssertionError(f"packed lane {name} is not classified as state")
+        raise AssertionError(f"state optimization changed {name} probe semantics")
 PY
 
 python3 "${ROOT}/compiler/mlir/test/check_state_delay_tap_models.py" \

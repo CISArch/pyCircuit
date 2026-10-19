@@ -75,7 +75,7 @@ for verify_case in delay_line_verify delay_tap_verify_invalid \
     --verify-diagnostics -o /dev/null
 done
 
-"${PYCC}" "${INPUT}" --emit=cpp --state-pack-width=192 \
+"${PYCC}" "${INPUT}" --emit=cpp \
   --profile-json="${PROFILE_JSON}" -o "${MODEL}" 2>"${STDERR_LOG}"
 
 python3 - "${MODEL}.stats.json" "${STDERR_LOG}" "${PROFILE_JSON}" <<'PY'
@@ -123,7 +123,7 @@ for key, value in expected.items():
 stderr = stderr_path.read_text(encoding="utf-8")
 needle = (
     "stats: state_policy=structural, retime=pipeline, "
-    "pack_width=192, regs=2 (16 bits), "
+    "regs=2 (16 bits), "
     "delay_lines=1 (depth_total=2), merged=2, bits_removed=16, delay_chains=1"
 )
 if needle not in stderr:
