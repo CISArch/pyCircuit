@@ -51,7 +51,7 @@ b@4 ─────────────────────────�
 仍可调的预算是：
 
 ```text
---state-pack-width=1024
+--state-pack-width=0      # 默认：不打包；显式传正整数（如 1024）才重新开启
 ```
 
 retiming 不设组合规模预算：组合锥按合法性（纯白名单、无反馈、无锥外 fanout）整体
@@ -179,8 +179,8 @@ IR；要观察内部阶段，需用 `pyc-opt` 单独运行对应 pass（见第 1
 `pycc` 在 C++ 路径上的状态优化开关（Verilog / `--emit=none` 不跑这组 pass）：
 
 ```text
---state-pack-width=1024
-    Stage 2 单个 packed storage 的默认最大宽度；组宽超过会跨更多
+--state-pack-width=0
+    默认值：Stage 2 打包关闭。正整数 N 表示单个 packed storage 的最大宽度（如 1024）；组宽超过会跨更多
     64bit 字并拉长 emitted concat 的变参模板链
 
 --state-pack-width=0
@@ -478,7 +478,7 @@ Packing：
 直接成为模块输出的 packed slice 仍被 probe manifest 分类为 state。有运行时读取需求
 的具名逻辑 state 可通过 slice alias 和 `addRegSlice` 保持逻辑 probe 映射。
 
-### 9.4 打包宽度的选择（默认 1024）
+### 9.4 打包宽度的选择（默认 0 = 关闭；显式开启建议 1024）
 
 更宽的 storage 会减少 primitive 数，但超宽 `Bits<W>` 的 concat/extract、copy 和
 更新成本也会上升。该结论来自 C++ 微基准，且明显依赖 workload：
@@ -496,9 +496,16 @@ Packing：
 34 trace 的成对实测显示打包是大幅净收益（封顶 192 的 2560.5 cyc/s 对比禁用
 打包 1310.0，禁用 **-48.8%**）；但完全不设上限会把上千个窄 lane 拼进一根
 超宽状态，emitted concat 的 `SumWidth` 递归模板超过 clang 1024 层上限，
-host 编译直接失败（2026-10-15 实测，全 34 trace 编译失败）。**当前默认
-`--state-pack-width=1024`**：保留封顶作为 host 编译器安全护栏，同时允许比
-192 更宽的组；上限族谱正整数可调（128/192/256/...）。
+host 编译直接失败（2026-10-15 实测，全 34 trace 编译失败）。显式开启时建议
+`--state-pack-width=1024`：保留封顶作为 host 编译器安全护栏，同时允许比 192 更宽
+的组；上限为正整数可调（128/192/256/...）。
+
+**默认值变更（`ldz/feat/no-pack-bank`）**：上述「禁用 -48.8%」是在 C++ 后端尚无
+SeqBank/DelayBank/VecBank 银行化时测得，对象数量爆炸是主因。银行化之后，同时钟域
+寄存器进同一循环并保持 per-lane 脏位图唤醒；而 IR 级打包把多个 lane 拼成一个宽寄存器，
+任一小 lane 变化都会唤醒全部 extract 下游，丢失 change-driven 跳过能力。因此默认
+改为 0（不打包），由银行轮询提供对象数收益。该默认的性能依据见
+`docs/no_reg_pack_bank_plan.md` 的实测记录；需要旧行为时显式传 `--state-pack-width=1024`。
 
 `pycc` 在 state-opt 之后、`pyc-comb-canonicalize` 和 clock-domain gate 之后，对所有
 emit 路径运行旧 `pyc-pack-i1-regs`，收集通用 dependency-aware packer 留下的 i1

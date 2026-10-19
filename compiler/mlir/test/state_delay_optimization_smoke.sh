@@ -129,6 +129,16 @@ if ! "${TMP_DIR}/observation-demand-comb-runtime"; then
   exit 1
 fi
 
+# Default configuration must not pack state lanes: packing merges lanes into
+# one wide reg and loses per-lane change-driven wake (SeqBank keeps it).
+# Packing stays reachable via an explicit --state-pack-width below.
+"${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp --observe-named=all \
+  -o "${TMP_DIR}/default-no-pack.hpp" 2>"${TMP_DIR}/default-no-pack.stderr"
+if grep -q 'addRegSlice<8, 16>' "${TMP_DIR}/default-no-pack.hpp"; then
+  echo "fail: default pycc configuration packed state lanes (expected --state-pack-width=0)" >&2
+  exit 1
+fi
+
 "${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp --state-pack-width=192 \
   --observe-named=demand \
   -o "${TMP_DIR}/packed-probes-demand.hpp" 2>"${TMP_DIR}/packed-probes-demand.stderr"
