@@ -39,11 +39,17 @@ struct StateOptimizePass
     : public PassWrapper<StateOptimizePass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(StateOptimizePass)
 
+  StateOptimizePass() = default;
+  StateOptimizePass(const StateOptimizePass &other)
+      : PassWrapper(other), tunables(other.tunables) {}
+  explicit StateOptimizePass(const StateOptimizeTunables &tunables)
+      : tunables(tunables) {}
+
   StringRef getArgument() const override { return "pyc-state-optimize"; }
   StringRef getDescription() const override {
     return "Unified structural state optimization: dead-state cleanup, "
-           "retime, then delay-line chain formation with observation "
-           "identities preserved";
+           "retime, delay-line chain formation, then lane packing with "
+           "observation identities preserved";
   }
 
   void runOnOperation() override {
@@ -62,13 +68,18 @@ struct StateOptimizePass
     // Form ordinary direct chains only after retiming selected the more
     // general computed pipelines; also share equivalent histories here.
     runDelayChainFormAndShare(function);
+    // Packing works on the final state set.
+    runPackStateLanes(function, tunables.packMaxWidth);
   }
+
+  StateOptimizeTunables tunables;
 };
 
 } // namespace
 
-std::unique_ptr<::mlir::Pass> createStateOptimizePass() {
-  return std::make_unique<StateOptimizePass>();
+std::unique_ptr<::mlir::Pass>
+createStateOptimizePass(const StateOptimizeTunables &tunables) {
+  return std::make_unique<StateOptimizePass>(tunables);
 }
 
 static PassRegistration<StateOptimizePass> pass;
