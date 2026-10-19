@@ -3,15 +3,16 @@
 本文说明 pyCircuit 周期状态优化的设计、实现和正确性边界。当前实现覆盖：
 
 - 一等 MLIR 状态操作 `pyc.delay_line`；
-- Stage 1 等价状态合并、结构化寄存器链识别和重复 delay-line 共享；
-- Stage 1.5 有界的 canonicalize/CSE 与第二轮状态细化；
-- Stage 2 通用整数 state-lane packing；
-- Stage 3 共享 history 的中间 `pyc.delay_tap`；
+- 两轮有界等价状态合并，以及 merge 轮之间/retiming 之后的 pass 内 canonicalize+CSE；
+- 结构化寄存器链识别、只读中间 `pyc.delay_tap` 和重复 delay-line 共享；
+- 通用整数 state-lane packing；
 - 默认开启的受约束 pipeline retiming 与共同 delay 下沉；
 - 默认性能优先的显式观测身份清理；
 - C++/Verilog lowering、编译统计、probe/trace 适配和仓库内的等价测试。
 
-文档状态：描述 `cycle-combine` 分支当前实现和默认策略。
+文档状态：描述 `zxy/feat/cycle-combine`（PR #8）当前实现和默认策略；默认指
+`--emit=cpp` 的 structural 路径。正文沿用 Stage 1/1.5/2 的历史命名，但实现上
+`pyc-state-optimize` 是一个统一的 func-level pass。
 
 ## 1. 问题、目标与当前结论
 
@@ -43,8 +44,9 @@ b@4 ─────────────────────────�
 - 优化完成后，`--observe-named=demand`（默认）按 `@probe` / trace / IR 观测属性只把声明过的名字做成急切探针；其余作者名保留为按名懒查找（状态切片或已有组合成员上的 `addWire`），C++ 热路径不再为它们每拍抄第二根命名 Wire；
 - 端口行为、周期数、reset/enable/init 和功能数据流仍必须等价。
 
-只有 `--emit=cpp`（或 `-cpp`）跑完整状态优化（structural 合并 + pipeline retiming）。
-`--emit=verilog` 与 `--emit=none` 保持优化前的寄存器网表；Verilog 后端不认识
+只有 `--emit=cpp`（或 `-cpp <path>`）跑完整状态优化（structural 合并 + pipeline retiming）。
+`--emit=verilog` 与 `--emit=none` 不跑 state-opt，保持 state-opt 前的寄存器网表
+（仍会运行 `pyc-pack-i1-regs` 等通用 pass）；Verilog 后端不认识
 `pyc.delay_line`/`pyc.delay_tap`，若 IR 中出现会明确报错（delay lines 为 C++ 专属）。
 仍可调的预算是：
 
@@ -107,7 +109,8 @@ logical state bits     = N × W
 ```
 
 单链合并减少的是状态对象、IR、生成文本和 C++ 调度。只有等价状态合并、dead-state
-删除或重复历史共享才会减少 logical state bits。
+删除、重复历史共享，以及通过 state-bit 非增 guard 的 retiming/共同下沉，才会减少
+logical state bits。
 
 ## 3. 设计原则
 
@@ -141,10 +144,11 @@ delay-line 能大幅减少每周期调度，但 Verilog 仍要保留真实 N 级
 
 ### 3.4 有界优化优先于无界 fixed point
 
-Stage 1.5 固定运行一次 canonicalize+CSE 和第二轮状态优化。这样能捕获主要级联收益，
-同时保证编译时间、统计口径和 IR 结果可预测，不引入数据相关的无界迭代。
+有界性由固定顺序保证：merge 轮之间固定运行一次 pass 内 canonicalize+CSE 和第二轮
+merge；retiming 之后再运行一次 canonicalize+CSE，让融合后的子表达式在后续成链/
+共享/packing 前归一。merge 固定两轮，不运行数据相关的 fixed point。
 
-## 4. 默认流水线和预算开关
+## 4. 默认流水线和开关
 
 状态优化在 wire/dead-state 清理之后、clock/comb/logic-depth legality gates 之前运行：
 
@@ -153,16 +157,24 @@ eliminate-wires
 eliminate-dead-state
         │
         ▼
-pyc-state-optimize（单个 pass，内部按以下阶段顺序执行）
-  ├─ Stage 1/1.5: two bounded equivalent-state merge rounds with canonicalize/CSE
-  ├─ Retiming: computed pipeline history / common delay sinking
-  ├─ dead-state cleanup
-  ├─ Stage 1: form direct delay lines / taps / share delay lines
-  └─ Stage 2: pack compatible reg/delay-line lanes
+pyc-state-optimize（单个 func-level pass，内部按以下顺序执行）
+  1. merge equivalent states（第 1 轮）
+  2. canonicalize + CSE（pass 内）
+  3. merge equivalent states（第 2 轮 / cascade）
+  4. retiming：computed pipeline history / common delay sinking
+  5. canonicalize + CSE（pass 内，retiming 之后）
+  6. eliminate-dead-state
+  7. form direct delay lines / taps / share equivalent delay lines
+  8. pack compatible reg/delay-line lanes
         │
         ▼
-comb/clock/logic-depth gates → stats → C++ or Verilog emitter
+SLP pack wires → comb canonicalize → clock gate → pack i1 regs
+  → (C++ demand) apply observation demand → fuse comb → ...
+  → comb-cycle / logic-depth gates → stats → C++ or Verilog emitter
 ```
+
+`pyc-state-optimize` 是单个 pass，因此 `pycc --dump-pass-ir` 只能看到它执行前后的
+IR；要观察内部阶段，需用 `pyc-opt` 单独运行对应 pass（见第 14 节）。
 
 `pycc` 在 C++ 路径上的状态优化开关（Verilog / `--emit=none` 不跑这组 pass）：
 
@@ -171,8 +183,7 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
     Stage 2 单个 packed storage 的默认最大宽度
 
 --state-pack-width=0
-    禁用 Stage 2，便于隔离 Stage 1/1.5 收益
-
+    禁用 Stage 2；state-opt 之后运行的 pyc-pack-i1-regs 仍会执行
 ```
 
 编译统计 JSON 会记录：
@@ -189,9 +200,12 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 
 ## 5. 观测边界
 
-改写 pass 使用
-[`StateObservabilityAnalysis`](../compiler/mlir/lib/Transforms/StateOptimization.cpp)
-识别以下物理状态身份：
+改写 pass 共享
+[`StateOptimization.cpp`](../compiler/mlir/lib/Transforms/StateOptimization.cpp) /
+[`StateOptimization.h`](../compiler/mlir/include/pyc/Transforms/StateOptimization.h)
+中的 observation helper（`hasExternalObservationIdentity`、
+`stateHasExternalObservation`、`copyExternalObservationAttrs`、
+`materializeObservationAlias` 等）识别以下物理状态身份：
 
 - `pyc.debug_keep`；
 - `pyc.observable`；
@@ -203,8 +217,8 @@ comb/clock/logic-depth gates → stats → C++ or Verilog emitter
 
 ## 6. 观测身份重映射
 
-`pyc-strip-state-observability` 和 `--state-opt-preserve-observability` 已删除。
-C++ 路径始终优化，并把外部可读身份改挂到只读视图：
+`pyc-strip-state-observability`、`--state-opt-preserve-observability` 和 test-only 的
+`--no-state-opt` 已删除。C++ 路径始终优化，并把外部可读身份改挂到只读视图：
 
 1. 等价合并：victim 上的身份挂到 survivor `q` 的 `pyc.alias`；
 2. 收链：中间级挂到对应深度的 `pyc.delay_tap`，末端挂到 `delay_line.q`；
@@ -225,7 +239,7 @@ Stage 1 由
 [`CombineDelayChainsPass.cpp`](../compiler/mlir/lib/Transforms/CombineDelayChainsPass.cpp)
 和
 [`StateOptimization.cpp`](../compiler/mlir/lib/Transforms/StateOptimization.cpp)
-实现，依次执行三个子步骤。
+实现，包含以下四类改写。
 
 ### 7.1 等价状态合并
 
@@ -263,8 +277,8 @@ pyc.optimized_by = "merge_equivalent_state"
 1. 中间只经过透明 `pyc.alias`；
 2. predecessor 和 tail 的 q 类型一致；
 3. clock、reset、enable、init 语义等价；
-4. predecessor q 及路径上的 alias 至少有当前链这一条 state-to-state 使用；structural
-   性能模式允许其它只读 consumer，后续会改写为固定深度 tap；
+4. predecessor q 及路径上的 alias 至少有当前链这一条 state-to-state 使用；当前
+   structural 路径允许其它只读 consumer，后续会改写为固定深度 tap；
 5. 链长度至少为 2；
 6. predecessor 路径只能由 `pyc.reg` 和透明 `pyc.alias` 构成，因此不会穿过
    module/instance、memory、FIFO 或 CDC 语义边界。
@@ -283,8 +297,8 @@ replacement= tail.q → delay_line.q
 
 ### 7.3 中间只读 fanout 与 delay tap
 
-早期实现要求中间 q one-use，因为 `pyc.delay_line` 只暴露末端 q。当前 structural
-性能模式进一步识别只读 fanout：
+早期实现要求中间 q one-use，因为 `pyc.delay_line` 只暴露末端 q。当前实现进一步
+识别只读 fanout：
 
 ```mlir
 %q0 = pyc.reg ... %input ... : i8
@@ -312,7 +326,7 @@ return %side, %q2
 history array 读取 tap；Verilog 后端不支持 delay-line（见 11.2）。这样
 旁路值和末端值都保持原来的周期关系，状态存储仍只有一份。
 
-默认模式不会忽略真实 state dependency、写回 fanout、组合环或跨 block 边界。
+当前实现不会忽略真实 state dependency、写回 fanout、组合环或跨 block 边界。
 （早期草稿中的"显式保留观测模式"已删除：identity 通过 tap/slice alias 保留，
 不再需要跳过 tap rewrite。）
 
@@ -367,6 +381,8 @@ second equivalent-state merge (merge-only)
         ↓
 retiming
         ↓
+canonicalize + CSE (in-pass, after retiming)
+        ↓
 dead-state cleanup
         ↓
 direct chain form/share/tap
@@ -375,10 +391,11 @@ direct chain form/share/tap
 第二轮可识别下游级联的等价状态；两轮 merge 后再运行 retiming，最后才形成普通直连
 chain、共享 history 和生成 tap。这样既不会让局部 retiming 抢占更有收益的等价状态，
 也不会让短直连链提前抢走 computed-pipeline 的 head。merge 流水线固定两轮，不跑到
-fixed point。
+fixed point。retiming 之后的 canonicalize+CSE 只做去重，让成链/共享/packing 看到
+融合后的语义值。
 统计字段：
 
-- `state_opt_merge_rounds`：实际合并轮数；
+- `state_opt_merge_rounds`：执行的 merge 轮数；当前固定为 2，不表示实际发生合并的次数；
 - `state_opt_cascade_regs_merged`：第二轮新增的等价状态合并数。
 
 Stage 1.5 只共享已经因状态合并而等价的组合锥，不移动组合逻辑穿过寄存器边界。
@@ -473,15 +490,18 @@ Packing：
 192-bit 相对不打包快 32.8%，相对 128-bit 快 10.8%。256-bit 虽然 primitive 更少，
 但超宽运算成本抵消了调度收益，因此默认选择 192。
 
-性能模式还会运行旧 `PackI1RegsPass`，收集通用 dependency-aware packer 留下的
-i1 lane。（早期草稿中的"显式观测保留模式"已删除，见第 6 节。）
+`pycc` 在 state-opt 之后、`pyc-comb-canonicalize` 和 clock-domain gate 之后，对所有
+emit 路径运行旧 `pyc-pack-i1-regs`，收集通用 dependency-aware packer 留下的 i1
+lane。它不是 Stage 2 的一部分，也不受 `--state-pack-width` 控制。
 
 ## 10. 受约束 Retiming：把计算链变成共享历史
 
 Retiming 由 [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimePipelinesPass.cpp)
 实现，由 `pyc-state-optimize`（`pycc` C++ 路径的统一状态优化 pass）作为内部
 阶段调用；也可用 `pyc-opt` 单独跑 `pyc-retime-pipelines`。它不依赖
-`pyc.generated="cycle_balance"`，默认在 C++ 性能路径中开启。
+`pyc.generated="cycle_balance"`，默认在 C++ structural 路径中开启。retiming 没有
+stage 数、组合 op 数或组合深度预算开关：候选按合法性整体接受，最终由
+`--logic-depth` gate 拒绝超深设计。
 
 ### 10.0 收益模型：跨拍融合，不是位宽差
 
@@ -533,7 +553,7 @@ history。中间值被模块输出、assert、组合 consumer，甚至另一寄�
 
 收益有两层：状态侧（例如两个 depth-2 `i8` 历史只用于 equality，
 `2 * 2 * 8 = 32 bit` 变为 `2 * 1 = 2 bit`）和组合侧（f 与生产锥融合，见
-10.0）。默认性能策略要求至少合并两个源状态且新 state bits 不增加——后者
+10.0）。默认 structural 路径要求至少合并两个源状态且新 state bits 不增加——后者
 是护栏而非收益来源，防止单输入窄化干扰后续 packing 却不减少 primitive。
 
 ### 10.3 等价性证明和硬边界
@@ -563,7 +583,9 @@ delay-line 和 tap，并执行 lane packing。先做等价合并，是为了避�
 ### 10.5 实测结果
 
 专项 benchmark 为 32 条、每条 16 stage、stage 间带 `i32 add` 的流水线；30 万周期，
-每组 5 次，默认 32 级组合预算：
+每组 5 次。下表是早期带 32 级组合深度预算、且仍可用 `retime off` 开关时测得的
+数据；该预算和开关都已删除（见第 1 节），当前实现会接受更深但合法的锥，绝对值
+可能不同，表仅作量级和历史对照：
 
 | 策略 | median ns/cycle | logical stages | state bits | delay-line | 相对 retimed |
 |---|---:|---:|---:|---:|---:|
@@ -571,9 +593,9 @@ delay-line 和 tap，并执行 lane packing。先做等价合并，是为了避�
 | 简单 delay-line，retime off | 12,195.9 | 512 | 16,384 | 0 | 4.78x slower |
 | 默认 retiming | 2,550.2 | 481 | 15,392 | 32 | baseline |
 
-默认改写 33 个 region，统计移除 464 个 state primitive 和 992 bit。三组 checksum
-一致。该数据说明这条合成流水线的 C++ 调度收益，不代表任意设计或综合结果都有相同比例。
-没有通过 init、收益或深度证明的候选保持原样。
+该次测量中默认改写 33 个 region，统计移除 464 个 state primitive 和 992 bit。三组
+checksum 一致。该数据说明这条合成流水线的 C++ 调度收益，不代表任意设计或综合结果
+都有相同比例。没有通过 init 或 state-bit 非增 guard 的候选保持原样。
 
 ## 11. 后端表示
 
@@ -598,11 +620,19 @@ unsigned head = 0;
 调度降为 O(1)。reset 必须填充全部历史位置，仍为 O(depth)。scalar/vector 分别使用
 `pyc_delay_line<Width, Depth>` 和 `pyc_vec_delay_line<T, Depth>`。
 
+`tap(depth)` 直接读 ring 的固定槽位；`tap_next(depth)` 给出下一拍视图（pending reset
+返回 `init`，pending edge 时 depth=1 返回采样的输入，否则返回 `tap(depth-1)`）。
+`has_pending()` 表示当前有 enabled/reset edge 等待 commit。C++ emitter 为 delay-line
+维护两个 wake domain：tail `q` 的 fanout 只在 `tick_commit()` 报告 tail 变化时唤醒；
+tap 的 fanout 在 `has_pending()` 为真时唤醒，因为每个 enabled edge 都会移动所有 tap。
+change-driven 调度还使用 `posedge_tick_compute()` / `negedge_update()` 的快速路径。
+
 ### 11.2 Verilog：不支持 delay-line
 
 Verilog 后端保持未优化网表契约，**不实现** delay-line lowering：IR 中出现
 `pyc.delay_line` / `pyc.delay_tap` 时 emitter 以明确诊断拒绝
-（delay lines 为 C++ 专属；Verilog 路径本身保持未优化网表，可作为对照）。
+（delay lines 为 C++ 专属；Verilog 路径本身不运行 state-opt，可作为未优化网表对照）。
+`pycc` 已不再提供 `--no-state-opt` 之类的 C++ 关闭开关。
 
 ### 11.3 Packed state 的 probe/trace
 
@@ -634,8 +664,9 @@ depth=128 的 logical state bits 仍是 `128 × 8 = 1024`。收益来自 O(depth
 
 ### 12.2 各项改写分别改变什么
 
-保留模式和性能模式的 primitive 数不能只归因于观测清理：保留模式还会跳过旧 i1
-packing。state bits 的主要下降来自等价状态合并，不是 lane packing。
+旧 preserve/off 模式已删除，因此当前不存在“保留模式 vs 性能模式”的对照；早期
+对照中 preserve 模式还会跳过旧 i1 packing，所以 primitive 数不能只归因于观测清理。
+state bits 的主要下降来自等价状态合并，不是 lane packing。
 
 这里的 `reg_count` 遵循 compile-stats 资源口径：普通或 packed `pyc.reg` 计 1，
 `pyc.delay_line depth=N` 计 N。它能防止把长 delay-line 误算成一个逻辑寄存器，但也
@@ -672,12 +703,13 @@ C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读
 
 - 功能回归、内部 `dut.read` 和 probe 清单都走默认 C++ 路径；
 - 需要只跑某一阶段做诊断时用 `pyc-opt` 指定 `pyc-combine-delay-chains` 或
-  `pyc-state-optimize`；两条路径共用同一套候选策略。`pycc` 不提供 off /
-  retime-off / preserve-observability 开关。
+  `pyc-state-optimize`；两者对 merge/chain/share 使用同一套候选证明。`pycc` 不提供
+  off / retime-off / preserve-observability / no-state-opt 开关。
 
 ## 14. 统计和诊断
 
-新建的 delay-line 和 packed state 会携带来源属性：
+由 combine/pack 新建的 delay-line 和 packed state 会携带来源属性；retime 新建的
+history 只带 `pyc.optimized_by`。示例：
 
 ```mlir
 %q = pyc.delay_line ... {
@@ -688,6 +720,19 @@ C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读
 } : i8
 ```
 
+`pyc.optimized_by` 的当前取值：
+
+- `merge_equivalent_state`（等价状态合并）；
+- `combine_delay_chains_structural`（直连链形成 delay-line）；
+- `combine_delay_chain_tap`（链中间只读 fanout 的 tap）；
+- `retime_pipeline_history`（computed pipeline 形成的 history/tap）；
+- `retime_common_delay_sink`（共同 delay 下沉）；
+- `pack_state_lanes`（Stage 2 packed storage）。
+
+`pyc.source_reg_count` 和 `pyc.shared_chain_count` 会沿 delay-line / packed storage
+累积，用于来源统计；`pyc.generated="cycle_balance"` 只在所有来源 reg 都带该 marker
+时保留。它们都不参与正确性判断。
+
 主要统计字段：
 
 | JSON 字段 | 含义 |
@@ -697,38 +742,58 @@ C++ 默认路径优化物理对象，但外部可读名字/probe 必须仍能读
 | `observe_named` | `--emit=cpp` 为 `demand`（默认）或 `all`；其它 emit 为 `off` |
 | `observe_named_names_lazy` | demand 模式下改按名懒查找（保留 `pyc.observe_lazy`）的 `pyc.name` 数 |
 | `observe_named_names_kept` | demand 模式下因 @probe/trace/IR 属性保持急切的 `pyc.name` 数 |
-| `state_opt_pack_width` | 实际 Stage 2 width 上限 |
-| `state_opt_regs_merged` | 两轮实际合并的 reg 数 |
+| `state_opt_pack_width` | 实际 Stage 2 width 上限；非 C++ emit 为 0 |
+| `reg_count` / `reg_bits` | compile-stats 资源口径：普通/packed reg 计 1，delay-line 按 depth 计 |
+| `delay_line_count` / `delay_line_depth_total` | delay-line 对象数 / depth 总和 |
+| `mem_count` / `mem_bits` | memory 资源口径 |
+| `state_opt_regs_merged` | 两轮 merge 实际合并的 reg 数 |
 | `state_opt_reg_bits_removed` | 等价状态合并移除的逻辑 bits |
-| `state_opt_merge_rounds` | structural 合并轮数 |
-| `state_opt_cascade_regs_merged` | 第二轮新增合并数 |
+| `state_opt_merge_rounds` | 执行的 merge 轮数；当前固定为 2，不代表实际发生合并的次数 |
+| `state_opt_cascade_regs_merged` | 第二轮新增的等价状态合并数 |
 | `delay_chains_combined` | 成功形成的最大链数量 |
 | `delay_chain_regs_combined` | 被 delay-line 替代的 reg 数 |
-| `delay_chain_delay_lines_merged` | 完整时序键相同而共享的 delay-line 数 |
-| `state_opt_pack_groups` | packed state group 数 |
+| `delay_chain_aliases_removed` | 收链时折叠的透明 alias 数 |
+| `delay_chain_delay_lines_created` / `delay_chain_delay_lines_merged` | 新建 / 因完整时序键相同而共享的 delay-line 数 |
+| `delay_chain_taps_created` / `delay_chain_tap_uses_rewritten` | 由中间只读 fanout 形成的 tap 数 / 被 tap 替换的只读 SSA 使用数 |
+| `state_opt_pack_groups` / `state_opt_pack_reg_groups` / `state_opt_pack_delay_groups` | packing group 总数及 reg/delay 分类 |
 | `state_opt_packed_state_ops` | 参与 packing 的原 state op 数 |
 | `state_opt_state_primitives_removed` | packing 净减少的 primitive 数 |
 | `state_opt_pack_bits` | 参与 packing 的逻辑 bit×depth 总量 |
-| `delay_chain_taps_created` | 由中间只读 fanout 形成的固定深度 tap 数 |
-| `delay_chain_tap_uses_rewritten` | 被 tap 替换的只读 SSA 使用数 |
-| `retime_regions/regs_rewritten` | 实际改写的 region 和源状态数 |
+| `retime_regions_rewritten` / `retime_regs_rewritten` | 实际改写的 region 和源状态数 |
 | `retime_state_primitives_removed` | retiming 净减少的 state primitive 数 |
-| `retime_common_delay_sinks` | 成功执行的共同 delay 下沉数 |
-| `retime_comb_ops_cloned/moved` | 重建前缀和跨状态移动的组合 op 数 |
+| `retime_taps_created` | retiming 重建视图生成的 tap 数 |
+| `retime_comb_ops_cloned` | 重建前缀克隆的组合 op 数 |
+| `retime_common_delay_sinks` / `retime_common_delay_source_states` | 共同下沉次数 / 涉及的源状态数 |
+| `retime_comb_ops_moved` | 被搬到状态之前、参与融合的锥内 op 数 |
 | `retime_state_bits_removed` | retiming 净减少的逻辑 state bits |
-| `retime_blocked_init/cost` | 因 init 证明或 state-bit 不增 guard 拒绝的候选数 |
+| `retime_blocked_init` | 因 init 无法精确求值/类型不支持而拒绝的候选数 |
+| `retime_blocked_cost` | 因 state-bit 非增 guard、非法依赖/反馈、非整数宽度或单源不变收益拒绝的候选数 |
+| `fuse_comb_enabled` / `logic_depth_limit` / `max_logic_depth` / `wns` / `tns` | comb fusion 与 logic-depth 门禁结果 |
 
-`delay_chain_state_reads/writes_before/after` 描述生成 C++ model 每拍需要静态调度的
-状态 primitive 数，不是 CPU load/store、MLIR MemoryEffects 或 RTL 物理端口数。
+`delay_chain_state_reads/writes_before/after` 描述 delay-chain 改写前后的状态
+primitive 账面，不是 CPU load/store、MLIR MemoryEffects 或 RTL 物理端口数。
 四项在 JSON 中分别由 `delay_chain_regs_combined`（before）与
-`delay_chain_delay_lines_created - delay_chain_delay_lines_merged`（after）派生，
-不再写入 IR attr。
+`delay_chain_delay_lines_created - delay_chain_delay_lines_merged`（after）派生；
+reads 与 writes 当前取相同的派生值，也不包含后续 retiming/packing 的进一步变化。
 
 查看 pass 前后 IR：
 
 ```bash
+# pycc 里 state-opt 是一个 pass：只能看到它执行前后的全量快照
 pycc input.mlir --emit=cpp \
   --dump-pass-ir=/tmp/state_ir \
+  --dump-pass-ir-filter='state-optimize' \
+  --dump-pass-ir-phase=both
+
+# 要逐个阶段看，用 pyc-opt 单独运行对外 pass（短名已去掉 pyc- 前缀）。
+# 注意：pyc-combine-delay-chains 内部是 merge+form/share 一体，pyc-opt 无法
+# 复现 state-optimize 的“两轮 merge → retime → form/share → pack”内部顺序；
+# 这些 dump 用于单 pass 输入/输出对照，不等价于统一 pass 的逐阶段 IR。
+pyc-opt input.mlir \
+  --pyc-retime-pipelines \
+  --pyc-combine-delay-chains \
+  --pyc-pack-state-lanes \
+  --dump-pass-ir=/tmp/state_phases \
   --dump-pass-ir-filter='retime-pipelines|combine-delay-chains|pack-state-lanes' \
   --dump-pass-ir-phase=both
 ```
@@ -741,12 +806,14 @@ pycc input.mlir --emit=cpp \
 ```bash
 bash compiler/mlir/test/state_delay_optimization_smoke.sh
 bash compiler/mlir/test/delay_line_diagnostics_smoke.sh
+bash tests/runtime/run_delay_line_commit.sh
 python3 compiler/mlir/test/check_state_delay_tap_models.py
 python3 compiler/mlir/test/check_state_retime_models.py
 ```
 
 `state_delay_optimization_smoke.sh` 覆盖默认策略、观测重映射、delay tap、lane packing
-和 probe。两个 Python 检查分别核对 delay tap 与 retiming 的 C++ 结果。
+和 probe，并调用两个 Python 检查分别核对 delay tap 与 retiming 的 C++ 结果。
+`run_delay_line_commit.sh` 覆盖 `tick_compute/commit`、tail/tap 两域唤醒和 reset。
 
 ## 16. 修改文件与职责
 
@@ -755,14 +822,14 @@ python3 compiler/mlir/test/check_state_retime_models.py
 | Frontend | [`v5.py`](../compiler/frontend/pycircuit/v5.py)、[`dsl.py`](../compiler/frontend/pycircuit/dsl.py)、[`hw.py`](../compiler/frontend/pycircuit/hw.py) | 生成并传播 cycle-balance provenance |
 | Dialect | [`PYCOps.td`](../compiler/mlir/include/pyc/Dialect/PYC/PYCOps.td)、[`PYCOps.cpp`](../compiler/mlir/lib/Dialect/PYC/PYCOps.cpp) | 定义和验证 `pyc.delay_line` |
 | Analysis | [`StateOptimization.cpp`](../compiler/mlir/lib/Transforms/StateOptimization.cpp) | 观测边界、状态值归一化和等价证明，供改写 pass 使用 |
-| Transform | [`CombineDelayChainsPass.cpp`](../compiler/mlir/lib/Transforms/CombineDelayChainsPass.cpp) | 等价 state、串行 chain、delay sharing 和观测重映射 |
-| Transform | [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimePipelinesPass.cpp) | computed pipeline history、共同 delay 下沉、init/depth/cost 证明 |
+| Transform | [`CombineDelayChainsPass.cpp`](../compiler/mlir/lib/Transforms/CombineDelayChainsPass.cpp) | 等价 state、串行 chain/tap、delay sharing 和观测重映射 |
+| Transform | [`RetimePipelinesPass.cpp`](../compiler/mlir/lib/Transforms/RetimePipelinesPass.cpp) | computed pipeline history、共同 delay 下沉、init/state-bit guard 证明 |
 | Transform | [`PackStateLanesPass.cpp`](../compiler/mlir/lib/Transforms/PackStateLanesPass.cpp) | reg/delay-line lane packing |
 | Pipeline | [`pycc.cpp`](../compiler/mlir/tools/pycc.cpp) | 默认策略、pass 顺序、CLI 和统计汇总 |
 | Gates | [`CheckClockDomainsPass.cpp`](../compiler/mlir/lib/Transforms/CheckClockDomainsPass.cpp)、[`CheckCombCyclesPass.cpp`](../compiler/mlir/lib/Transforms/CheckCombCyclesPass.cpp)、[`CheckLogicDepthPass.cpp`](../compiler/mlir/lib/Transforms/CheckLogicDepthPass.cpp) | 把 delay-line 视为时序边界并执行 legality 检查 |
 | C++ | [`CppEmitter.cpp`](../compiler/mlir/lib/Emit/CppEmitter.cpp)、[`pyc_primitives.hpp`](../runtime/cpp/pyc_primitives.hpp)、[`pyc_probe_registry.hpp`](../runtime/cpp/pyc_probe_registry.hpp)、[`pyc_trace_bin.hpp`](../runtime/cpp/pyc_trace_bin.hpp) | ring runtime、packed slice probe 和 trace |
 | Verilog | [`VerilogEmitter.cpp`](../compiler/mlir/lib/Emit/VerilogEmitter.cpp) | 不支持 delay-line（明确报错） |
-| Tests | [`state_delay_optimization_smoke.sh`](../compiler/mlir/test/state_delay_optimization_smoke.sh)、[`delay_line_diagnostics_smoke.sh`](../compiler/mlir/test/delay_line_diagnostics_smoke.sh)、[`check_state_delay_tap_models.py`](../compiler/mlir/test/check_state_delay_tap_models.py)、[`check_state_retime_models.py`](../compiler/mlir/test/check_state_retime_models.py) | 默认策略、delay tap、retiming 和运行时 probe |
+| Tests | [`state_delay_optimization_smoke.sh`](../compiler/mlir/test/state_delay_optimization_smoke.sh)、[`delay_line_diagnostics_smoke.sh`](../compiler/mlir/test/delay_line_diagnostics_smoke.sh)、[`run_delay_line_commit.sh`](../tests/runtime/run_delay_line_commit.sh)、[`check_state_delay_tap_models.py`](../compiler/mlir/test/check_state_delay_tap_models.py)、[`check_state_retime_models.py`](../compiler/mlir/test/check_state_retime_models.py) | 默认策略、delay tap、retiming、tail/tap 唤醒和运行时 probe |
 
 ## 17. 当前没有实现的优化
 
@@ -782,9 +849,10 @@ sequential/formal equivalence，不能靠局部 matcher 放宽。
 ### 17.2 多抽头 history 的当前边界
 
 当前已实现单个 `pyc.delay_line` 上的多个 `pyc.delay_tap`。canonicalize/CSE 可以
-合并相同 depth 的重复 tap，C++ 和 Verilog 共享同一份最大 history。尚未实现的是
-把多个 tap 合并为一个多结果 `pyc.delay_taps` op，或基于 tap 数量、depth 和 host
-成本自动决定是否值得折叠；当前 chain matcher 采用保守的只读 fanout 条件。
+合并相同 depth 的重复 tap；C++ emit 从同一个 ring 读取所有 tap。Verilog 后端不支持
+delay-line（见 11.2），因此这条优化只存在于 C++ 路径。尚未实现的是把多个 tap 合并
+为一个多结果 `pyc.delay_taps` op，或基于 tap 数量、depth 和 host 成本自动决定是否
+值得折叠；当前 chain matcher 采用保守的只读 fanout 条件。
 
 ### 17.3 没有基于综合反馈的目标相关 pack cost model
 
@@ -805,10 +873,11 @@ pyc4.0 value-model hardening。Yosys/目标综合器的 FF/LUT/memory 数据也�
 1. `delay_line` 是固定周期历史的一等状态语义，不是省略硬件周期；
 2. 候选资格依据状态转移证明，而不是依赖 frontend marker；
 3. Stage 1 减少等价状态、形成严格串行历史并共享重复历史；
-4. Stage 1.5 用一次有界 canonicalize/CSE 捕获级联机会；
+4. Stage 1.5 和 retiming 之后各用一次有界 canonicalize/CSE 捕获级联/融合机会；
 5. Stage 2 将独立窄状态集中为较少的宽 storage，重点降低 C++ primitive 调度；
 6. C++ 默认路径优化物理对象，但 name/debug/probe/trace 仍通过只读视图保持同一周期可读；
-7. 已删除 strip 与 `--state-opt-preserve-observability`，不再提供剥身份或钉死身份两种模式；
+7. 已删除 strip、`--state-opt-preserve-observability`、`--no-state-opt` 以及 retiming
+   预算开关，不再提供剥身份、钉死身份或关闭状态优化的模式；
 8. 受约束 computed-pipeline retiming 和共同 delay 下沉已默认开启；不同深度/反馈图的
    全局 retiming、多结果 tap 原语和综合反馈 cost model 仍是后续独立阶段。
 
