@@ -1,5 +1,10 @@
 # pack 拆分：cycle-combine-base 与 pack 分支
 
+> **本文件所在分支是 `ldz/feat/pack`**：它在 `ldz/feat/cycle-combine-base` 之上通过 revert 拆除提交
+> `093d7e4c` 把 IR 级 reg pack（`--state-pack-width` 默认 1024、`PackStateLanesPass`、
+> `PackI1RegsPass`）加回，代码与 `zxy/feat/cycle-combine@e4c5e82f` 逐文件等价。下面「本分支拆掉了什么」
+> 指的是 `ldz/feat/cycle-combine-base` 相对它做的拆除，在本分支已被还原。
+
 ## 背景
 
 `zxy/feat/cycle-combine` 同时包含两类减少 C++ 模型状态对象数量的手段：
