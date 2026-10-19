@@ -89,25 +89,24 @@ int main(int argc, char **argv) {
   // Build the config from the (now-parsed) standard mlir-opt CL options, then
   // install our IR-dump instrumentation via the pass-pipeline setup callback.
   MlirOptMainConfig config = MlirOptMainConfig::createFromCLOptions();
-  config.setPassPipelineSetupFn([](PassManager &pm) -> LogicalResult {
-    if (dumpPassIrDir.empty())
+  if (!dumpPassIrDir.empty())
+    config.setPassPipelineSetupFn([](PassManager &pm) -> LogicalResult {
+      if (dumpPassIrDir.getValue() == "auto") {
+        // pycc resolves `auto` to <--out-dir>/pass_ir; pyc-opt has no --out-dir.
+        llvm::errs() << "error: --dump-pass-ir=auto is not supported by pyc-opt; "
+                        "pass an explicit directory\n";
+        return failure();
+      }
+      pyc::PassIRDumperOptions opts;
+      opts.dir = dumpPassIrDir.getValue();
+      opts.phase = dumpPassIrPhase.getValue();
+      opts.filterRegex = dumpPassIrFilter.getValue();
+      opts.maxLines = static_cast<uint64_t>(dumpPassIrMaxLines.getValue());
+      // addInstrumentation takes ownership; the PassManager keeps the
+      // instrumentation alive for the duration of pm.run().
+      pm.addInstrumentation(std::make_unique<pyc::PassIRDumper>(std::move(opts)));
       return success();
-    if (dumpPassIrDir.getValue() == "auto") {
-      // pycc resolves `auto` to <--out-dir>/pass_ir; pyc-opt has no --out-dir.
-      llvm::errs() << "error: --dump-pass-ir=auto is not supported by pyc-opt; "
-                      "pass an explicit directory\n";
-      return failure();
-    }
-    pyc::PassIRDumperOptions opts;
-    opts.dir = dumpPassIrDir.getValue();
-    opts.phase = dumpPassIrPhase.getValue();
-    opts.filterRegex = dumpPassIrFilter.getValue();
-    opts.maxLines = static_cast<uint64_t>(dumpPassIrMaxLines.getValue());
-    // addInstrumentation takes ownership; the PassManager keeps the
-    // instrumentation alive for the duration of pm.run().
-    pm.addInstrumentation(std::make_unique<pyc::PassIRDumper>(std::move(opts)));
-    return success();
-  });
+    });
 
   // Read input buffer (stdin when input is "-").
   auto buffer = llvm::MemoryBuffer::getFileOrSTDIN(inputFilename);
