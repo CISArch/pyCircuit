@@ -231,6 +231,14 @@ static llvm::cl::opt<unsigned> statePackWidth(
         "wake, pass e.g. 1024 to re-enable IR-level packing)"),
     llvm::cl::init(0));
 
+static llvm::cl::opt<bool> packI1Regs(
+    "pack-i1-regs",
+    llvm::cl::desc("Run pyc-pack-i1-regs, merging adjacent same-clk/rst/en i1 "
+                   "registers into one wide reg (off by default: the merged "
+                   "reg wakes all bit consumers on any bit change, losing "
+                   "per-register change-driven skipping)"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> noInline(
     "noinline",
     llvm::cl::desc("Disable MLIR inliner to preserve module boundaries (prevents merge/flatten)"),
@@ -2652,7 +2660,8 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
   pm.addPass(pyc::createCheckClockDomainsPass());
-  pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+  if (packI1Regs)
+    pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
   // SeqBank partition runs after all state rewrites so banks cover the final
   // reg set; the C++ emitter reads the ids. fuse-comb does not move state.
   if (emitKind == "cpp" && seqBank && !noSeqBank)

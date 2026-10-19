@@ -46,7 +46,7 @@ b@4 ─────────────────────────�
 
 只有 `--emit=cpp`（或 `-cpp <path>`）跑完整状态优化（structural 合并 + pipeline retiming）。
 `--emit=verilog` 与 `--emit=none` 不跑 state-opt，保持 state-opt 前的寄存器网表
-（仍会运行 `pyc-pack-i1-regs` 等通用 pass）；Verilog 后端不认识
+（`pyc-pack-i1-regs` 默认不再运行，需显式 `--pack-i1-regs`）；Verilog 后端不认识
 `pyc.delay_line`/`pyc.delay_tap`，若 IR 中出现会明确报错（delay lines 为 C++ 专属）。
 仍可调的预算是：
 
@@ -180,11 +180,11 @@ IR；要观察内部阶段，需用 `pyc-opt` 单独运行对应 pass（见第 1
 
 ```text
 --state-pack-width=0
-    默认值：Stage 2 打包关闭。正整数 N 表示单个 packed storage 的最大宽度（如 1024）；组宽超过会跨更多
-    64bit 字并拉长 emitted concat 的变参模板链
+    默认值：Stage 2 打包关闭。正整数 N 表示单个 packed storage 的最大宽度（如 1024）；
+    组宽超过会跨更多 64bit 字并拉长 emitted concat 的变参模板链
 
---state-pack-width=0
-    禁用 Stage 2；state-opt 之后运行的 pyc-pack-i1-regs 仍会执行
+--pack-i1-regs
+    默认关闭。开启后在 state-opt 之后对所有 emit 路径运行 pyc-pack-i1-regs
 ```
 
 编译统计 JSON 会记录：
@@ -507,9 +507,11 @@ SeqBank/DelayBank/VecBank 银行化时测得，对象数量爆炸是主因。银
 改为 0（不打包），由银行轮询提供对象数收益。该默认的性能依据见
 `docs/no_reg_pack_bank_plan.md` 的实测记录；需要旧行为时显式传 `--state-pack-width=1024`。
 
-`pycc` 在 state-opt 之后、`pyc-comb-canonicalize` 和 clock-domain gate 之后，对所有
-emit 路径运行旧 `pyc-pack-i1-regs`，收集通用 dependency-aware packer 留下的 i1
-lane。它不是 Stage 2 的一部分，也不受 `--state-pack-width` 控制。
+`pycc` 仅在显式传入 `--pack-i1-regs` 时，才在 state-opt 之后、`pyc-comb-canonicalize` 和
+clock-domain gate 之后，对所有 emit 路径运行旧 `pyc-pack-i1-regs`，合并同 clk/rst/en 的
+i1 lane。它不是 Stage 2 的一部分，也不受 `--state-pack-width` 控制。默认关闭的原因同
+`--state-pack-width`：合并后的宽寄存器任一 bit 变化都会唤醒全部消费者，丢失 per-lane
+change-driven 跳过（见 `docs/no_reg_pack_bank_plan.md`）。
 
 ## 10. 受约束 Retiming：把计算链变成共享历史
 

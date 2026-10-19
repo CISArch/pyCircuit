@@ -129,6 +129,23 @@ if ! "${TMP_DIR}/observation-demand-comb-runtime"; then
   exit 1
 fi
 
+# pyc-pack-i1-regs is opt-in on every emit path: by default two same-clk/rst/en
+# i1 regs stay separate; --pack-i1-regs merges them into one reg.
+for emit in cpp verilog; do
+  default_stats="$("${PYCC}" "${ROOT}/compiler/mlir/test/pack_i1_probe.mlir" --emit="${emit}" \
+    -o "${TMP_DIR}/pack-i1-default.${emit}" 2>&1 | grep '^stats:')"
+  packed_stats="$("${PYCC}" "${ROOT}/compiler/mlir/test/pack_i1_probe.mlir" --emit="${emit}" \
+    --pack-i1-regs -o "${TMP_DIR}/pack-i1-on.${emit}" 2>&1 | grep '^stats:')"
+  if [[ "${default_stats}" != *"regs=2 "* ]]; then
+    echo "fail: default ${emit} merged i1 regs (stats: ${default_stats})" >&2
+    exit 1
+  fi
+  if [[ "${packed_stats}" != *"regs=1 "* ]]; then
+    echo "fail: --pack-i1-regs did not merge i1 regs for ${emit} (stats: ${packed_stats})" >&2
+    exit 1
+  fi
+done
+
 # Default configuration must not pack state lanes: packing merges lanes into
 # one wide reg and loses per-lane change-driven wake (SeqBank keeps it).
 # Packing stays reachable via an explicit --state-pack-width below.
