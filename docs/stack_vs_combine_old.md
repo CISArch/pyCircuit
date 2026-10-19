@@ -13,8 +13,8 @@
 
 结论：L4 与 e4c5e82f 相差 +1.9%，在 ±3% 机器噪声内，P/V 同为 0.724，34 条 trace 的
 `simulated_cycles` 逐条完全一致，面积综合顶层同为 `v5_superscalar_v5_core`。
-功能与性能等价于 combine-old。merge 层贡献 L3→L4 +27.1%（merge 让重复寄存器合一后
-state-loop/pack 的 lane 数大幅减少）。
+功能与性能等价于 combine-old。merge 层贡献 L3→L4 +27.1%（推测：merge 让重复寄存器合一后
+state-loop/pack 的 lane 数减少，未单独做 lane 数统计验证）。
 
 ## 与 e4c5e82f 的差异（均为有意）
 
