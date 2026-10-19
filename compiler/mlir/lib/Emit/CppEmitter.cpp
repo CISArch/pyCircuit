@@ -2122,7 +2122,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             // Looped detection for the fallback write-next.
             std::string loopPend;
             std::string loopQNext;
-            std::string tapViewDecl;
             std::string tapViewRef;
             {
               Value qv = q;
@@ -2155,14 +2154,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                                      std::to_string(lane) + "u)";
                           loopQNext = loop + ".lane_qnext(" +
                                       std::to_string(lane) + "u)";
-                          tapViewDecl =
-                              "    static const pyc::cpp::DelayLoop<" +
-                              std::to_string(dw) + ">::TapView _pyc_tvw_" +
-                              std::to_string(key) + "_" +
-                              std::to_string(lane) + "{&" + loop + ", " +
-                              std::to_string(lane) + "u};\n";
-                          tapViewRef = "&_pyc_tvw_" + std::to_string(key) +
-                                       "_" + std::to_string(lane);
+                          tapViewRef = "&delay_tap_view_" +
+                                       std::to_string(key) + "_" +
+                                       std::to_string(lane);
                         }
                       }
                     }
@@ -2175,24 +2169,21 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
               tapWriteNext = loopQNext;
             else
               tapWriteNext = inst + "->qNext";
-            if (tapViewDecl.empty()) {
-              tapViewDecl = "";
+            if (tapViewRef.empty()) {
               tapViewRef = inst;
               if (loopPend.empty())
                 loopPend = "&" + inst + "->pending";
             }
-            // Looped source delay: emit a static DelayLoop::TapView and pass
-            // its pointer as the DelayInst argument (same tap()/pending
-            // interface), with write-intent from the loop lane.
+            // Looped source delay: pass the lane's DelayLoop::TapView member
+            // as the DelayInst argument (same tap()/pending interface), with
+            // write-intent from the loop lane.
             if (lsb == 0 && width == storageWidth) {
-              os << tapViewDecl;
               const bool loopedW = tapWriteNext.rfind("delay_loop_", 0) == 0;
               os << "    reg.addRegLazyTap<" << width << ">(reg_path("
                  << cppStringLiteral(field) << "), " << tapViewRef << ", "
                  << tapDepth << "u, " << (loopPend.empty() ? ("&" + inst + "->pending") : loopPend)
                  << ", " << (loopedW ? tapWriteNext : ("&" + tapWriteNext)) << ");\n";
             } else {
-              os << tapViewDecl;
               const bool loopedW2 = tapWriteNext.rfind("delay_loop_", 0) == 0;
               os << "    reg.addRegLazyTapSlice<" << width << ", "
                  << storageWidth << ">(reg_path(" << cppStringLiteral(field)
@@ -2331,6 +2322,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   for (int64_t dbk : delayLoopIds) {
     os << "  pyc::cpp::DelayLoop<" << delayLoopShape[dbk].first
        << "> delay_loop_" << dbk << ";\n";
+    // One stable TapView per lane: probe lambdas keep a pointer to it, so it
+    // must live and die with this instance (not a function-local static).
+    for (size_t lane = 0; lane < delayLoopLines[dbk].size(); ++lane)
+      os << "  pyc::cpp::DelayLoop<" << delayLoopShape[dbk].first
+         << ">::TapView delay_tap_view_" << dbk << "_" << lane << "{&delay_loop_"
+         << dbk << ", " << lane << "u};\n";
   }
   std::string fastClkName;
   bool fastClkUnique = true;
@@ -4038,9 +4035,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       std::string tapExpr;
       if (auto idAttr = delay->getAttrOfType<IntegerAttr>("pyc.loop_id")) {
         if (!isa<VectorType>(delay.getQ().getType())) {
-          // Locate the owning loop by (raw, width); the tap's own depth is
-          // NOT part of the loop key (it indexes the stage, not the loop).
-          const int64_t raw = idAttr.getValue().getSExtValue();
+          // Locate the owning loop by width; the tap's own depth is NOT part
+          // of the loop key (it indexes the stage, not the loop).
           const unsigned w = bitWidth(delay.getQ().getType());
           for (int64_t dbk : delayLoopIds) {
             if (delayLoopShape[dbk].first != w)

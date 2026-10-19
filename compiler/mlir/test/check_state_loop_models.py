@@ -16,6 +16,8 @@ HERE = Path(__file__).resolve().parent
 FIXTURES = (
     ("state_delay_tap_codegen.mlir", "state_delay_tap_model.cpp"),
     ("state_retime_codegen.mlir", "state_retime_model.cpp"),
+    # Named stages become lazy tap probes (DelayLoop::TapView registration).
+    ("state_loop_probe.mlir", "state_delay_tap_model.cpp"),
 )
 
 
