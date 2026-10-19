@@ -34,7 +34,7 @@ def result(command: list[str]) -> tuple[int, int]:
 
 def emit(pycc: Path, source: Path, output: Path) -> dict[str, object]:
     run([
-        str(pycc), str(source), "--emit=cpp",
+        str(pycc), str(source), "--emit=cpp", "--state-pack-width=0",
         "-o", str(output),
     ])
     return json.loads(Path(f"{output}.stats.json").read_text(encoding="utf-8"))

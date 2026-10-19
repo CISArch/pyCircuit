@@ -41,12 +41,15 @@ struct StateOptimizePass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(StateOptimizePass)
 
   StateOptimizePass() = default;
-  StateOptimizePass(const StateOptimizePass &other) : PassWrapper(other) {}
+  StateOptimizePass(const StateOptimizePass &other)
+      : PassWrapper(other), tunables(other.tunables) {}
+  explicit StateOptimizePass(const StateOptimizeTunables &tunables)
+      : tunables(tunables) {}
 
   StringRef getArgument() const override { return "pyc-state-optimize"; }
   StringRef getDescription() const override {
-    return "Unified structural state optimization: merge, retime, and chain "
-           "state with observation identities preserved";
+    return "Unified structural state optimization: merge, retime, chain, "
+           "and pack state with observation identities preserved";
   }
 
   void runOnOperation() override {
@@ -79,7 +82,7 @@ struct StateOptimizePass
     // same combinational cone as the producers of next. The fusion win
     // (shared subexpressions, one scheduled comb region) only materializes
     // once CSE deduplicates the merged cone — run it here so chain
-    // forming and history sharing see the deduplicated values
+    // forming, history sharing, and packing see the deduplicated values
     // instead of structurally-identical duplicates.
     if (failed(canonicalizeAndCSE(function))) {
       signalPassFailure();
@@ -89,13 +92,18 @@ struct StateOptimizePass
     // Form ordinary direct chains only after retiming selected the more
     // general computed pipelines; also share equivalent histories here.
     runDelayChainFormAndShare(function, /*accumulateStats=*/true);
+    // Packing works on the final state set.
+    runPackStateLanes(function, tunables.packMaxWidth);
   }
+
+  StateOptimizeTunables tunables;
 };
 
 } // namespace
 
-std::unique_ptr<::mlir::Pass> createStateOptimizePass() {
-  return std::make_unique<StateOptimizePass>();
+std::unique_ptr<::mlir::Pass>
+createStateOptimizePass(const StateOptimizeTunables &tunables) {
+  return std::make_unique<StateOptimizePass>(tunables);
 }
 
 static PassRegistration<StateOptimizePass> pass;

@@ -223,6 +223,12 @@ static llvm::cl::opt<bool> noSeqBank(
     llvm::cl::desc("Disable SeqBank lowering; expand per-reg tick code"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<unsigned> statePackWidth(
+    "state-pack-width",
+    llvm::cl::desc(
+        "Maximum packed state-lane width in structural mode (0 disables Stage 2)"),
+    llvm::cl::init(1024));
+
 static llvm::cl::opt<bool> noInline(
     "noinline",
     llvm::cl::desc("Disable MLIR inliner to preserve module boundaries (prevents merge/flatten)"),
@@ -2035,6 +2041,7 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
 struct CompileStatsSummary {
   std::string stateOptimizationPolicy;
   std::string stateRetimePolicy;
+  int64_t stateOptPackWidth = 0;
   int64_t regCount = 0;
   int64_t regBits = 0;
   int64_t delayLineCount = 0;
@@ -2061,7 +2068,12 @@ struct CompileStatsSummary {
   int64_t stateOptRegBitsRemoved = 0;
   int64_t stateOptMergeRounds = 0;
   int64_t stateOptCascadeRegsMerged = 0;
+  int64_t stateOptPackGroups = 0;
+  int64_t stateOptPackRegGroups = 0;
+  int64_t stateOptPackDelayGroups = 0;
+  int64_t stateOptPackedStateOps = 0;
   int64_t stateOptStatePrimitivesRemoved = 0;
+  int64_t stateOptPackBits = 0;
   int64_t memCount = 0;
   int64_t memBits = 0;
   int64_t maxLogicDepth = 0;
@@ -2164,9 +2176,24 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
     s.stateOptCascadeRegsMerged = satAdd(
         s.stateOptCascadeRegsMerged,
         getI64Attr(f, "pyc.stats.state_opt_cascade_regs_merged", 0));
+    s.stateOptPackGroups = satAdd(
+        s.stateOptPackGroups,
+        getI64Attr(f, "pyc.stats.state_opt_pack_groups", 0));
+    s.stateOptPackRegGroups = satAdd(
+        s.stateOptPackRegGroups,
+        getI64Attr(f, "pyc.stats.state_opt_pack_reg_groups", 0));
+    s.stateOptPackDelayGroups = satAdd(
+        s.stateOptPackDelayGroups,
+        getI64Attr(f, "pyc.stats.state_opt_pack_delay_groups", 0));
+    s.stateOptPackedStateOps = satAdd(
+        s.stateOptPackedStateOps,
+        getI64Attr(f, "pyc.stats.state_opt_packed_state_ops", 0));
     s.stateOptStatePrimitivesRemoved = satAdd(
         s.stateOptStatePrimitivesRemoved,
         getI64Attr(f, "pyc.stats.state_opt_state_primitives_removed", 0));
+    s.stateOptPackBits = satAdd(
+        s.stateOptPackBits,
+        getI64Attr(f, "pyc.stats.state_opt_pack_bits", 0));
     s.memCount = satAdd(s.memCount, getI64Attr(f, "pyc.stats.mem_count", 0));
     s.memBits = satAdd(s.memBits, getI64Attr(f, "pyc.stats.mem_bits", 0));
     s.observeNamedNamesLazy = satAdd(
@@ -2196,12 +2223,14 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
 static void printCompileStats(const CompileStatsSummary &s) {
   llvm::errs() << "stats: state_policy=" << s.stateOptimizationPolicy
                << ", retime=" << s.stateRetimePolicy
+               << ", pack_width=" << s.stateOptPackWidth
                << ", regs=" << s.regCount << " (" << s.regBits << " bits)"
                << ", delay_lines=" << s.delayLineCount
                << " (depth_total=" << s.delayLineDepthTotal << ")"
                << ", merged=" << s.stateOptRegsMerged
                << ", bits_removed=" << s.stateOptRegBitsRemoved
                << ", delay_chains=" << s.delayChainsCombined
+               << ", pack_groups=" << s.stateOptPackGroups
                << ", retime_rewritten=" << s.retimeRegionsRewritten
                << ", comb_moved=" << s.retimeCombOpsMoved
                << ", mems=" << s.memCount << " (" << s.memBits << " bits)"
@@ -2215,6 +2244,7 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   llvm::json::Object obj;
   obj["state_opt_policy"] = s.stateOptimizationPolicy;
   obj["state_retime_policy"] = s.stateRetimePolicy;
+  obj["state_opt_pack_width"] = s.stateOptPackWidth;
   obj["reg_count"] = s.regCount;
   obj["reg_bits"] = s.regBits;
   obj["delay_line_count"] = s.delayLineCount;
@@ -2255,8 +2285,13 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["state_opt_reg_bits_removed"] = s.stateOptRegBitsRemoved;
   obj["state_opt_merge_rounds"] = s.stateOptMergeRounds;
   obj["state_opt_cascade_regs_merged"] = s.stateOptCascadeRegsMerged;
+  obj["state_opt_pack_groups"] = s.stateOptPackGroups;
+  obj["state_opt_pack_reg_groups"] = s.stateOptPackRegGroups;
+  obj["state_opt_pack_delay_groups"] = s.stateOptPackDelayGroups;
+  obj["state_opt_packed_state_ops"] = s.stateOptPackedStateOps;
   obj["state_opt_state_primitives_removed"] =
       s.stateOptStatePrimitivesRemoved;
+  obj["state_opt_pack_bits"] = s.stateOptPackBits;
   obj["mem_count"] = s.memCount;
   obj["mem_bits"] = s.memBits;
   obj["logic_depth_limit"] = s.logicDepthLimit;
@@ -2599,19 +2634,23 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
-  // State merge and retiming stay on the C++ emit path only so
+  // State merge, retiming, and packing stay on the C++ emit path only so
   // Verilog keeps the pre-optimization netlist.
   const bool isCppEmit = emitKind == "cpp";
   if (isCppEmit) {
     // Unified structural state optimization: equivalent-state merge rounds
     // (with in-pass canonicalize/CSE between them), retiming, direct-chain
-    // and formation/history sharing in one func-level pass.
-    pm.addNestedPass<func::FuncOp>(pyc::createStateOptimizePass());
+    // formation/history sharing, and lane packing in one func-level pass.
+    pyc::StateOptimizeTunables stateTunables;
+    stateTunables.packMaxWidth = statePackWidth;
+    pm.addNestedPass<func::FuncOp>(
+        pyc::createStateOptimizePass(stateTunables));
   }
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
   pm.addPass(pyc::createCheckClockDomainsPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
   // SeqBank partition runs after all state rewrites so banks cover the final
   // reg set; the C++ emitter reads the ids. fuse-comb does not move state.
   if (emitKind == "cpp" && seqBank && !noSeqBank)
@@ -2676,6 +2715,8 @@ int main(int argc, char **argv) {
   CompileStatsSummary compileStats = collectCompileStats(*module, static_cast<int64_t>(logicDepthLimit));
   compileStats.stateOptimizationPolicy = isCppEmit ? "structural" : "off";
   compileStats.stateRetimePolicy = isCppEmit ? "pipeline" : "off";
+  compileStats.stateOptPackWidth =
+      isCppEmit ? static_cast<int64_t>(statePackWidth) : 0;
   compileStats.fuseCombEnabled = enableFuseComb;
   compileStats.observeNamedPolicy =
       emitKind == "cpp" ? std::string(observeNamed) : std::string("off");

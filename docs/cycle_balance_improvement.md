@@ -27,8 +27,9 @@
 3. **周期对齐**：`pyc-cycle-balance`（按 `dst_cycle`/`src_cycle` 插入并 **复用** 共享延迟寄存器）  
 4. 线网：`pyc-eliminate-wires`、`pyc-eliminate-dead-state`、`pyc-comb-canonicalize`、…  
 5. 合法性：`pyc-check-comb-cycles`、`pyc-check-clock-domains`  
-6. 组合融合：`pyc-fuse-comb`（可选）  
-7. 深度统计：`pyc-check-logic-depth`  
+6. 寄存器打包：`pyc-pack-i1-regs`  
+7. 组合融合：`pyc-fuse-comb`（可选）  
+8. 深度统计：`pyc-check-logic-depth`  
 
 组合环检查依赖 `pyc.reg` 等作为时序割点；`pyc-cycle-balance` 新增的寄存器同样参与该割集。
 
