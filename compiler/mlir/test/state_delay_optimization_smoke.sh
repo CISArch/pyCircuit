@@ -130,11 +130,12 @@ if ! "${TMP_DIR}/observation-demand-comb-runtime"; then
 fi
 
 # pyc-pack-i1-regs is opt-in on every emit path: by default two same-clk/rst/en
-# i1 regs stay separate; --pack-i1-regs merges them into one reg.
+# i1 regs stay separate; --pack-i1-regs merges them into one reg. Stage 2
+# state-lane packing is disabled here so only the i1 pass is observed.
 for emit in cpp verilog; do
-  default_stats="$("${PYCC}" "${ROOT}/compiler/mlir/test/pack_i1_probe.mlir" --emit="${emit}" \
+  default_stats="$("${PYCC}" "${ROOT}/compiler/mlir/test/pack_i1_probe.mlir" --emit="${emit}" --state-pack-width=0 \
     -o "${TMP_DIR}/pack-i1-default.${emit}" 2>&1 | grep '^stats:')"
-  packed_stats="$("${PYCC}" "${ROOT}/compiler/mlir/test/pack_i1_probe.mlir" --emit="${emit}" \
+  packed_stats="$("${PYCC}" "${ROOT}/compiler/mlir/test/pack_i1_probe.mlir" --emit="${emit}" --state-pack-width=0 \
     --pack-i1-regs -o "${TMP_DIR}/pack-i1-on.${emit}" 2>&1 | grep '^stats:')"
   if [[ "${default_stats}" != *"regs=2 "* ]]; then
     echo "fail: default ${emit} merged i1 regs (stats: ${default_stats})" >&2
@@ -145,16 +146,6 @@ for emit in cpp verilog; do
     exit 1
   fi
 done
-
-# Default configuration must not pack state lanes: packing merges lanes into
-# one wide reg and loses per-lane change-driven wake (SeqBank keeps it).
-# Packing stays reachable via an explicit --state-pack-width below.
-"${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp --observe-named=all \
-  -o "${TMP_DIR}/default-no-pack.hpp" 2>"${TMP_DIR}/default-no-pack.stderr"
-if grep -q 'addRegSlice<8, 16>' "${TMP_DIR}/default-no-pack.hpp"; then
-  echo "fail: default pycc configuration packed state lanes (expected --state-pack-width=0)" >&2
-  exit 1
-fi
 
 "${PYCC}" "${PACK_PROBE_INPUT}" --emit=cpp --state-pack-width=192 \
   --observe-named=demand \

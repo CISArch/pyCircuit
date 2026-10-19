@@ -301,7 +301,7 @@ public:
   Option<unsigned> maxWidthOption{
       *this, "max-width",
       llvm::cl::desc("Maximum packed integer width (0 disables packing)"),
-      llvm::cl::init(0)};
+      llvm::cl::init(1024)};
   void runOnOperation() override {
     func::FuncOp function = getOperation();
     PackStats stats;

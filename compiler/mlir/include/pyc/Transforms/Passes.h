@@ -32,7 +32,7 @@ void runEliminateDeadState(::mlir::func::FuncOp function);
 /// dead-state -> form/share-chains -> pack sequence in pycc with one
 /// func-level pass that runs the same phases in order.
 struct StateOptimizeTunables {
-  unsigned packMaxWidth = 0; // 0 disables packing (default: bank lowering keeps per-reg change-driven wake)
+  unsigned packMaxWidth = 1024; // 0 disables packing
 };
 std::unique_ptr<::mlir::Pass>
 createStateOptimizePass(const StateOptimizeTunables &tunables = {});

@@ -226,10 +226,8 @@ static llvm::cl::opt<bool> noSeqBank(
 static llvm::cl::opt<unsigned> statePackWidth(
     "state-pack-width",
     llvm::cl::desc(
-        "Maximum packed state-lane width in structural mode (0 disables "
-        "Stage 2; default off so SeqBank keeps per-register change-driven "
-        "wake, pass e.g. 1024 to re-enable IR-level packing)"),
-    llvm::cl::init(0));
+        "Maximum packed state-lane width in structural mode (0 disables Stage 2)"),
+    llvm::cl::init(1024));
 
 static llvm::cl::opt<bool> packI1Regs(
     "pack-i1-regs",
