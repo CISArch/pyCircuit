@@ -7,10 +7,15 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#ifdef PYC_HAVE_MLIR_REGISTER_ALL_PASSES
 #include "mlir/InitAllPasses.h"
+#endif
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
+#include "mlir/Transforms/Passes.h"
 
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -69,7 +74,11 @@ int main(int argc, char **argv) {
   DialectRegistry registry;
   registry.insert<pyc::PYCDialect, mlir::arith::ArithDialect, mlir::func::FuncDialect, mlir::scf::SCFDialect>();
   mlir::func::registerInlinerExtension(registry);
+#ifdef PYC_HAVE_MLIR_REGISTER_ALL_PASSES
   registerAllPasses();
+#else
+  registerCSEPass();
+#endif
   forceLinkPycPasses();
 
   // Parse CLI ourselves so we can read our custom dump flags before MlirOptMain
