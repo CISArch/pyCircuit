@@ -117,11 +117,13 @@ grep -q 'std::array<unsigned, 2> _pyc_direct_fanout_.*{{1u, 2u}}' \
   "${dirty_cpp}"
 test "$(grep -c '_pyc_direct_fanout_' "${dirty_cpp}")" -eq 6
 
-python3 -m pycircuit.cli emit "${STATE_PY}" -o "${OUT}/comb_dirty_state.pyc"
+echo "[comb-dirty] state emit: start"
+python3 -m pycircuit.cli emit "${STATE_PY}" -o "${OUT}/comb_dirty_state.pyc" 2>&1 | sed 's/^/[state-emit] /'
 state_dir="${OUT}/state"
 mkdir -p "${state_dir}"
 "${PYCC}" "${OUT}/comb_dirty_state.pyc" --emit=cpp \
-  -o "${state_dir}/comb_dirty_state.cpp" "${common[@]}"
+  -o "${state_dir}/comb_dirty_state.cpp" "${common[@]}" 2>&1 | sed 's/^/[state-cpp] /'
+echo "[comb-dirty] state emit: done"
 state_cpp="${state_dir}/comb_dirty_state.cpp"
 # The comb must not snapshot the register Q directly (that is polling);
 # the temp numbering shifts with benign pipeline changes, so match the

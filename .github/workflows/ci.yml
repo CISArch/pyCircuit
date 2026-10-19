@@ -236,7 +236,7 @@ jobs:
               # Carry the failing command's own output (assertions, diffs)
               # through annotations; the raw job log is not publicly
               # readable without admin rights on this repository.
-              tail -n 50 "${log}" | sed ':a;N;$!ba;s/\n/%0A/g' | fold -w 3800 | head -8 |
+              tail -n 50 "${log}" | sed ':a;N;$!ba;s/\n/%0A/g' | fold -w 3800 | head -14 |
                 while IFS= read -r chunk; do
                   echo "::error::${chunk}"
                 done
