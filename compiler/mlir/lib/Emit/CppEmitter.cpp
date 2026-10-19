@@ -37,6 +37,105 @@ using namespace mlir;
 namespace pyc {
 namespace {
 
+// ---------------------------------------------------------------------------
+// p2sim-style static tick weights, used by --cpp-tick-partition=weighted.
+//
+// Mirrors p2sim's compute_inst_costs shape (per-op mix -> static weight with
+// recursive instance rollup), calibrated to pyCircuit's tick semantics: the
+// tick phase propagates instance ports and arms sequential primitives, while
+// combinational logic evaluates in the sequential comb phase regardless of
+// how tick parts are cut. Tick weight therefore counts state arms (regs,
+// delays, memories) plus a fixed per-instance propagation cost; pure comb
+// ops (adds, muxes, ...) contribute nothing. p2sim's 0.5 branch-nesting
+// discount has no analogue here (pure dataflow IR).
+static double opTickCost(Operation &op) {
+  if (isa<func::ReturnOp>(op))
+    return 0.0;
+  StringRef name = op.getName().getStringRef();
+  name.consume_front("pyc.");
+  // State primitives: one arm each in tick_compute.
+  if (name == "reg" || name == "delay" || name == "delay_line" ||
+      name == "sync_mem" || name == "sync_mem_dp" || name == "byte_mem" ||
+      name == "fifo" || name == "async_fifo" || name == "cdc_sync")
+    return 1.0;
+  // Declarations, plumbing, comb evaluation, wire saves: no tick-time work.
+  return 0.0;
+}
+
+static double moduleTickWeight(func::FuncOp f, ModuleOp mod,
+                               llvm::DenseMap<Operation *, double> &memo) {
+  auto known = memo.find(f);
+  if (known != memo.end())
+    return known->second;
+  double w = 0.0;
+  // Walk regions too: comb fusion wraps fused expression trees into single
+  // region-carrying ops, and the tick-time cost lives in the inner ops.
+  f.walk([&](Operation *op) {
+    if (op == f)
+      return;
+    if (auto inst = dyn_cast<pyc::InstanceOp>(op)) {
+      auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
+      if (calleeAttr)
+        if (auto callee =
+                mod.lookupSymbol<func::FuncOp>(calleeAttr.getValue()))
+          w += moduleTickWeight(callee, mod, memo);
+      w += 5.0; // per-instance fixed cost: port propagation + edge detect
+                // measures ~5x one reg arm on real loads
+      w += 0.5 * inst->getNumOperands();
+      return;
+    }
+    w += opTickCost(*op);
+  });
+  memo[f] = w;
+  return w;
+}
+
+// Split the ordered instance list into `parts` contiguous ranges minimizing
+// the maximum range weight (gsim-style linear-partition DP over the sorted
+// schedule; order is preserved so tick semantics are untouched). Returns an
+// empty vector when the weights carry no signal, letting the caller fall
+// back to uniform stride.
+static std::vector<std::pair<unsigned, unsigned>>
+weightedPartBounds(const std::vector<double> &weights, unsigned parts) {
+  const unsigned n = static_cast<unsigned>(weights.size());
+  parts = std::min(parts, n);
+  if (parts <= 1 || n == 0)
+    return {};
+  std::vector<double> prefix(n + 1, 0.0);
+  for (unsigned i = 0; i < n; ++i)
+    prefix[i + 1] = prefix[i] + weights[i];
+  if (prefix[n] <= 0.0)
+    return {};
+  // dp[p][i]: minimal achievable max-part weight covering the first i
+  // instances with p parts; cut[p][i] backtracks the last boundary.
+  std::vector<std::vector<double>> dp(parts + 1,
+                                      std::vector<double>(n + 1, -1.0));
+  std::vector<std::vector<unsigned>> cut(
+      parts + 1, std::vector<unsigned>(n + 1, 0));
+  dp[0][0] = 0.0;
+  for (unsigned p = 1; p <= parts; ++p)
+    for (unsigned i = p; i <= n; ++i)
+      for (unsigned k = p - 1; k < i; ++k) {
+        if (dp[p - 1][k] < 0.0)
+          continue;
+        double cand = std::max(dp[p - 1][k], prefix[i] - prefix[k]);
+        if (dp[p][i] < 0.0 || cand < dp[p][i]) {
+          dp[p][i] = cand;
+          cut[p][i] = k;
+        }
+      }
+  if (dp[parts][n] < 0.0)
+    return {};
+  std::vector<std::pair<unsigned, unsigned>> bounds;
+  unsigned i = n;
+  for (unsigned p = parts; p >= 1; --p) {
+    bounds.emplace_back(cut[p][i], i);
+    i = cut[p][i];
+  }
+  std::reverse(bounds.begin(), bounds.end());
+  return bounds;
+}
+
 // A function argument feeds only sequential clock ports when every use is a
 // clock operand, an alias/wire, or an instance port that is itself clock-only.
 // Those values do not change combinational outputs, so the instance eval cache
@@ -3641,14 +3740,55 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  }\n\n";
   };
 
-  // Emit chunked submodule tick helpers.
-  unsigned subParts = 0;
+  // Emit chunked submodule tick helpers. Boundaries come from uniform stride
+  // or, with --cpp-tick-partition=weighted, from a min-max DP over p2sim-style
+  // static instance weights (same part count as uniform, balanced weight).
+  std::vector<std::pair<unsigned, unsigned>> tickPartBounds;
+  {
+    const unsigned n = static_cast<unsigned>(instInfos.size());
+    const unsigned partCount = n == 0 ? 0u : (n + kTickChunk - 1) / kTickChunk;
+    if (opts.tickPartition == "weighted" && partCount > 1) {
+      std::vector<double> weights(n, 1.0);
+      llvm::DenseMap<Operation *, double> weightMemo;
+      for (unsigned i = 0; i < n; ++i) {
+        auto calleeAttr =
+            instInfos[i].op->getAttrOfType<FlatSymbolRefAttr>("callee");
+        if (calleeAttr)
+          if (auto callee =
+                  mod.lookupSymbol<func::FuncOp>(calleeAttr.getValue()))
+            weights[i] = moduleTickWeight(callee, mod, weightMemo);
+        // The parent-side tick_compute propagates every operand per tick,
+        // plus the same per-instance fixed cost as nested rollups.
+        weights[i] += 5.0 + 0.5 * instInfos[i].op->getNumOperands();
+      }
+      tickPartBounds = weightedPartBounds(weights, partCount);
+      if (!tickPartBounds.empty()) {
+        double total = 0.0;
+        for (double w : weights)
+          total += w;
+        os << "  // weighted tick partition: " << tickPartBounds.size()
+           << " parts, total weight " << total << "\n";
+        for (unsigned p = 0; p < tickPartBounds.size(); ++p) {
+          double w = 0.0;
+          for (unsigned i = tickPartBounds[p].first;
+               i < tickPartBounds[p].second; ++i)
+            w += weights[i];
+          os << "  // part " << p << ": instances [" << tickPartBounds[p].first
+             << "," << tickPartBounds[p].second << ") weight " << w << "\n";
+        }
+      }
+    }
+    if (tickPartBounds.empty())
+      for (unsigned b = 0; b < n; b += kTickChunk)
+        tickPartBounds.emplace_back(
+            b, std::min(n, b + kTickChunk));
+  }
+  unsigned subParts = static_cast<unsigned>(tickPartBounds.size());
   if (!instInfos.empty()) {
-    for (unsigned b = 0; b < instInfos.size(); b += kTickChunk)
-      emitTickComputePart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), subParts++);
-    unsigned commitParts = 0;
-    for (unsigned b = 0; b < instInfos.size(); b += kTickChunk)
-      emitTickCommitPart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), commitParts++);
+    for (unsigned p = 0; p < subParts; ++p)
+      emitTickComputePart(tickPartBounds[p].first, tickPartBounds[p].second, p);
+    for (unsigned p = 0; p < subParts; ++p)
+      emitTickCommitPart(tickPartBounds[p].first, tickPartBounds[p].second, p);
   }
 
   os << "  void tick_compute() {\n";
@@ -3783,20 +3923,20 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "    _pyc_seq_armed = false;\n";
   if (!instInfos.empty()) {
     os << "    // Sub-modules.\n";
-    unsigned commitParts = (static_cast<unsigned>(instInfos.size()) + kTickChunk - 1) / kTickChunk;
+    // Same bounds as tick_compute (uniform stride or weighted DP).
     // Same disjoint-partition argument as tick_compute: instance commits write
     // only their own SimObjects; parent state wakes run sequentially below.
-    if (opts.parallelTick && commitParts > 1) {
-      os << "    pyc::cpp::pyc_parallel_for(" << commitParts
+    if (opts.parallelTick && subParts > 1) {
+      os << "    pyc::cpp::pyc_parallel_for(" << subParts
          << "u, [this](unsigned _pyc_part) {\n";
       os << "      switch (_pyc_part) {\n";
-      for (unsigned i = 0; i < commitParts; ++i)
+      for (unsigned i = 0; i < subParts; ++i)
         os << "      case " << i << "u: this->tick_commit_part_" << i
            << "(); break;\n";
       os << "      }\n";
       os << "    });\n";
     } else {
-      for (unsigned i = 0; i < commitParts; ++i)
+      for (unsigned i = 0; i < subParts; ++i)
         os << "    tick_commit_part_" << i << "();\n";
     }
   }

@@ -157,6 +157,11 @@ static llvm::cl::opt<unsigned> cppTickChunkInstances(
     llvm::cl::desc("Submodule instances per tick helper part (default 256; smaller values give finer parallel grain with --cpp-parallel-tick)"),
     llvm::cl::init(256));
 
+static llvm::cl::opt<std::string> cppTickPartition(
+    "cpp-tick-partition",
+    llvm::cl::desc("Tick part boundary policy with --cpp-parallel-tick: uniform stride or weighted min-max DP over p2sim-style static instance weights (uniform|weighted)"),
+    llvm::cl::init("uniform"));
+
 static llvm::cl::opt<std::string> cppManifestPath(
     "cpp-manifest",
     llvm::cl::desc("C++ compile manifest path (default: <out-dir>/cpp_compile_manifest.json)"),
@@ -2800,6 +2805,7 @@ int main(int argc, char **argv) {
     obj["cpp_shard_max_ast_nodes"] = static_cast<int64_t>(cppShardMaxAstNodes);
     obj["cpp_parallel_tick"] = cppParallelTick.getValue();
     obj["cpp_tick_chunk_instances"] = static_cast<int64_t>(cppTickChunkInstances);
+    obj["cpp_tick_partition"] = cppTickPartition.getValue();
     obj["cpp_pch"] = cppPch.getValue();
     obj["profile_pass_timing"] = collectPassTiming;
     {
@@ -2970,6 +2976,11 @@ int main(int argc, char **argv) {
       cppEmitOpts.probePlanPath = probePlanPath;
       cppEmitOpts.parallelTick = cppParallelTick;
       cppEmitOpts.tickChunkInstances = cppTickChunkInstances;
+    if (cppTickPartition != "uniform" && cppTickPartition != "weighted") {
+      llvm::errs() << "error: --cpp-tick-partition must be uniform|weighted\n";
+      return 1;
+    }
+    cppEmitOpts.tickPartition = cppTickPartition;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -3330,6 +3341,11 @@ int main(int argc, char **argv) {
     cppEmitOpts.probePlanPath = probePlanPath;
     cppEmitOpts.parallelTick = cppParallelTick;
     cppEmitOpts.tickChunkInstances = cppTickChunkInstances;
+    if (cppTickPartition != "uniform" && cppTickPartition != "weighted") {
+      llvm::errs() << "error: --cpp-tick-partition must be uniform|weighted\n";
+      return 1;
+    }
+    cppEmitOpts.tickPartition = cppTickPartition;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))

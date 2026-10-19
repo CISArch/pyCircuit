@@ -14,11 +14,12 @@
 //   claim counter and completion counter. Workers block on cvWork_ until the
 //   epoch *changes*, consume it, and drain claims until the claim counter is
 //   exhausted. When every index finished, the dispatcher retires the dispatch
-//   (clears the task, bumps the epoch again) and notifies cvWork_ so workers
-//   fall back to sleep. Bumping the epoch on retire is what keeps workers from
-//   busy-spinning on "task_ != nullptr" between the last completion and the
-//   retire — under a pointer-only predicate, spinning workers can starve the
-//   dispatcher's mutex reacquisition and livelock the pool permanently.
+//   (clears the task, bumps the epoch again) without broadcasting: workers
+//   that consumed the published epoch are already asleep on the epoch
+//   predicate, and the next publish bumps and notifies. Bumping the epoch on
+//   retire is what keeps late-waking workers from spinning on a stale
+//   "task_ != nullptr" — under a pointer-only predicate, spinning workers can
+//   starve the dispatcher's mutex reacquisition and livelock the pool.
 //
 // Thread count is resolved once, when the pool is first used, from
 // pyc_set_threads() > PYC_THREADS env > hardware_concurrency; 0/1 selects
@@ -111,19 +112,33 @@ public:
     cvWork_.notify_all();
     drain(); // caller participates in index claiming
     {
+      // Adaptive spin: generated-simulator dispatches typically complete
+      // within microseconds; a short bounded spin on the completion counter
+      // skips the cvDone_ sleep/wake round trip when parts are short.
+      for (int spin = 0; spin < 4000; ++spin) {
+        if (done_.load(std::memory_order_acquire) >= count)
+          break;
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+      }
       std::unique_lock<std::mutex> lock(mutex_);
       cvDone_.wait(lock, [&] {
         return done_.load(std::memory_order_acquire) >= count;
       });
       // done_ == count implies every claimed index finished its fn call, so no
       // worker can still dereference task_; retire the dispatch and move the
-      // epoch so workers that consumed it fall back to sleep instead of
-      // spinning on stale state.
+      // epoch. No cvWork_ broadcast here: workers that consumed the published
+      // epoch are already asleep on their epoch predicate, and the next
+      // publish bumps the epoch and notifies. A worker that wakes late from
+      // the publish finds task_ == nullptr and returns from drain() without
+      // touching retired state.
       task_.store(nullptr, std::memory_order_relaxed);
       count_.store(0, std::memory_order_relaxed);
       ++epoch_; // retire
     }
-    cvWork_.notify_all();
     workerMarker() = false;
   }
 

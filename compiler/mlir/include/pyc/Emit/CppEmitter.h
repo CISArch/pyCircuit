@@ -88,6 +88,12 @@ struct CppEmitterOptions {
   /// give a finer parallel grain when parallelTick is enabled; the value also
   /// controls tick TU sharding granularity for --cpp-split=module.
   unsigned tickChunkInstances = 256;
+  /// Tick part boundary policy with parallelTick: "uniform" keeps the
+  /// fixed-stride chunking; "weighted" keeps the same part count but places
+  /// boundaries via a min-max DP over p2sim-style static instance weights
+  /// (tick weight = state arms + per-instance propagation cost; instances
+  /// roll up their callee's weight recursively).
+  std::string tickPartition = "uniform";
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,
