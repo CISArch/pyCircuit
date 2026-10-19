@@ -28,6 +28,38 @@ constexpr llvm::StringLiteral kOptimizedByAttr = "pyc.optimized_by";
 constexpr llvm::StringLiteral kStructuralCombineDelayChains =
     "combine_delay_chains_structural";
 
+// Registers with identical (type, clock, reset, enable, next, init) are one
+// state: keep the first, remap the others' observation identities onto it.
+static void mergeEquivalentStates(func::FuncOp function) {
+  llvm::SmallVector<pyc::RegOp> regs;
+  function.walk([&](pyc::RegOp reg) { regs.push_back(reg); });
+
+  llvm::DenseMap<std::size_t, llvm::SmallVector<pyc::RegOp>> buckets;
+  for (pyc::RegOp reg : regs) {
+    auto &bucket = buckets[registerStateHash(reg)];
+    pyc::RegOp survivor;
+    for (pyc::RegOp existing : bucket) {
+      if (equivalentRegisterState(existing, reg)) {
+        survivor = existing;
+        break;
+      }
+    }
+    if (!survivor) {
+      bucket.push_back(reg);
+      continue;
+    }
+
+    OpBuilder builder(survivor);
+    builder.setInsertionPointAfter(survivor);
+    remapStateOpIdentity(builder, reg.getOperation(), survivor.getQ());
+    reg.getQ().replaceAllUsesWith(survivor.getQ());
+    survivor->setAttr(kOptimizedByAttr,
+                      StringAttr::get(function.getContext(),
+                                      "merge_equivalent_state"));
+    reg.erase();
+  }
+}
+
 static void combineStateChains(func::FuncOp function) {
   llvm::SmallVector<pyc::RegOp> regs;
   function.walk([&](pyc::RegOp reg) { regs.push_back(reg); });
@@ -231,6 +263,10 @@ struct CombineDelayChainsPass
 
 std::unique_ptr<::mlir::Pass> createCombineDelayChainsPass() {
   return std::make_unique<CombineDelayChainsPass>();
+}
+
+void runDelayChainMergeRound(func::FuncOp function) {
+  mergeEquivalentStates(function);
 }
 
 void runDelayChainFormAndShare(func::FuncOp function) {
