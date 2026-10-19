@@ -41,7 +41,7 @@ b@4 ─────────────────────────�
 - 状态类型、clock/reset/enable/init、next-state、fanout 和依赖关系决定能否改写；
 - `pycc --emit=cpp` 固定走 `structural` 证明，不要求 `pyc.generated` marker；
 - C++ 路径优化时保留 debug/probe/trace/name，改挂到 survivor / delay_tap / slice alias；
-- 优化完成后，`--observe-named=demand`（默认）按 `@probe` / trace / IR 观测属性只把声明过的名字做成急切探针；其余作者名保留为按名懒查找（状态切片或已有组合成员上的 `addWire`），C++ 热路径不再为它们每拍抄第二根命名 Wire；
+- 优化完成后，`--observe-named=demand`（默认）按 `@probe` / trace / IR 观测属性只把声明过的名字做成急切探针；其余作者名只要满足单结果、宽度 1..64 且有状态切片或组合 host，就保留为按名懒查找（状态切片或已有组合成员上的 `addWire`）；多结果、宽度 0 或 >64、无 host 的名字仍保持急切，C++ 热路径不再为可懒查找的名字每拍抄第二根命名 Wire；
 - 端口行为、周期数、reset/enable/init 和功能数据流仍必须等价。
 
 只有 `--emit=cpp`（或 `-cpp <path>`）跑完整状态优化（structural 合并 + pipeline retiming）。
@@ -228,8 +228,9 @@ IR；要观察内部阶段，需用 `pyc-opt` 单独运行对应 pass（见第 1
 
 `cycle_balance` 的 `_v5_bal_*` 不拉外部视图。有运行时读取需求的观测 alias/tap
 带副作用，避免被 DCE 在 emit 前删掉。`--observe-named=demand` 会在 fuse-comb /
-placement 之前把未声明的 `pyc.name` 标成懒查找；观测-only 拷贝可 DCE，但
-`findByPath` 仍能按原名读到存储切片。`--observe-named=all`
+placement 之前，把满足「单结果、宽度 1..64、有状态存储或组合 host」的未声明
+`pyc.name` 标成懒查找；多结果、宽度 0 或 >64、找不到 host 的名字保持急切。
+观测-only 拷贝可 DCE，但 `findByPath` 仍能按原名读到存储切片。`--observe-named=all`
 恢复「每个非 cycle-balance 名字都当急切探针」。功能端口、周期和 clk/rst/en/init
 证明不放宽。
 
@@ -420,7 +421,9 @@ after:
   extract<0:3>, extract<4:11>, extract<12:14>
 ```
 
-同样的变换适用于 depth 相同的多个 `pyc.delay_line`。
+同样的变换适用于 depth 相同的多个 `pyc.delay_line`，但 q 带任一 `pyc.delay_tap`
+使用者的 delay-line 不参与 packing；Stage 1/retiming 产生的 tapped history 因此
+不会被打包。
 
 ### 9.2 分组合法性
 
@@ -430,6 +433,7 @@ after:
 - 都是 integer state，且单 lane width 不超过 max width；
 - 全部是 reg，或全部是 delay-line，二者不混合；
 - delay-line 的 depth 完全相同；
+- delay-line 的 q 不能被任何 `pyc.delay_tap` 使用；
 - clock/reset 在剥离透明 alias 后等价；
 - enable 为相同 SSA，或类型和值相同的常量；
 - 插入 packed state 的位置支配所有 lane consumer；
@@ -563,7 +567,10 @@ history。中间值被模块输出、assert、组合 consumer，甚至另一寄�
 - 所有相关状态位于同一 block，clock/reset/enable 语义等价；共同下沉还要求 depth 相同；
 - 组合锥只包含白名单 pure op：alias、整数算术/位运算、mux/比较、扩截位、extract、shift、concat；
 - 不跨 instance、memory、FIFO、CDC 或未知副作用 op；
-- 每级 init 可由前一级 init 位精确求值，且与原 consumer init 完全相同；
+- computed-pipeline retiming：每级 init 可由前一级 init 精确求值，且与原 consumer
+  init 完全相同；
+- 共同 delay 下沉：所有源 init 必须是常量，新 history init 由 `f(source inits)`
+  按结果位宽精确求值（没有 consumer init 可对照）；
 - 被删除状态的 next 不反馈依赖候选内状态，也不通过未解析 wire 隐藏反馈；
 - 组合锥中间结果没有锥外 fanout；共同下沉的源状态没有其他使用；
 - 新 history bits 不增加；
@@ -629,9 +636,10 @@ change-driven 调度还使用 `posedge_tick_compute()` / `negedge_update()` 的�
 
 ### 11.2 Verilog：不支持 delay-line
 
-Verilog 后端保持未优化网表契约，**不实现** delay-line lowering：IR 中出现
+Verilog 后端保持 state-opt 前的网表（仍运行 SLP、comb canonicalize、clock gate、
+pack-i1、fuse-comb 等通用 pass），**不实现** delay-line lowering：IR 中出现
 `pyc.delay_line` / `pyc.delay_tap` 时 emitter 以明确诊断拒绝
-（delay lines 为 C++ 专属；Verilog 路径本身不运行 state-opt，可作为未优化网表对照）。
+（delay lines 为 C++ 专属；Verilog 路径不运行 state-opt，可作为 state-opt 前网表对照）。
 `pycc` 已不再提供 `--no-state-opt` 之类的 C++ 关闭开关。
 
 ### 11.3 Packed state 的 probe/trace
@@ -740,8 +748,8 @@ history 只带 `pyc.optimized_by`。示例：
 | `state_opt_policy` | `--emit=cpp` 为 `structural`，其它 emit 为 `off` |
 | `state_retime_policy` | `--emit=cpp` 为 `pipeline`，其它 emit 为 `off` |
 | `observe_named` | `--emit=cpp` 为 `demand`（默认）或 `all`；其它 emit 为 `off` |
-| `observe_named_names_lazy` | demand 模式下改按名懒查找（保留 `pyc.observe_lazy`）的 `pyc.name` 数 |
-| `observe_named_names_kept` | demand 模式下因 @probe/trace/IR 属性保持急切的 `pyc.name` 数 |
+| `observe_named_names_lazy` | demand 模式下满足懒查找条件（单结果、宽度 1..64、有状态存储/组合 host）并保留 `pyc.observe_lazy` 的 `pyc.name` 数 |
+| `observe_named_names_kept` | demand 模式下因 @probe/trace/IR 属性，或因多结果、宽度 0/>64、无 host 而保持急切的 `pyc.name` 数 |
 | `state_opt_pack_width` | 实际 Stage 2 width 上限；非 C++ emit 为 0 |
 | `reg_count` / `reg_bits` | compile-stats 资源口径：普通/packed reg 计 1，delay-line 按 depth 计 |
 | `delay_line_count` / `delay_line_depth_total` | delay-line 对象数 / depth 总和 |
