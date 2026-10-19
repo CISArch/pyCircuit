@@ -5,14 +5,23 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 
 namespace pyc {
+
+// Shared stat-attribute helpers for the state-optimization passes.
+inline void setI64Attr(mlir::Operation *op, llvm::StringRef name,
+                       std::int64_t value) {
+  op->setAttr(name, mlir::IntegerAttr::get(
+                        mlir::IntegerType::get(op->getContext(), 64), value));
+}
 
 /// Stateful ops terminate combinational scheduling: registers, delay lines,
 /// memories, FIFOs, CDC syncs, and instance boundaries.
