@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
@@ -14,6 +15,12 @@ std::unique_ptr<::mlir::Pass> createEliminateWiresPass();
 std::unique_ptr<::mlir::Pass> createCombineDelayChainsPass();
 std::unique_ptr<::mlir::Pass> createRetimePipelinesPass();
 std::unique_ptr<::mlir::Pass> createPackI1RegsPass();
+/// After C++ state opt remaps identities, drop pyc.name values that are not
+/// in the runtime observation demand set (@probe source, trace fields, or
+/// debug_keep/observable/probe*/trace*).
+std::unique_ptr<::mlir::Pass>
+createApplyObservationDemandPass(std::string probePlanPath = {},
+                                 std::string traceCodegenPlanPath = {});
 std::unique_ptr<::mlir::Pass> createLowerSCFToPYCStaticPass();
 std::unique_ptr<::mlir::Pass> createCheckFrontendContractPass();
 std::unique_ptr<::mlir::Pass> createCheckHierarchyDisciplinePass();
@@ -30,7 +37,12 @@ std::unique_ptr<::mlir::Pass> createCheckLogicDepthPass(unsigned logicDepth);
 std::unique_ptr<::mlir::Pass> createCollectCompileStatsPass();
 std::unique_ptr<::mlir::Pass> createFlattenInstancesPass();
 /// C++ emit prep: sets module comb chunk size and runs member placement.
-std::unique_ptr<::mlir::Pass> createCppPlacementPass(unsigned combChunkNodes);
+/// C++ emit prep: sets module comb chunk size and runs member placement.
+/// Named values stay on the struct so probes and VCD sampling keep stable
+/// addresses. A trace codegen plan, when given, must name fields that exist.
+std::unique_ptr<::mlir::Pass>
+createCppPlacementPass(unsigned combChunkNodes,
+                       std::string traceCodegenPlanPath = {});
 std::unique_ptr<::mlir::Pass> createVectorUnrollPass();
 
 /// Phase runners shared with the unified StateOptimizePass. Defined next to

@@ -76,6 +76,7 @@ add_library(pyc_transforms
   lib/Transforms/CheckLogicDepthPass.cpp
   lib/Transforms/CheckNoDynamicPass.cpp
   lib/Transforms/CheckCombCyclesPass.cpp
+  lib/Transforms/ApplyObservationDemandPass.cpp
   lib/Transforms/CheckClockDomainsPass.cpp
   lib/Transforms/ChangeDrivenSchedulePass.cpp
   lib/Transforms/CombCanonicalizePass.cpp
