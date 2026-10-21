@@ -223,7 +223,7 @@ static llvm::cl::opt<bool> cppFallCommitGate(
     "cpp-fall-commit-gate",
     llvm::cl::desc("Skip tick_commit's local reg/delay-line walk on falling edges "
                    "(single-clock modules; A/B switch)"),
-    llvm::cl::init(false));
+    llvm::cl::init(true));
 
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
