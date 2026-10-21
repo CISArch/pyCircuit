@@ -219,6 +219,15 @@ matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg) {
   return link;
 }
 
+bool equivalentRegisterState(pyc::RegOp lhs, pyc::RegOp rhs) {
+  return lhs.getQ().getType() == rhs.getQ().getType() &&
+         equivalentStateValue(lhs.getClk(), rhs.getClk()) &&
+         equivalentStateValue(lhs.getRst(), rhs.getRst()) &&
+         equivalentStateValue(lhs.getEn(), rhs.getEn()) &&
+         equivalentStateValue(lhs.getNext(), rhs.getNext()) &&
+         equivalentStateValue(lhs.getInit(), rhs.getInit());
+}
+
 bool equivalentDelayLineState(pyc::DelayLineOp lhs, pyc::DelayLineOp rhs) {
   auto lhsDepth = lhs->getAttrOfType<IntegerAttr>("depth");
   auto rhsDepth = rhs->getAttrOfType<IntegerAttr>("depth");
@@ -229,6 +238,14 @@ bool equivalentDelayLineState(pyc::DelayLineOp lhs, pyc::DelayLineOp rhs) {
          equivalentStateValue(lhs.getEn(), rhs.getEn()) &&
          equivalentStateValue(lhs.getNext(), rhs.getNext()) &&
          equivalentStateValue(lhs.getInit(), rhs.getInit());
+}
+
+std::size_t registerStateHash(pyc::RegOp reg) {
+  return static_cast<std::size_t>(llvm::hash_combine(
+      opaqueHash(reg.getQ().getType().getAsOpaquePointer()),
+      semanticValueHash(reg.getClk()), semanticValueHash(reg.getRst()),
+      semanticValueHash(reg.getEn()), semanticValueHash(reg.getNext()),
+      semanticValueHash(reg.getInit())));
 }
 
 std::size_t delayLineStateHash(pyc::DelayLineOp delay) {

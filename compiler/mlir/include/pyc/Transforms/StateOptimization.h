@@ -83,7 +83,9 @@ struct StateChainLink {
 std::optional<StateChainLink>
 matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg);
 
+bool equivalentRegisterState(pyc::RegOp lhs, pyc::RegOp rhs);
 bool equivalentDelayLineState(pyc::DelayLineOp lhs, pyc::DelayLineOp rhs);
+std::size_t registerStateHash(pyc::RegOp reg);
 std::size_t delayLineStateHash(pyc::DelayLineOp delay);
 
 /// Attribute names used to carry lazy probe metadata on IR.

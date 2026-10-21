@@ -48,13 +48,24 @@ struct StateOptimizePass
   StringRef getArgument() const override { return "pyc-state-optimize"; }
   StringRef getDescription() const override {
     return "Unified structural state optimization: dead-state cleanup, "
-           "retime, delay-line chain formation, then lane packing with "
+           "equivalent-state merge, retime, delay-line chain formation, then "
+           "lane packing with "
            "observation identities preserved";
   }
 
   void runOnOperation() override {
     func::FuncOp function = getOperation();
     runEliminateDeadState(function);
+    // Merge equivalent registers before retiming, so a local retime cannot
+    // consume a state that has a more profitable equivalent. The first merge
+    // can expose equivalent combinational cones, so canonicalize/CSE and run
+    // one more merge round.
+    runDelayChainMergeRound(function);
+    if (failed(canonicalizeAndCSE(function))) {
+      signalPassFailure();
+      return;
+    }
+    runDelayChainMergeRound(function);
     runRetimePipelines(function);
     // Sinking moves consumer cones onto source.next, into the same
     // combinational cone as the producers of next. The fusion win (shared

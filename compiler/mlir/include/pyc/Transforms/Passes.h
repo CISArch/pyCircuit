@@ -47,6 +47,7 @@ std::unique_ptr<::mlir::Pass> createVectorUnrollPass();
 
 /// Phase runners shared with the unified StateOptimizePass. Defined next to
 /// the passes whose cores they drive.
+void runDelayChainMergeRound(::mlir::func::FuncOp function);
 void runRetimePipelines(::mlir::func::FuncOp function);
 void runDelayChainFormAndShare(::mlir::func::FuncOp function);
 void runEliminateDeadState(::mlir::func::FuncOp function);
