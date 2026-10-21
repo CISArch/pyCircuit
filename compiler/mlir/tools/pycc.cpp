@@ -168,6 +168,11 @@ static llvm::cl::opt<std::string> traceCodegenPlanPath(
         "Resolved per-module internal trace fields used by C++ placement"),
     llvm::cl::init(""));
 
+static llvm::cl::opt<unsigned> statePackWidth(
+    "state-pack-width",
+    llvm::cl::desc("Maximum packed state-lane width (0 disables lane packing)"),
+    llvm::cl::init(1024));
+
 static llvm::cl::opt<bool> stateLoop(
     "state-loop",
     llvm::cl::desc(
@@ -2448,10 +2453,14 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(pyc::createVectorUnrollPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadStatePass());
-  // State rewrites (delay-line formation) run on the C++ emit path only so
-  // Verilog keeps the pre-optimization register netlist.
-  if (emitKind == "cpp")
-    pm.addNestedPass<func::FuncOp>(pyc::createStateOptimizePass());
+  // State rewrites (delay-line formation, lane packing) run on the C++ emit
+  // path only so Verilog keeps the pre-optimization register netlist.
+  if (emitKind == "cpp") {
+    pyc::StateOptimizeTunables stateTunables;
+    stateTunables.packMaxWidth = statePackWidth;
+    pm.addNestedPass<func::FuncOp>(
+        pyc::createStateOptimizePass(stateTunables));
+  }
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());

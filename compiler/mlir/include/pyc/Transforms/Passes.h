@@ -50,10 +50,19 @@ std::unique_ptr<::mlir::Pass> createVectorUnrollPass();
 void runRetimePipelines(::mlir::func::FuncOp function);
 void runDelayChainFormAndShare(::mlir::func::FuncOp function);
 void runEliminateDeadState(::mlir::func::FuncOp function);
+void runPackStateLanes(::mlir::func::FuncOp function, unsigned maxWidth);
 
 /// Unified C++-only structural state optimization pipeline: one func-level
 /// pass that runs the state rewrites in a fixed order.
-std::unique_ptr<::mlir::Pass> createStateOptimizePass();
+struct StateOptimizeTunables {
+  unsigned packMaxWidth = 1024; // 0 disables lane packing
+};
+std::unique_ptr<::mlir::Pass>
+createStateOptimizePass(const StateOptimizeTunables &tunables = {});
+
+/// Packs same-control integer reg / delay-line lanes into one wider state op;
+/// lane values come back as `pyc.state_pack_lsb`-tagged extracts.
+std::unique_ptr<::mlir::Pass> createPackStateLanesPass(unsigned maxWidth = 1024);
 
 /// Analysis-only: tag each pyc.reg / scalar pyc.delay_line with
 /// `pyc.loop_id` (one loop per equivalent clock domain) plus function-level

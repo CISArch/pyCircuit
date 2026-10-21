@@ -23,7 +23,8 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="pyc-retime-", dir="/tmp") as path:
         temp = Path(path)
         opt_cpp = temp / "opt.hpp"
-        cpp_stats = emit(args.pycc, source, opt_cpp)
+        # Packing changes the logical reg count; this check is about retiming.
+        cpp_stats = emit(args.pycc, source, opt_cpp, "--state-pack-width=0")
         if (cpp_stats.get("reg_count") != 5 or cpp_stats.get("reg_bits") != 33):
             raise AssertionError(f"cpp: logical state changed: {cpp_stats}")
         if cpp_stats.get("retime_regions_rewritten") != 2:
