@@ -1,0 +1,44 @@
+{
+  "source": "SimTop-xiangshan-default.fir (202503-69e6), 1.39GB Lo-FIRRTL",
+  "totals": {
+    "modules": 14703,
+    "modules_with_state": 6527,
+    "modules_with_regs": 4075,
+    "recursive_regs_simtop": 85273
+  },
+  "regs_per_module_quantiles": {
+    "n": 4075, "min": 1, "p50": 3, "p90": 20, "p99": 236,
+    "p999": 1000, "max": 28640
+  },
+  "regs_per_module_log10_histogram": {
+    "1e0..1e1": 3205,
+    "1e1..1e2": 781,
+    "1e2..1e3": 83,
+    "1e3..1e4": 5,
+    "1e4..1e5": 1
+  },
+  "concentration": {
+    "top20_modules_pct_of_local_regs": 50.4
+  },
+  "hierarchy_shape": {
+    "SimTop_children_recursive_weights": {
+      "XSTop": 53478, "SimMMIO": 3134,
+      "AXI4RAMWrapper": 17, "LogPerfEndpoint": 28640
+    },
+    "XSTop_children_recursive_weights": {
+      "IntBuffer_1": 1, "IntBuffer_2": 1, "ResetGen": 1, "ResetGen_1": 1,
+      "SoCMisc": 1373, "HuanCun": 8072, "XSTile": 44029
+    }
+  },
+  "generator_recipe": {
+    "instances": 1612,
+    "sample_regcount_logbins": [
+      {"p": 0.787, "lo": 1, "hi": 9},
+      {"p": 0.192, "lo": 10, "hi": 99},
+      {"p": 0.019, "lo": 100, "hi": 999},
+      {"p": 0.002, "lo": 1000, "hi": 2000}
+    ],
+    "cap_per_instance": 256,
+    "note": "XSTile-scale monolith (28640 regs) is split into multiple capped instances; cap keeps MLIR/pycc emission tractable while preserving the tail shape"
+  }
+}
