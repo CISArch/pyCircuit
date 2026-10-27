@@ -155,7 +155,7 @@ static llvm::cl::opt<bool> cppParallelTick(
 static llvm::cl::opt<unsigned> cppTickChunkInstances(
     "cpp-tick-chunk",
     llvm::cl::desc("Submodule instances per tick helper part (default 256; smaller values give finer parallel grain with --cpp-parallel-tick)"),
-    llvm::cl::init(256));
+    llvm::cl::init(128));
 
 static llvm::cl::opt<std::string> cppTickPartition(
     "cpp-tick-partition",

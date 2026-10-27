@@ -2035,10 +2035,27 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
-def _backend_build_flag_hashes(build_flags: dict[str, Any], *, cpp_pch: bool) -> tuple[str, str]:
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer, got: {raw!r}")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _backend_build_flag_hashes(build_flags: dict[str, Any], *, cpp_flags: dict[str, Any]) -> tuple[str, str]:
     """Return shared-backend and C++-specific cache keys."""
     shared_hash = _canonical_hash(build_flags)
-    cpp_hash = _canonical_hash({**build_flags, "cpp_pch": bool(cpp_pch)})
+    cpp_hash = _canonical_hash({**build_flags, **cpp_flags})
     return shared_hash, cpp_hash
 
 
@@ -2296,6 +2313,26 @@ def _cmd_build(args: argparse.Namespace) -> int:
         raise SystemExit("--logic-depth must be > 0")
     logic_depth = int(args.logic_depth)
 
+    # Parallel tick: pycc emits pyc::cpp::pyc_parallel_for dispatch over submodule
+    # tick parts; the thread count is resolved at run time from PYC_THREADS.
+    cpp_parallel_tick = bool(args.cpp_parallel_tick)
+    # Left unset unless the caller asks: pycc owns the default chunk size, and
+    # passing it explicitly would silently override it.
+    cpp_tick_chunk: int | None = None
+    if args.cpp_tick_chunk is not None:
+        cpp_tick_chunk = int(args.cpp_tick_chunk)
+        if cpp_tick_chunk <= 0:
+            raise SystemExit("--cpp-tick-chunk must be > 0")
+    cpp_tick_partition: str | None = (
+        str(args.cpp_tick_partition) if args.cpp_tick_partition is not None else None
+    )
+    cpp_flags = {
+        "cpp_pch": bool(args.cpp_pch),
+        "cpp_parallel_tick": cpp_parallel_tick,
+        "cpp_tick_chunk": cpp_tick_chunk,
+        "cpp_tick_partition": cpp_tick_partition,
+    }
+
     device_cpp_root = out_dir / "device" / "cpp"
     device_v_root = out_dir / "device" / "verilog"
     device_cpp_root.mkdir(parents=True, exist_ok=True)
@@ -2322,9 +2359,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
         "tb_schedule_mode": str(args.tb_schedule_mode),
         "frontend_contract": FRONTEND_CONTRACT,
     }
-    cpp_build_flags = {**build_flags, "cpp_pch": bool(args.cpp_pch)}
+    cpp_build_flags = {**build_flags, **cpp_flags}
     build_flags_hash, cpp_build_flags_hash = _backend_build_flag_hashes(
-        build_flags, cpp_pch=bool(args.cpp_pch)
+        build_flags, cpp_flags=cpp_flags
     )
     same_flags = str(cache.get("build_flags_hash", "")) == build_flags_hash
     cpp_same_flags = str(cache.get("cpp_build_flags_hash", "")) == cpp_build_flags_hash
@@ -2482,6 +2519,12 @@ def _cmd_build(args: argparse.Namespace) -> int:
             ]
             if args.cpp_pch:
                 cpp_args.append("--cpp-pch")
+            if cpp_parallel_tick:
+                cpp_args.append("--cpp-parallel-tick")
+            if cpp_tick_chunk is not None:
+                cpp_args.append(f"--cpp-tick-chunk={cpp_tick_chunk}")
+            if cpp_tick_partition is not None:
+                cpp_args.append(f"--cpp-tick-partition={cpp_tick_partition}")
             pycc_jobs.append(
                 (
                     f"cpp:{sym}",
@@ -2635,6 +2678,14 @@ def _cmd_build(args: argparse.Namespace) -> int:
         subprocess.run(cmake_cmd, check=True)
         subprocess.run(["cmake", "--build", str(cmake_build), "-j", str(jobs)], check=True)
         manifest["cpp_executable"] = str(cmake_build / "pyc_tb")
+        manifest["cpp_parallel_tick"] = cpp_parallel_tick
+        manifest["cpp_tick_chunk"] = cpp_tick_chunk
+        manifest["cpp_tick_partition"] = cpp_tick_partition
+        if cpp_parallel_tick:
+            print(
+                "parallel tick enabled: run with PYC_THREADS=<n> to select the thread pool size "
+                "(PYC_THREADS=1 degrades to sequential; PYC_TP_STATS=1 prints per-thread load)"
+            )
 
     if do_v:
         if not tb_sv_out.is_file():
@@ -2853,6 +2904,27 @@ def main(argv: list[str] | None = None) -> int:
         "--cpp-pch",
         action="store_true",
         help="Precompile device module hpp headers in generated CMake build",
+    )
+    build.add_argument(
+        "--cpp-parallel-tick",
+        action="store_true",
+        default=_env_flag("PYC_CPP_PARALLEL_TICK"),
+        help=(
+            "Dispatch submodule tick parts through the runtime thread pool "
+            "(env PYC_CPP_PARALLEL_TICK; runtime thread count comes from PYC_THREADS)"
+        ),
+    )
+    build.add_argument(
+        "--cpp-tick-chunk",
+        type=int,
+        default=_env_int("PYC_CPP_TICK_CHUNK"),
+        help="Submodule instances per tick helper part (omit to keep pycc's default; smaller = finer parallel grain)",
+    )
+    build.add_argument(
+        "--cpp-tick-partition",
+        choices=["uniform", "weighted"],
+        default=os.environ.get("PYC_CPP_TICK_PARTITION"),
+        help="Tick part boundary policy: uniform stride or weighted min-max DP (omit to keep pycc's default)",
     )
     build.add_argument(
         "--trace-config",
