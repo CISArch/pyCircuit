@@ -23,8 +23,31 @@ ELF_DATA_BASE="0x20000"
 ELF_PAGE_ALIGN="0x1000"
 PYC_BUILD_PROFILE="${PYC_BUILD_PROFILE:-release}"
 
+# Multithreaded tick: pycc emits pyc::cpp::pyc_parallel_for over submodule tick
+# parts; the pool size is resolved at run time from PYC_THREADS.
+PYC_PARALLEL_TICK="${PYC_PARALLEL_TICK:-0}"
+PYC_TICK_CHUNK="${PYC_TICK_CHUNK:-}"
+PYC_TICK_PARTITION="${PYC_TICK_PARTITION:-}"
+PYC_THREADS="${PYC_THREADS:-}"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --parallel-tick)
+      PYC_PARALLEL_TICK=1
+      shift
+      ;;
+    --tick-chunk)
+      PYC_TICK_CHUNK="${2:?missing value for --tick-chunk}"
+      shift 2
+      ;;
+    --tick-partition)
+      PYC_TICK_PARTITION="${2:?missing value for --tick-partition}"
+      shift 2
+      ;;
+    --threads)
+      PYC_THREADS="${2:?missing value for --threads}"
+      shift 2
+      ;;
     --memh)
       MEMH="${2:?missing value for --memh}"
       shift 2
@@ -60,6 +83,12 @@ Usage:
   $0 --memh <file> [--expected <hex>]   # run one memh program
   $0 --elf  <file> [--expected <hex>]   # convert ELF -> memh (apply relocs, load .data/.bss) and run
 
+Parallel tick options (multithreaded simulation):
+  --parallel-tick           Emit pyc_parallel_for dispatch (env PYC_PARALLEL_TICK=1)
+  --tick-chunk <n>          Submodule instances per tick part (env PYC_TICK_CHUNK)
+  --tick-partition <mode>   uniform|weighted (env PYC_TICK_PARTITION)
+  --threads <n>             Runtime thread pool size (env PYC_THREADS; 1 = sequential)
+
 ELF options:
   --base <addr>       Alias for --text-base (default: 0x10000)
   --text-base <addr>  (default: 0x10000)
@@ -74,6 +103,15 @@ EOF
       ;;
   esac
 done
+
+case "${PYC_PARALLEL_TICK}" in
+  1|true|True|yes|on) PYC_PARALLEL_TICK=1 ;;
+  *) PYC_PARALLEL_TICK=0 ;;
+esac
+if [[ -n "${PYC_THREADS}" ]] && ! [[ "${PYC_THREADS}" =~ ^[0-9]+$ ]]; then
+  echo "error: --threads must be a non-negative integer, got: ${PYC_THREADS}" >&2
+  exit 2
+fi
 
 TMP_DIR="$(mktemp -d -t linx_cpu_pyc.XXXXXX)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
@@ -191,8 +229,12 @@ PYC_COMPILE_HELP="$("${PYCC}" --help 2>&1 || true)"
 PYC_SUPPORTS_SIM_MODE=0
 PYC_SUPPORTS_LOGIC_DEPTH=0
 PYC_SUPPORTS_CPP_SPLIT=0
+PYC_SUPPORTS_PARALLEL_TICK=0
 if grep -q -- "--sim-mode" <<<"${PYC_COMPILE_HELP}"; then
   PYC_SUPPORTS_SIM_MODE=1
+fi
+if grep -q -- "--cpp-parallel-tick" <<<"${PYC_COMPILE_HELP}"; then
+  PYC_SUPPORTS_PARALLEL_TICK=1
 fi
 if grep -q -- "--logic-depth" <<<"${PYC_COMPILE_HELP}"; then
   PYC_SUPPORTS_LOGIC_DEPTH=1
@@ -200,7 +242,7 @@ fi
 if grep -q -- "--cpp-split" <<<"${PYC_COMPILE_HELP}"; then
   PYC_SUPPORTS_CPP_SPLIT=1
 fi
-BUILD_KEY="logic_depth=${PYC_LOGIC_DEPTH};sim_mode=${SIM_MODE};mem_bytes=${PYC_MEM_BYTES:-default};sim_mode_flag=${PYC_SUPPORTS_SIM_MODE};logic_depth_flag=${PYC_SUPPORTS_LOGIC_DEPTH};cpp_split_flag=${PYC_SUPPORTS_CPP_SPLIT};backend=${PYCC}"
+BUILD_KEY="logic_depth=${PYC_LOGIC_DEPTH};sim_mode=${SIM_MODE};mem_bytes=${PYC_MEM_BYTES:-default};sim_mode_flag=${PYC_SUPPORTS_SIM_MODE};logic_depth_flag=${PYC_SUPPORTS_LOGIC_DEPTH};cpp_split_flag=${PYC_SUPPORTS_CPP_SPLIT};parallel_tick=${PYC_PARALLEL_TICK};tick_chunk=${PYC_TICK_CHUNK:-default};tick_partition=${PYC_TICK_PARTITION:-default};backend=${PYCC}"
 
 MANIFEST_REF=""
 if [[ -f "${CPP_MANIFEST_LEGACY}" ]]; then
@@ -237,6 +279,19 @@ if [[ "${need_regen}" -ne 0 ]]; then
   fi
   if [[ "${PYC_SUPPORTS_CPP_SPLIT}" -ne 0 ]]; then
     compile_cmd+=("--cpp-split=module")
+  fi
+  if [[ "${PYC_PARALLEL_TICK}" -eq 1 ]]; then
+    if [[ "${PYC_SUPPORTS_PARALLEL_TICK}" -eq 0 ]]; then
+      echo "error: ${PYCC} does not support --cpp-parallel-tick" >&2
+      exit 1
+    fi
+    compile_cmd+=("--cpp-parallel-tick")
+    if [[ -n "${PYC_TICK_CHUNK}" ]]; then
+      compile_cmd+=("--cpp-tick-chunk=${PYC_TICK_CHUNK}")
+    fi
+    if [[ -n "${PYC_TICK_PARTITION}" ]]; then
+      compile_cmd+=("--cpp-tick-partition=${PYC_TICK_PARTITION}")
+    fi
   fi
   "${compile_cmd[@]}"
   printf '%s\n' "${BUILD_KEY}" > "${KEY_FILE}"
@@ -276,6 +331,9 @@ if [[ "${need_build}" -ne 0 ]]; then
       --tb "${TB_SRC}"
       --out "${TB_EXE}"
       --profile "${PYC_BUILD_PROFILE}")
+    if [[ "${PYC_PARALLEL_TICK}" -eq 1 ]]; then
+      build_cmd+=(--pthread)
+    fi
     for inc in "${EXTRA_INC[@]}"; do
       build_cmd+=(--extra-include "${inc}")
     done
@@ -290,6 +348,9 @@ if [[ "${need_build}" -ne 0 ]]; then
       cxx_flags+=(-O1)
     else
       cxx_flags+=(-O2 -DNDEBUG)
+    fi
+    if [[ "${PYC_PARALLEL_TICK}" -eq 1 ]]; then
+      cxx_flags+=(-pthread)
     fi
     direct_build_cmd=("${cxx}" "${cxx_flags[@]}" -I "${CPP_OUT_DIR}")
     for inc in "${EXTRA_INC[@]}"; do
@@ -323,6 +384,16 @@ materialize_fixture_trace_if_needed() {
     fi
   done
 }
+
+if [[ "${PYC_PARALLEL_TICK}" -eq 1 && -z "${PYC_THREADS}" ]]; then
+  PYC_THREADS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
+fi
+if [[ "${PYC_PARALLEL_TICK}" -eq 1 ]]; then
+  export PYC_THREADS
+  echo "[pyc] parallel tick: PYC_THREADS=${PYC_THREADS} (PYC_TP_STATS=1 prints per-thread load)" >&2
+elif [[ -n "${PYC_THREADS}" ]]; then
+  export PYC_THREADS
+fi
 
 if [[ -n "${MEMH}" ]]; then
   if [[ -n "${EXPECTED}" ]]; then

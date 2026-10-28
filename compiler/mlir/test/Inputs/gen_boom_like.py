@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Generate boom_like.mlir: a parallel-tick load design whose per-module
+register counts reproduce TestHarness-LargeBoom.fir exactly (one pyc module
+per BOOM module that declares regs; k regs for a module with k reg/regreset
+declarations), instantiated flat at the top in shuffled order so the tick
+partitioner sees the real weight distribution (p50=3, p90=25, max=202).
+
+Weight source: boom_modstats.txt (module regs inst-children... per line),
+extracted from TestHarness-LargeBoom.fir; see boom_weight_profile.json.
+
+Usage: gen_boom_like.py [modstats.txt] [seed] > boom_like.mlir
+"""
+import random
+import sys
+
+stats = sys.argv[1] if len(sys.argv) > 1 else "boom_modstats.txt"
+seed = int(sys.argv[2]) if len(sys.argv) > 2 else 42
+manifest = sys.argv[3] if len(sys.argv) > 3 else None
+
+mods = []  # (name, regs)
+for line in open(stats):
+    p = line.split()
+    if len(p) < 2:
+        continue
+    regs = int(p[1])
+    if regs > 0:
+        mods.append((p[0], regs))
+
+total_regs = sum(r for _, r in mods)
+n = len(mods)
+
+attrs = (
+    'attributes {{arg_names = ["clk", "rst", "x"], result_names = ["acc"], '
+    'pyc.kind = "module", pyc.inline = "false", pyc.base = "{base}", '
+    'pyc.params = "{{}}", pyc.value_params = [], pyc.value_param_types = [], '
+    'pyc.struct.collections = "[]", '
+    'pyc.struct.metrics = "{{'
+    '\\22ast_node_count\\22:8,\\22collection_count\\22:0,'
+    '\\22collection_instance_count\\22:0,\\22estimated_inline_cost\\22:4,'
+    '\\22hardware_call_count\\22:0,\\22instance_count\\22:0,'
+    '\\22loop_count\\22:0,\\22module_call_count\\22:0,'
+    '\\22module_family_collection_count\\22:0,\\22repeat_pressure\\22:0,'
+    '\\22repeated_body_clusters\\22:[],\\22source_loc\\22:3,'
+    '\\22state_alloc_count\\22:1,\\22state_call_count\\22:0}}"}}'
+)
+
+out = []
+out.append(
+    'module attributes {pyc.top = @boom_like, '
+    'pyc.frontend.contract = "pycircuit"} {'
+)
+
+# one func per BOOM module: k counters (q_j += j+1), XOR tree keeps all live
+for idx, (name, k) in enumerate(mods):
+    out.append(f"  func.func @bm{idx}(%clk: !pyc.clock, %rst: !pyc.reset, %x: i8) -> i8 "
+               + attrs.format(base=f"bm{idx}") + " {")
+    out.append("    %en = pyc.constant 1 : i1")
+    out.append("    %zero = pyc.constant 0 : i8")
+    for j in range(k):
+        out.append(f'    %n{j} = pyc.wire {{pyc.name = "q{j}__next"}} : i8')
+        out.append(f"    %r{j} = pyc.reg %clk, %rst, %en, %n{j}, %zero : i8")
+        out.append(f'    %a{j} = pyc.alias %r{j} {{pyc.name = "q{j}"}} : i8')
+        out.append(f"    %c{j} = pyc.constant {j + 1} : i8")
+        out.append(f"    %s{j} = pyc.add %a{j}, %c{j} : i8, i8 -> i8")
+        out.append(f"    pyc.assign %n{j}, %s{j} : i8")
+    if k == 1:
+        out.append("    %out = pyc.xor %a0, %x : i8, i8 -> i8")
+    else:
+        # balanced XOR tree (depth = ceil(log2 k)) to stay under the
+        # logic-depth gate (M2 depth limit 32; BOOM max k=202 -> depth 8)
+        layer = [f"%a{j}" for j in range(k)]
+        v = 0
+        while len(layer) > 1:
+            nxt = []
+            for i in range(0, len(layer) - 1, 2):
+                out.append(f"    %t{v} = pyc.xor {layer[i]}, {layer[i + 1]} : i8, i8 -> i8")
+                nxt.append(f"%t{v}")
+                v += 1
+            if len(layer) % 2:
+                nxt.append(layer[-1])
+            layer = nxt
+        out.append(f"    %out = pyc.xor {layer[0]}, %x : i8, i8 -> i8")
+    out.append("    func.return %out : i8")
+    out.append("  }")
+
+# top: shuffled flat instantiation (BOOM weight mix, random placement of the
+# 202/169/... heavy modules), XOR aggregate
+order = list(range(n))
+random.Random(seed).shuffle(order)
+out.append(
+    "  func.func @boom_like(%clk: !pyc.clock, %rst: !pyc.reset, %incr: i8) -> i8 "
+    + attrs.format(base="build")
+        .replace('arg_names = ["clk", "rst", "x"]',
+                 'arg_names = ["clk", "rst", "incr"]')
+        .replace('result_names = ["acc"]', 'result_names = ["agg"]')
+        .replace('\\22instance_count\\22:0', f'\\22instance_count\\22:{n}') + " {")
+for i in range(n):
+    out.append(f"    %k{i} = pyc.constant {i % 256} : i8")
+for i in range(n):
+    out.append(f"    %x{i} = pyc.add %incr, %k{i} : i8, i8 -> i8")
+for pos, idx in enumerate(order):
+    out.append(f'    %q{pos} = pyc.instance %clk, %rst, %x{pos} {{callee = @bm{idx}, name = "m{pos}"}} : (!pyc.clock, !pyc.reset, i8) -> i8')
+acc = [f"%q{i}" for i in range(n)]
+v = 0
+while len(acc) > 1:
+    nxt = []
+    for i in range(0, len(acc) - 1, 2):
+        out.append(f"    %g{v} = pyc.xor {acc[i]}, {acc[i + 1]} : i8, i8 -> i8")
+        nxt.append(f"%g{v}")
+        v += 1
+    if len(acc) % 2:
+        nxt.append(acc[-1])
+    acc = nxt
+out.append(f"    func.return {acc[0]} : i8")
+out.append("  }")
+out.append("}")
+print("\n".join(out))
+print(f"# boom_like: {n} modules, {total_regs} reg arms, seed={seed}", file=sys.stderr)
+
+if manifest:
+    with open(manifest, "w") as f:
+        f.write("// generated by gen_boom_like.py: reg-arm count of each top-level\n"
+                "// instance, in instantiation (position) order\n"
+                f"static const unsigned kBoomArms[] = {{\n")
+        for pos, idx in enumerate(order):
+            f.write(f"  {mods[idx][1]},  // m{pos} = bm{idx}\n")
+        f.write("};\n"
+                f"static constexpr unsigned kBoomN = {n};\n")
