@@ -1259,8 +1259,8 @@ static bool hasDirtyPolledBoundaryInput(pyc::CombOp comb) {
 
 static void emitCombInputGuard(pyc::CombOp comb, llvm::raw_ostream &os,
                                NameTable &nt, unsigned idx) {
-  os << "    bool _pyc_comb_should_eval = _pyc_comb_take_active(" << idx
-     << "u);\n";
+  os << "    bool _pyc_comb_should_eval = _pyc_comb_dirty.takeUnchecked("
+     << idx << "u);\n";
   os << "    bool _pyc_comb_inputs_changed = _pyc_comb_should_eval;\n";
   for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
     if (isDirtyDrivenInput(input))
@@ -1760,15 +1760,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  // Runtime-owned local fused-comb dirty set (per-comb ids).\n";
     os << "  pyc::cpp::DirtyBitset<" << combs.size()
        << "> _pyc_comb_dirty{};\n";
-    os << "  inline bool _pyc_comb_take_active(unsigned id) {\n";
-    os << "    return _pyc_comb_dirty.takeUnchecked(id);\n";
-    os << "  }\n";
-    os << "  inline bool _pyc_comb_is_active(unsigned id) const {\n";
-    os << "    return _pyc_comb_dirty.testUnchecked(id);\n";
-    os << "  }\n";
-    os << "  inline void _pyc_mark_comb_dirty(unsigned id) {\n";
-    os << "    _pyc_comb_dirty.markUnchecked(id);\n";
-    os << "  }\n\n";
   }
 
   sortBySchedule(instances);
@@ -2867,7 +2858,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
       unsigned index = combIndex.lookup(comb.getOperation());
       if (!hasDirtyPolledBoundaryInput(comb)) {
-        os << "    if (_pyc_comb_is_active(" << index << "u)) {\n";
+        os << "    if (_pyc_comb_dirty.testUnchecked(" << index << "u)) {\n";
         os << "      eval_comb_" << index << "();\n";
         os << "    }\n";
       } else {
@@ -3366,7 +3357,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
       unsigned index = combIndex.lookup(comb.getOperation());
       if (!hasDirtyPolledBoundaryInput(comb)) {
-        os << indent << "if (_pyc_comb_is_active(" << index << "u)) {\n";
+        os << indent << "if (_pyc_comb_dirty.testUnchecked(" << index
+           << "u)) {\n";
         os << indent << "  eval_comb_" << index << "();\n";
         os << indent << "}\n";
       } else {
