@@ -1261,8 +1261,7 @@ static void emitCombInputGuard(pyc::CombOp comb, llvm::raw_ostream &os,
                                NameTable &nt, unsigned idx) {
   os << "    bool _pyc_comb_should_eval = _pyc_comb_take_active(" << idx
      << "u);\n";
-  os << "    bool _pyc_comb_inputs_changed = !_pyc_comb_" << idx
-     << "_inputs_valid;\n";
+  os << "    bool _pyc_comb_inputs_changed = _pyc_comb_should_eval;\n";
   for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
     if (isDirtyDrivenInput(input))
       continue;
@@ -1273,12 +1272,9 @@ static void emitCombInputGuard(pyc::CombOp comb, llvm::raw_ostream &os,
     os << "      _pyc_comb_inputs_changed = true;\n";
     os << "    }\n";
   }
-  os << "    _pyc_comb_inputs_changed = _pyc_comb_inputs_changed || "
-        "_pyc_comb_should_eval;\n";
   os << "    if (!_pyc_comb_inputs_changed) {\n";
   os << "      return;\n";
   os << "    }\n";
-  os << "    _pyc_comb_" << idx << "_inputs_valid = true;\n";
 }
 
 static void emitCombResultPublish(
@@ -1750,7 +1746,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  // Per-comb validity flags and input snapshots for change-driven"
        << " evaluation.\n";
     for (auto [index, comb] : llvm::enumerate(combs)) {
-      os << "  bool _pyc_comb_" << index << "_inputs_valid = false;\n";
       for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
         if (isDirtyDrivenInput(input))
           continue;
@@ -2626,6 +2621,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << " {\n";
   if (!combs.empty()) {
+    // The only guarantee that every comb runs on its first eval.
     os << "    for (unsigned _pyc_id = 0; _pyc_id < " << combs.size()
        << "u; ++_pyc_id)\n";
     os << "      _pyc_comb_dirty.mark(_pyc_id);\n";
