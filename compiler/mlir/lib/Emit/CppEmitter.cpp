@@ -1450,6 +1450,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   for (Operation &op : top) {
     if (!isa<pyc::WireOp, pyc::AliasOp>(op))
       continue;
+    // A named pyc.alias exists to expose its name; keep it unless lazy.
+    auto lazy = op.getAttrOfType<BoolAttr>("pyc.observe_lazy");
+    if (isa<pyc::AliasOp>(op) && op.hasAttr("pyc.name") &&
+        !(lazy && lazy.getValue()))
+      continue;
     Value v = op.getResult(0);
     Value src = aliasSource(v);
     if (!src || src.getType() != v.getType() ||
