@@ -217,6 +217,8 @@ static void emitWireProbes(llvm::raw_ostream &os, Type ty, unsigned w,
 struct NameTable {
   llvm::DenseMap<Value, std::string> names;
   llvm::StringMap<unsigned> used;
+  // Values that share their source's member instead of copying it.
+  llvm::DenseMap<Value, Value> aliasOf;
   int next = 0;
 
   std::string unique(std::string base) {
@@ -230,6 +232,11 @@ struct NameTable {
   std::string get(Value v) {
     if (auto it = names.find(v); it != names.end())
       return it->second;
+    if (Value target = aliasOf.lookup(v)) {
+      std::string n = get(target);
+      names.try_emplace(v, n);
+      return n;
+    }
     if (Operation *def = v.getDefiningOp()) {
       if (auto nAttr = def->getAttrOfType<StringAttr>("pyc.name")) {
         auto lazy = def->getAttrOfType<BoolAttr>("pyc.observe_lazy");
@@ -714,6 +721,8 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     return success();
   }
   if (auto a = dyn_cast<pyc::AliasOp>(op)) {
+    if (nt.aliasOf.count(a.getResult()))
+      return success();
     assignExpr(a.getResult(), a.getType(), os, nt,
                [&](llvm::raw_ostream &e) { e << nt.get(a.getIn()); }, locals);
     return success();
@@ -1403,6 +1412,26 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   return success();
 }
 
+/// The value a pyc.alias forwards, or the source of the only pyc.assign
+/// driving a pyc.wire; null otherwise.
+static Value aliasSource(Value v) {
+  Operation *def = v.getDefiningOp();
+  if (auto a = dyn_cast_or_null<pyc::AliasOp>(def))
+    return a.getIn();
+  if (!isa_and_nonnull<pyc::WireOp>(def))
+    return {};
+  Value src;
+  for (OpOperand &use : v.getUses()) {
+    auto assign = dyn_cast<pyc::AssignOp>(use.getOwner());
+    if (!assign || use.getOperandNumber() != 0)
+      continue;
+    if (src)
+      return {};
+    src = assign.getSrc();
+  }
+  return src;
+}
+
 static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                               const CppEmitterOptions &opts,
                               const ObservationPlans &probePlans) {
@@ -1416,6 +1445,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     return failure();
 
   Block &top = f.getBody().front();
+  // A top-level wire/alias that only mirrors another top-level value shares
+  // that value's member instead of copying it on every comb pass.
+  for (Operation &op : top) {
+    if (!isa<pyc::WireOp, pyc::AliasOp>(op))
+      continue;
+    Value v = op.getResult(0);
+    Value src = aliasSource(v);
+    if (!src || src.getType() != v.getType() ||
+        src.getParentBlock() != op.getBlock())
+      continue;
+    llvm::DenseSet<Value> seen;
+    bool cyclic = false;
+    for (Value s = src; s && !cyclic; s = aliasSource(s))
+      cyclic = s == v || !seen.insert(s).second;
+    if (!cyclic)
+      nt.aliasOf[v] = src;
+  }
 
   std::string structName = sanitizeId(f.getSymName());
   os << "struct " << structName << " {\n";
@@ -1498,7 +1544,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   });
   f.walk([&](Operation *op) {
     for (Value r : op->getResults()) {
-      if (combLocals.count(r))
+      if (combLocals.count(r) || nt.aliasOf.count(r))
         continue;
       decls.push_back(Decl{nt.get(r), r.getType()});
     }
@@ -2852,7 +2898,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 
   for (Operation *op : ordered) {
     if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
-      os << "    " << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
+      if (!nt.aliasOf.count(a.getDst()))
+        os << "    " << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
       continue;
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
@@ -3351,7 +3398,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       return success();
     }
     if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
-      os << indent << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
+      if (!nt.aliasOf.count(a.getDst()))
+        os << indent << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
       return success();
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
