@@ -87,7 +87,8 @@ Parallel tick options (multithreaded simulation):
   --parallel-tick           Emit pyc_parallel_for dispatch (env PYC_PARALLEL_TICK=1)
   --tick-chunk <n>          Submodule instances per tick part (env PYC_TICK_CHUNK)
   --tick-partition <mode>   uniform|weighted (env PYC_TICK_PARTITION)
-  --threads <n>             Runtime thread pool size (env PYC_THREADS; 1 = sequential)
+  --threads <n>             Runtime thread pool size (env PYC_THREADS); 1 keeps the
+                            baseline sequential emission so single-thread runs never regress
 
 ELF options:
   --base <addr>       Alias for --text-base (default: 0x10000)
@@ -111,6 +112,16 @@ esac
 if [[ -n "${PYC_THREADS}" ]] && ! [[ "${PYC_THREADS}" =~ ^[0-9]+$ ]]; then
   echo "error: --threads must be a non-negative integer, got: ${PYC_THREADS}" >&2
   exit 2
+fi
+
+if [[ "${PYC_PARALLEL_TICK}" -eq 1 && -z "${PYC_THREADS}" ]]; then
+  PYC_THREADS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
+fi
+# Single-threaded runs must compile the baseline sequential emission. The
+# parallel emission adds part methods and a dispatch call even when the pool
+# degrades to inline, so requesting it with one thread is pure overhead.
+if [[ "${PYC_THREADS}" == "1" ]]; then
+  PYC_PARALLEL_TICK=0
 fi
 
 TMP_DIR="$(mktemp -d -t linx_cpu_pyc.XXXXXX)"
@@ -385,14 +396,12 @@ materialize_fixture_trace_if_needed() {
   done
 }
 
-if [[ "${PYC_PARALLEL_TICK}" -eq 1 && -z "${PYC_THREADS}" ]]; then
-  PYC_THREADS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
-fi
 if [[ "${PYC_PARALLEL_TICK}" -eq 1 ]]; then
   export PYC_THREADS
   echo "[pyc] parallel tick: PYC_THREADS=${PYC_THREADS} (PYC_TP_STATS=1 prints per-thread load)" >&2
 elif [[ -n "${PYC_THREADS}" ]]; then
   export PYC_THREADS
+  echo "[pyc] PYC_THREADS=${PYC_THREADS} without --parallel-tick: sequential emission" >&2
 fi
 
 if [[ -n "${MEMH}" ]]; then

@@ -5,21 +5,37 @@
 //
 // Contract (mirrors the sequential emission it replaces):
 //   pyc_parallel_for(n, fn) invokes fn(i) exactly once for every i in [0, n),
-//   blocks until all invocations return, and is safe to nest: a call made from
-//   inside a worker (or when the pool runs inline) degrades to a sequential
-//   loop, so nested module hierarchies never deadlock.
+//   and blocks until all invocations return. Calls may nest: a dispatch made
+//   from inside a part publishes a new frame on top of the frame list and is
+//   served by every thread in the pool, so hierarchical module trees get real
+//   concurrency instead of degrading to a sequential loop.
 //
-// Synchronization design (generation/epoch based):
-//   Each dispatch publishes under mutex_ a fresh epoch with its task pointer,
-//   claim counter and completion counter. Workers block on cvWork_ until the
-//   epoch *changes*, consume it, and drain claims until the claim counter is
-//   exhausted. When every index finished, the dispatcher retires the dispatch
-//   (clears the task, bumps the epoch again) without broadcasting: workers
-//   that consumed the published epoch are already asleep on the epoch
-//   predicate, and the next publish bumps and notifies. Bumping the epoch on
-//   retire is what keeps late-waking workers from spinning on a stale
-//   "task_ != nullptr" — under a pointer-only predicate, spinning workers can
-//   starve the dispatcher's mutex reacquisition and livelock the pool.
+// Frames and slot recycling:
+//   Frames live in a fixed pool `frames_[]` and are never freed, so a worker
+//   holding a stale pointer can never touch dead memory. Slots are handed out
+//   from a free stack, so a hot slot is recycled almost immediately. Each
+//   publish stamps the frame with a new generation `gen` and resets its claim
+//   counter to `(gen << 32) | 0`; a claim therefore carries the generation it
+//   belongs to. A worker drops a claim whose generation no longer matches:
+//   a generation can only be superseded after it completed, so dropping it
+//   cannot lose work. Comparing against a saved base/count instead is NOT
+//   safe - a claim taken with an older base is rejected exactly when it lands
+//   on the first index of the next generation, silently dropping live work.
+//
+//   Active frames form a doubly-linked list with `top_` as the newest head;
+//   publish pushes to the head and unpublish unlinks from the middle, because
+//   sibling nested frames complete in arbitrary order.
+//
+// Fast paths:
+//   * inline-only (PYC_THREADS=0/1, or thread creation failure): run() is a
+//     plain loop over fn, with no type erasure, no try/catch and no
+//     synchronization - the generated part switch is the only addition over
+//     the sequential emission.
+//   * workers spin for a bounded window after the last observed activity
+//     (PYC_TP_SPIN) before falling back to cvWork_, so a burst of short
+//     dispatches costs no futex round trips. The spin loop re-reads the claim
+//     counter before touching it, so an exhausted frame costs no atomics.
+//   * only the thread that finishes the last index takes mutex_, to notify.
 //
 // Thread count is resolved once, when the pool is first used, from
 // pyc_set_threads() > PYC_THREADS env > hardware_concurrency; 0/1 selects
@@ -28,15 +44,18 @@
 // Tasks must not throw: an escaping exception terminates the process (the
 // generated simulator kernels are noexcept by construction).
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace pyc {
@@ -84,6 +103,41 @@ inline unsigned resolvedThreads() {
   return hw == 0 ? 1u : hw;
 }
 
+inline unsigned envUnsigned(const char *name, unsigned fallback) {
+  if (const char *e = std::getenv(name)) {
+    int v = std::atoi(e);
+    if (v >= 0)
+      return static_cast<unsigned>(v);
+  }
+  return fallback;
+}
+
+inline void cpuPause() {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+  __asm__ __volatile__("yield");
+#else
+  std::this_thread::yield();
+#endif
+}
+
+// One fork-join dispatch frame. See the file comment for the generation-tagged
+// claim counter and the doubly-linked active list. alignas(64) keeps adjacent
+// frames off the same cache line.
+struct alignas(64) Dispatch {
+  void *obj = nullptr;
+  void (*call)(void *, unsigned) = nullptr;
+  // (gen << 32) | next index to hand out; reset to (gen << 32) on publish.
+  std::atomic<std::uint64_t> claim{0};
+  std::atomic<unsigned> gen{0};        // current generation
+  std::atomic<unsigned> count{0};     // current generation index count
+  std::atomic<unsigned> remaining{0}; // indices claimed but not yet finished
+  unsigned slot = 0;                  // index in ForkJoinPool::frames_
+  Dispatch *newer = nullptr;          // guarded by mutex_
+  Dispatch *older = nullptr;           // guarded by mutex_
+};
+
 class ForkJoinPool {
 public:
   static ForkJoinPool &instance() {
@@ -91,133 +145,218 @@ public:
     return pool;
   }
 
-  void run(unsigned count, const std::function<void(unsigned)> &fn) {
-    if (count <= 1 || workers_.empty() || workerMarker()) {
-      for (unsigned i = 0; i < count; ++i)
-        call(fn, i);
+  bool hasWorkers() const { return !workers_.empty(); }
+
+  template <class F> void run(unsigned count, F &&fn) {
+    if (count == 0)
+      return;
+    // Inline-only: identical cost to the sequential emission apart from the
+    // generated part switch. No type erasure, no synchronization.
+    if (!hasWorkers()) {
+      invokeAll(count, fn);
       return;
     }
-    // Mark the caller as "inside a dispatch" so parallel_for calls nested in
-    // fn (which may execute here on the caller thread) run inline instead of
-    // overwriting the single dispatch slot while workers still use it.
-    workerMarker() = true;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      task_.store(&fn, std::memory_order_relaxed);
-      count_.store(count, std::memory_order_relaxed);
-      next_.store(0, std::memory_order_relaxed);
-      done_.store(0, std::memory_order_relaxed);
-      ++epoch_; // publish the dispatch
+    if (count == 1) {
+      fn(0);
+      return;
     }
-    cvWork_.notify_all();
-    drain(); // caller participates in index claiming
-    {
-      // Adaptive spin: generated-simulator dispatches typically complete
-      // within microseconds; a short bounded spin on the completion counter
-      // skips the cvDone_ sleep/wake round trip when parts are short.
-      for (int spin = 0; spin < 4000; ++spin) {
-        if (done_.load(std::memory_order_acquire) >= count)
-          break;
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#else
-        std::this_thread::yield();
-#endif
-      }
-      std::unique_lock<std::mutex> lock(mutex_);
-      cvDone_.wait(lock, [&] {
-        return done_.load(std::memory_order_acquire) >= count;
-      });
-      // done_ == count implies every claimed index finished its fn call, so no
-      // worker can still dereference task_; retire the dispatch and move the
-      // epoch. No cvWork_ broadcast here: workers that consumed the published
-      // epoch are already asleep on their epoch predicate, and the next
-      // publish bumps the epoch and notifies. A worker that wakes late from
-      // the publish finds task_ == nullptr and returns from drain() without
-      // touching retired state.
-      task_.store(nullptr, std::memory_order_relaxed);
-      count_.store(0, std::memory_order_relaxed);
-      ++epoch_; // retire
+    Dispatch *f = publish(count, fn);
+    if (!f) { // frame pool exhausted: degrade to inline rather than drop work.
+      invokeAll(count, fn);
+      return;
     }
-    workerMarker() = false;
+    participate(f);
+    unpublish(f);
   }
 
 private:
-  static void call(const std::function<void(unsigned)> &fn, unsigned i) {
-    try {
+  static constexpr unsigned kMaxFrames = 64;
+  static constexpr std::uint64_t kIndexMask = 0xffffffffULL;
+
+  template <class F> static void invokeAll(unsigned count, F &fn) {
+    for (unsigned i = 0; i < count; ++i)
       fn(i);
-    } catch (...) {
-      std::terminate();
+  }
+
+  template <class Fn> static void trampoline(void *p, unsigned i) {
+    (*static_cast<Fn *>(p))(i);
+  }
+
+  static bool complete(const Dispatch *f) {
+    return f->remaining.load(std::memory_order_acquire) == 0;
+  }
+
+  unsigned spinBudget() const { return spin_; }
+  unsigned maxFrames() const { return maxFrames_; }
+
+  template <class F> Dispatch *publish(unsigned count, F &fn) {
+    using Fn = typename std::remove_reference<F>::type;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_ >= maxFrames())
+      return nullptr;
+    Dispatch *f = &frames_[free_[--freeCount_]];
+    const unsigned g = f->gen.load(std::memory_order_relaxed) + 1;
+    ++active_;
+    f->obj = const_cast<void *>(static_cast<const void *>(&fn));
+    f->call = &trampoline<Fn>;
+    f->count.store(count, std::memory_order_relaxed);
+    f->remaining.store(count, std::memory_order_relaxed);
+    f->gen.store(g, std::memory_order_relaxed);
+    f->newer = nullptr;
+    f->older = top_.load(std::memory_order_relaxed);
+    if (f->older)
+      f->older->newer = f;
+    // Release store publishes {obj, call, count, gen} and makes the frame
+    // claimable; workers acquire through claim_.
+    f->claim.store(static_cast<std::uint64_t>(g) << 32, std::memory_order_release);
+    top_.store(f, std::memory_order_release);
+    activity_.fetch_add(1, std::memory_order_release);
+    cvWork_.notify_all();
+    return f;
+  }
+
+  void unpublish(Dispatch *f) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (f->newer)
+      f->newer->older = f->older;
+    else
+      top_.store(f->older, std::memory_order_release);
+    if (f->older)
+      f->older->newer = f->newer;
+    f->newer = nullptr;
+    f->older = nullptr;
+    --active_;
+    free_[freeCount_++] = f->slot;
+    // Parked workers must see the drop: without this, a worker that fell
+    // asleep after the last publish would never notice the list changed and
+    // an outer dispatch would wait for help that never arrives.
+    activity_.fetch_add(1, std::memory_order_release);
+    lock.unlock();
+    cvWork_.notify_all();
+  }
+
+  // Try to claim one index from the innermost active frame. Returns false
+  // when there is no frame, the frame is exhausted, or the claim belongs to a
+  // superseded generation (safe to drop: superseded implies completed).
+  bool tryClaim(Dispatch *&out, unsigned &localIdx) {
+    Dispatch *t = top_.load(std::memory_order_acquire);
+    if (!t)
+      return false;
+    // Cheap pre-checks that consume nothing, so a spinning thread does not
+    // hammer the claim counter on an exhausted frame.
+    const std::uint64_t cur = t->claim.load(std::memory_order_acquire);
+    const unsigned g = static_cast<unsigned>(cur >> 32);
+    if (g != t->gen.load(std::memory_order_acquire))
+      return false; // superseded generation: nothing safe to claim right now
+    if ((cur & kIndexMask) >= t->count.load(std::memory_order_acquire))
+      return false; // exhausted: no atomic RMW, spinners stay cheap
+
+    const std::uint64_t v = t->claim.fetch_add(1, std::memory_order_acq_rel);
+    // Compare against the generation read AFTER the claim, never the one read
+    // before it: if the slot was recycled in between, the claim belongs to the
+    // new generation and is live work. Dropping it by comparing against the
+    // pre-read generation would consume a real index and lose it.
+    if (static_cast<unsigned>(v >> 32) != t->gen.load(std::memory_order_acquire))
+      return false; // superseded => already completed, so dropping is safe
+    const unsigned idx = static_cast<unsigned>(v & kIndexMask);
+    if (idx >= t->count.load(std::memory_order_acquire))
+      return false; // beyond the generation: not real work
+    out = t;
+    localIdx = idx;
+    return true;
+  }
+
+  void runOne(Dispatch *f, unsigned localIdx, TpStatSlot *st) {
+    const auto t0 =
+        st ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    f->call(f->obj, localIdx);
+    if (st) {
+      st->busyNs.fetch_add(
+          static_cast<unsigned long long>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count()),
+          std::memory_order_relaxed);
+      st->parts.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Notify under mutex_: the waiter evaluates its predicate while holding
+    // mutex_, so waking after the decrement cannot be lost.
+    if (f->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      cvDone_.notify_all();
     }
   }
 
-  static bool &workerMarker() {
-    static thread_local bool m = false;
-    return m;
-  }
-
-  void drain() {
+  // Dispatcher side: help with whatever is on top (possibly a nested frame
+  // published by another thread), then wait for `f` to finish.
+  void participate(Dispatch *f) {
     TpStatSlot *st = tpStatSlot();
-    for (;;) {
-      // Claim an index under the dispatch lock so {task_, next_, count_} are
-      // read as one consistent snapshot. A lock-free fetch_add can straddle a
-      // dispatch boundary (claim from the freshly reset counter, bound check
-      // against the retired count_) and silently swallow an index, hanging the
-      // dispatcher's completion wait; the mutex claim makes that impossible.
-      // The fn call itself stays outside the lock.
-      const std::function<void(unsigned)> *fn = nullptr;
-      unsigned index = 0;
-      unsigned bound = 0;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (task_ == nullptr)
-          return; // no active dispatch
-        index = next_.fetch_add(1, std::memory_order_relaxed);
-        if (index >= count_)
-          return; // dispatch exhausted (monotonic claim counter)
-        fn = task_;
-        bound = count_;
+    int spins = static_cast<int>(spinBudget());
+    while (spins-- > 0) {
+      Dispatch *t = nullptr;
+      unsigned localIdx = 0;
+      if (tryClaim(t, localIdx)) {
+        runOne(t, localIdx, st);
+        spins = static_cast<int>(spinBudget());
+        continue;
       }
-      const auto t0 =
-          st ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-      call(*fn, index);
-      if (st) {
-        st->busyNs.fetch_add(
-            static_cast<unsigned long long>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - t0)
-                    .count()),
-            std::memory_order_relaxed);
-        st->parts.fetch_add(1, std::memory_order_relaxed);
-      }
-      {
-        // Completion must be published under the dispatch lock. The waiter's
-        // cvDone_ predicate is only safe against lost wakeups if every change
-        // of done_ happens while holding mutex_: an unlocked increment can
-        // slip between the waiter's predicate check and its internal sleep,
-        // firing notify into the void and hanging the dispatcher forever.
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (done_.fetch_add(1, std::memory_order_acq_rel) + 1 == bound)
-          cvDone_.notify_all();
-      }
+      if (complete(f))
+        return;
+      cpuPause();
     }
+    std::unique_lock<std::mutex> lock(mutex_);
+    cvDone_.wait(lock, [&] { return complete(f); });
   }
 
   void workerLoop() {
-    unsigned seenEpoch = epoch_.load(std::memory_order_relaxed);
+    TpStatSlot *st = tpStatSlot();
+    unsigned long long seen = activity_.load(std::memory_order_relaxed);
+    int spins = static_cast<int>(spinBudget());
     for (;;) {
+      Dispatch *t = nullptr;
+      unsigned localIdx = 0;
+      if (tryClaim(t, localIdx)) {
+        runOne(t, localIdx, st);
+        spins = static_cast<int>(spinBudget());
+        continue;
+      }
+      const unsigned long long now = activity_.load(std::memory_order_relaxed);
+      if (now != seen) {
+        seen = now;
+        spins = static_cast<int>(spinBudget());
+        continue;
+      }
+      if (spins-- > 0) {
+        cpuPause();
+        continue;
+      }
       {
         std::unique_lock<std::mutex> lock(mutex_);
-        cvWork_.wait(lock, [&] { return epoch_ != seenEpoch || shutdown_; });
         if (shutdown_)
           return;
-        seenEpoch = epoch_; // consume the published (or retired) epoch
+        seen = activity_.load(std::memory_order_relaxed);
+        // Sleep only on activity changes: publish and unpublish both bump
+        // activity_, so a parked worker cannot miss a frame or wait forever
+        // on one that already retired.
+        cvWork_.wait(lock, [&] {
+          return shutdown_ ||
+                 activity_.load(std::memory_order_relaxed) != seen;
+        });
+        if (shutdown_)
+          return;
+        seen = activity_.load(std::memory_order_relaxed);
+        spins = static_cast<int>(spinBudget());
       }
-      drain();
     }
   }
 
-  ForkJoinPool() {
+  ForkJoinPool()
+      : spin_(envUnsigned("PYC_TP_SPIN", 2000)),
+        maxFrames_(std::min(kMaxFrames, std::max(1u, envUnsigned("PYC_TP_MAX_DEPTH", 32)))) {
+    for (unsigned i = 0; i < kMaxFrames; ++i) {
+      frames_[i].slot = i;
+      free_[i] = i;
+    }
     if (const char *e = std::getenv("PYC_TP_STATS"))
       tpStatsEnabled.store(e[0] == '1', std::memory_order_relaxed);
     unsigned threads = resolvedThreads();
@@ -226,13 +365,10 @@ private:
     try {
       workers_.reserve(threads);
       for (unsigned t = 0; t < threads; ++t)
-        workers_.emplace_back([this] {
-          workerMarker() = true;
-          workerLoop();
-        });
+        workers_.emplace_back([this] { workerLoop(); });
     } catch (...) {
       // Thread creation failure: retire any partial workers and degrade to
-      // inline-only execution (workers_.empty() routes run() inline).
+      // inline-only execution (hasWorkers() == false routes run() inline).
       {
         std::lock_guard<std::mutex> lock(mutex_);
         shutdown_ = true;
@@ -276,15 +412,18 @@ private:
     }
   }
 
+  unsigned spin_;
+  unsigned maxFrames_;
   std::mutex mutex_;
-  std::condition_variable cvWork_; // wakes workers on epoch changes
-  std::condition_variable cvDone_; // caller waits here for completion
-  std::atomic<const std::function<void(unsigned)> *> task_{nullptr};
-  std::atomic<unsigned> count_{0};
-  std::atomic<unsigned> epoch_{0}; // bumped on dispatch publish and retire
-  std::atomic<unsigned> next_{0};
-  std::atomic<unsigned> done_{0};
-  bool shutdown_ = false;
+  std::condition_variable cvWork_; // wakes parked workers on activity changes
+  std::condition_variable cvDone_; // dispatcher waits here for completion
+  std::atomic<Dispatch *> top_{nullptr};
+  std::atomic<unsigned long long> activity_{0}; // bumped on publish/unpublish
+  unsigned free_[kMaxFrames];                  // free-slot stack, mutex_-guarded
+  unsigned freeCount_ = kMaxFrames;             // guarded by mutex_
+  unsigned active_ = 0;                         // guarded by mutex_
+  bool shutdown_ = false;                      // guarded by mutex_
+  Dispatch frames_[kMaxFrames];
   std::vector<std::thread> workers_;
 };
 
@@ -304,9 +443,10 @@ inline unsigned pyc_threads() {
 }
 
 /// Fork-join parallel for: fn(i) runs exactly once per index on at most
-/// pyc_threads() threads; blocks until complete; nested calls run inline.
-inline void pyc_parallel_for(unsigned count,
-                             const std::function<void(unsigned)> &fn) {
+/// pyc_threads() threads; blocks until complete. Nested calls publish a new
+/// frame and are served by the whole pool.
+template <class F>
+inline void pyc_parallel_for(unsigned count, F &&fn) {
   if (count == 0)
     return;
   detail::ForkJoinPool::instance().run(count, fn);
