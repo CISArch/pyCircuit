@@ -4093,12 +4093,19 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
        << ".commit();\n";
     unsigned lane = 0;
     for (pyc::RegOp r : seqBanked[bankId]) {
-      os << "    if ((_pyc_bank_dirty_" << bankId << "[" << (lane >> 6)
-         << "u] >> " << (lane & 63) << "u) & 1u) {\n";
-      emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt, "      ");
-      os << "    }\n";
+      const std::string word = "_pyc_bank_dirty_" + std::to_string(bankId) +
+                               "[" + std::to_string(lane >> 6) + "u]";
+      // A clean 64-lane dirty word skips all of its per-lane wake checks.
+      if (!(lane & 63))
+        os << (lane ? "    }\n" : "") << "    if (" << word << ") {\n";
+      os << "      if ((" << word << " >> " << (lane & 63) << "u) & 1u) {\n";
+      emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt,
+                             "        ");
+      os << "      }\n";
       ++lane;
     }
+    if (lane)
+      os << "    }\n";
     (void)w;
   }
   for (auto r : phasedRegs) {
