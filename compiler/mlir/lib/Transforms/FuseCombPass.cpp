@@ -18,9 +18,7 @@ using namespace mlir;
 namespace pyc {
 namespace {
 
-static bool isFusableCombOp(Operation *op) {
-  if (shouldKeepStateOptimization(op) || hasStableStateName(op))
-    return false;
+static bool isFusableCombKind(Operation *op) {
   return isa<pyc::ConstantOp,
              pyc::AddOp,
              pyc::SubOp,
@@ -53,10 +51,35 @@ static bool isFusableCombOp(Operation *op) {
              pyc::VGetOp,
              pyc::VCreateOp,
              pyc::VBroadcastOp,
+             pyc::VBroadcastDimOp,
              pyc::VOrReduceOp,
              pyc::VAndReduceOp,
              pyc::VAddReduceOp,
              arith::SelectOp>(op);
+}
+
+static bool isFusableCombOp(Operation *op) {
+  if (shouldKeepStateOptimization(op) || hasStableStateName(op))
+    return false;
+  return isFusableCombKind(op);
+}
+
+// Observation attributes keep a plain combinational op out of a fusable run.
+// Move them onto a leaf alias at the end of the block: the computation then
+// fuses, and probes read the same value through the alias.
+static void detachObservationAttrs(Block &block) {
+  OpBuilder builder(block.getTerminator());
+  llvm::SmallVector<Operation *> pinned;
+  for (Operation &op : block.without_terminator())
+    if (op.getNumResults() == 1 && !isFusableCombOp(&op) &&
+        isFusableCombKind(&op))
+      pinned.push_back(&op);
+  for (Operation *op : pinned) {
+    pyc::AliasOp alias = materializeObservationAlias(
+        builder, op->getLoc(), op->getResult(0), op);
+    for (NamedAttribute attr : alias->getAttrs())
+      op->removeAttr(attr.getName());
+  }
 }
 
 struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncOp>> {
@@ -74,8 +97,10 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       if (v.equals_insensitive("true") || v == "1")
         return;
     }
-    for (Block &b : f.getBody())
+    for (Block &b : f.getBody()) {
+      detachObservationAttrs(b);
       fuseBlock(b);
+    }
   }
 
   void fuseBlock(Block &block) {
