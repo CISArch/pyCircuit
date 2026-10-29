@@ -1,5 +1,5 @@
-// Both wires survive elimination: %next feeds back through a reg and %late is
-// read before its driver is defined.
+// %next feeds back through a reg and survives; %late is read before its driver
+// is defined, so its reader moves after the driver and the wire is eliminated.
 func.func @layout(%clk: !pyc.clock, %rst: !pyc.reset, %a: i1) -> i1 {
   %en = pyc.constant 1 : i1
   %init = pyc.constant 0 : i1
