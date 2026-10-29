@@ -59,12 +59,33 @@ struct EliminateWiresPass : public PassWrapper<EliminateWiresPass, OperationPass
       // Collect wires up-front since we may erase ops during the walk.
       llvm::SmallVector<pyc::WireOp> wires;
       f.walk([&](pyc::WireOp w) { wires.push_back(w); });
-      for (pyc::WireOp w : wires)
-        changed |= tryEliminateWire(w, dom, builder);
+      for (pyc::WireOp w : wires) {
+        FailureOr<bool> eliminated = tryEliminateWire(w, dom, builder);
+        if (failed(eliminated))
+          return signalPassFailure();
+        changed |= *eliminated;
+      }
+    }
+
+    // Continuous assignment is position-independent, so declare every wire
+    // first and drive it last; wires then never split a fusable comb run.
+    for (Block &block : f.getBody()) {
+      llvm::SmallVector<Operation *> wires, assigns;
+      for (Operation &op : block) {
+        if (isa<pyc::WireOp>(op))
+          wires.push_back(&op);
+        else if (isa<pyc::AssignOp>(op))
+          assigns.push_back(&op);
+      }
+      for (Operation *op : llvm::reverse(wires))
+        op->moveBefore(&block.front());
+      for (Operation *op : assigns)
+        op->moveBefore(block.getTerminator());
     }
   }
 
-  bool tryEliminateWire(pyc::WireOp w, DominanceInfo &dom, OpBuilder &builder) {
+  FailureOr<bool> tryEliminateWire(pyc::WireOp w, DominanceInfo &dom,
+                                   OpBuilder &builder) {
     Value wireVal = w.getResult();
 
     llvm::SmallVector<pyc::AssignOp> assigns;
@@ -88,8 +109,13 @@ struct EliminateWiresPass : public PassWrapper<EliminateWiresPass, OperationPass
       return true;
     }
 
-    // Only handle the single-driver case for now.
-    if (assigns.size() != 1)
+    if (assigns.size() > 1) {
+      w.emitError("pyc.wire has ")
+          << assigns.size()
+          << " pyc.assign drivers; a wire must have a single driver";
+      return failure();
+    }
+    if (assigns.empty())
       return false;
 
     pyc::AssignOp driver = assigns.front();
