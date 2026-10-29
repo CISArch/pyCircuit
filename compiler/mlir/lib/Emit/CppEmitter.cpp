@@ -1205,15 +1205,15 @@ static void emitMetadataCombFanout(
   os << indent << "  _pyc_comb_dirty.markWordUnchecked(_pyc_w, _pyc_m);\n";
 }
 
-static bool isDirtyDrivenInput(Value input) {
-  Operation *producer = input.getDefiningOp();
-  return producer && isChangeScheduleNode(producer);
+static bool isDirtyDrivenInput(pyc::CombOp comb, unsigned inputIndex) {
+  auto polled = comb->getAttrOfType<ArrayAttr>(kChangeSchedulePolledInputsAttr);
+  return !polled || llvm::none_of(polled, [&](Attribute index) {
+    return cast<IntegerAttr>(index).getInt() == inputIndex;
+  });
 }
 
 static bool hasDirtyPolledBoundaryInput(pyc::CombOp comb) {
-  return llvm::any_of(comb.getInputs(), [](Value input) {
-    return !isDirtyDrivenInput(input);
-  });
+  return comb->hasAttr(kChangeSchedulePolledInputsAttr);
 }
 
 static void emitCombInputGuard(
@@ -1222,7 +1222,7 @@ static void emitCombInputGuard(
      << "u);\n";
   os << "    bool _pyc_comb_inputs_changed = _pyc_comb_should_eval;\n";
   for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
-    if (isDirtyDrivenInput(input))
+    if (isDirtyDrivenInput(comb, inputIndex))
       continue;
     std::string cacheName = "_pyc_comb_" + std::to_string(idx) + "_input_" +
                             std::to_string(inputIndex);
@@ -1653,7 +1653,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  // Per-comb input snapshots for change-driven evaluation.\n";
     for (auto [index, comb] : llvm::enumerate(combs)) {
       for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
-        if (isDirtyDrivenInput(input))
+        if (isDirtyDrivenInput(comb, inputIndex))
           continue;
         os << "  " << cppType(input.getType()) << " _pyc_comb_" << index
            << "_input_" << inputIndex << "{};\n";

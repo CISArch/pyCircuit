@@ -4,6 +4,7 @@
 #include "pyc/Transforms/CombDepGraph.h"
 #include "pyc/Transforms/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -151,6 +152,55 @@ FailureOr<ChangeSchedulePlan> buildChangeDrivenSchedule(func::FuncOp func) {
     plan.rankCount = std::max(plan.rankCount, node.rank + 1);
     plan.nodes.push_back(std::move(node));
   }
+
+  // A comb input needs polling if a path back from it ends at a non-constant
+  // source no scheduled producer owns (module ports, undriven wires), at a
+  // delay tap (its line wakes fanout only when the tail changes), or crosses a
+  // wire assign placed after the comb: comb passes may run in block order, so
+  // the comb would consume its wake before the wire updates.
+  llvm::DenseMap<Operation *, int64_t> blockOrder;
+  for (Block &block : func.getBody())
+    for (Operation &op : block)
+      blockOrder.try_emplace(&op, blockOrder.size());
+  struct Cone {
+    bool boundary = false;
+    int64_t lastWireDriver = -1;
+  };
+  llvm::DenseMap<unsigned, Cone> cones;
+  auto coneOf = [&](auto &self, unsigned nodeId) -> Cone {
+    if (candidateIndex.count(nodeId))
+      return {};
+    if (auto it = cones.find(nodeId); it != cones.end())
+      return it->second;
+    const CombDepValueNode &node = nodes[nodeId];
+    Cone cone;
+    if (isa_and_nonnull<pyc::DelayTapOp>(node.producer))
+      return cones[nodeId] = Cone{true};
+    cone.boundary = node.incomingEdges.empty() &&
+                    !isa_and_nonnull<pyc::ConstantOp, arith::ConstantOp>(
+                        node.producer);
+    for (unsigned edgeId : node.incomingEdges) {
+      const CombDepEdge &edge = edges[edgeId];
+      Cone source = self(self, edge.source);
+      cone.boundary |= source.boundary;
+      cone.lastWireDriver = std::max(cone.lastWireDriver, source.lastWireDriver);
+      if (edge.kind == CombDepEdgeKind::WireDriver)
+        cone.lastWireDriver =
+            std::max(cone.lastWireDriver, blockOrder.lookup(edge.owner));
+    }
+    return cones[nodeId] = cone;
+  };
+  for (const Candidate &candidate : candidates) {
+    auto comb = dyn_cast<pyc::CombOp>(candidate.operation);
+    if (!comb || candidate.resultIndex != 0)
+      continue;
+    for (auto [index, input] : llvm::enumerate(comb.getInputs())) {
+      auto nodeId = (*graph)->lookupNodeId(input);
+      Cone cone = nodeId ? coneOf(coneOf, *nodeId) : Cone{true};
+      if (cone.boundary || cone.lastWireDriver > blockOrder.lookup(comb))
+        plan.polledInputs[comb].push_back(index);
+    }
+  }
   return plan;
 }
 
@@ -187,6 +237,7 @@ struct ChangeDrivenSchedulePass
         op->removeAttr(kChangeScheduleRankAttr);
         op->removeAttr(kChangeScheduleSlotAttr);
         op->removeAttr(kChangeScheduleFanoutAttr);
+        op->removeAttr(kChangeSchedulePolledInputsAttr);
       });
       func->removeAttr(kChangeScheduleSummaryAttr);
       auto plan = buildChangeDrivenSchedule(func);
@@ -233,6 +284,9 @@ struct ChangeDrivenSchedulePass
           fanouts.push_back(integerArrayAttr(func.getContext(), fanout));
         op->setAttr(kChangeScheduleFanoutAttr, builder.getArrayAttr(fanouts));
       }
+      for (auto &[op, inputs] : plan->polledInputs)
+        op->setAttr(kChangeSchedulePolledInputsAttr,
+                    integerArrayAttr(func.getContext(), inputs));
 
       NamedAttrList summary;
       summary.append("schema", builder.getStringAttr(kChangeScheduleSchema));
