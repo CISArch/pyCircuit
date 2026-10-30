@@ -10,6 +10,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -93,6 +94,64 @@ static void detachObservationAttrs(Block &block) {
   }
 }
 
+static bool isSourceOp(Operation *op) {
+  return isa<pyc::RegOp, pyc::DelayLineOp, pyc::DelayTapOp, pyc::SyncMemOp,
+             pyc::SyncMemDPOp, pyc::CdcSyncOp>(op);
+}
+
+// State outputs are fixed during one eval, so state ops never need to sit
+// between combinational ops.  Lay the block out as constants, wires, then
+// state ops reading combinational values through new wires, keeping every
+// combinational run contiguous.
+static void hoistSources(Block &block) {
+  llvm::SmallVector<Operation *> consts, wires, sources;
+  llvm::DenseSet<Operation *> head;
+  // An operand left in place must be wirable and must not be state itself
+  // (delay_tap requires its delay_line directly).
+  auto hoistable = [&](Operation &op) {
+    return isSourceOp(&op) && llvm::none_of(op.getOperands(), [&](Value v) {
+             Operation *def = v.getDefiningOp();
+             return def && !head.count(def) &&
+                    (isSourceOp(def) || !isa<IntegerType, VectorType>(v.getType()));
+           });
+  };
+  for (Operation &op : block.without_terminator()) {
+    if (isa<pyc::ConstantOp>(op))
+      consts.push_back(&op);
+    else if (isa<pyc::WireOp>(op))
+      wires.push_back(&op);
+    else if (hoistable(op))
+      sources.push_back(&op);
+    else
+      continue;
+    head.insert(&op);
+  }
+  OpBuilder builder(block.getTerminator());
+  llvm::DenseMap<Value, Value> wired;
+  for (Operation *op : sources)
+    for (OpOperand &use : op->getOpOperands()) {
+      Value v = use.get();
+      Operation *def = v.getDefiningOp();
+      if (!def || head.count(def))
+        continue;
+      Value &w = wired[v];
+      if (!w) {
+        w = builder.create<pyc::WireOp>(op->getLoc(), v.getType());
+        builder.create<pyc::AssignOp>(op->getLoc(), w, v);
+        wires.push_back(w.getDefiningOp());
+      }
+      use.set(w);
+    }
+  Operation *prev = nullptr;
+  for (Operation *op : llvm::concat<Operation *>(consts, wires, sources)) {
+    if (prev)
+      op->moveAfter(prev);
+    else
+      op->moveBefore(&block.front());
+    prev = op;
+  }
+}
+
 struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseCombPass)
 
@@ -110,6 +169,7 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     }
     for (Block &b : f.getBody()) {
       detachObservationAttrs(b);
+      hoistSources(b);
       fuseBlock(b);
     }
   }
@@ -118,7 +178,7 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     llvm::SmallVector<Operation *> run;
 
     auto flushRun = [&]() {
-      if (run.empty() || (run.size() == 1 && isa<pyc::ConstantOp>(run.front()))) {
+      if (llvm::all_of(run, [](Operation *op) { return isa<pyc::ConstantOp>(op); })) {
         run.clear();
         return;
       }
@@ -189,13 +249,19 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       return;
 
     // External inputs: operands that are not defined by an op in the run.
+    // Plain constants are cloned in instead, so the body keeps literals.
     llvm::SmallVector<Value> inputs;
     llvm::DenseSet<Value> seenInputs;
+    llvm::SetVector<Operation *> consts;
     for (Operation *op : run) {
       for (Value v : op->getOperands()) {
         if (Operation *def = v.getDefiningOp()) {
           if (runSet.contains(def))
             continue;
+          if (isa<pyc::ConstantOp>(def) && isFusableCombOp(def)) {
+            consts.insert(def);
+            continue;
+          }
         }
         if (seenInputs.insert(v).second)
           inputs.push_back(v);
@@ -222,7 +288,7 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       mapping.map(in, body->getArgument(i));
 
     builder.setInsertionPointToStart(body);
-    for (Operation *op : run) {
+    for (Operation *op : llvm::concat<Operation *const>(consts.getArrayRef(), run)) {
       Operation *cloned = builder.clone(*op, mapping);
       for (auto [oldRes, newRes] : llvm::zip(op->getResults(), cloned->getResults()))
         mapping.map(oldRes, newRes);
