@@ -118,7 +118,7 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
     llvm::SmallVector<Operation *> run;
 
     auto flushRun = [&]() {
-      if (run.size() < 2) {
+      if (run.empty() || (run.size() == 1 && isa<pyc::ConstantOp>(run.front()))) {
         run.clear();
         return;
       }
