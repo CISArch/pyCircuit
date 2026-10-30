@@ -66,15 +66,26 @@ static bool isFusableCombOp(Operation *op) {
 
 // Observation attributes keep a plain combinational op out of a fusable run.
 // Move them onto a leaf alias at the end of the block: the computation then
-// fuses, and probes read the same value through the alias.
+// fuses, and probes read the same value through the alias.  An alias only
+// forwards its source, so its readers take the source directly and the alias
+// itself becomes that leaf, or goes away when it carries no attributes.
 static void detachObservationAttrs(Block &block) {
   OpBuilder builder(block.getTerminator());
   llvm::SmallVector<Operation *> pinned;
   for (Operation &op : block.without_terminator())
-    if (op.getNumResults() == 1 && !isFusableCombOp(&op) &&
-        isFusableCombKind(&op))
+    if (isa<pyc::AliasOp>(op) || (op.getNumResults() == 1 &&
+                                  !isFusableCombOp(&op) &&
+                                  isFusableCombKind(&op)))
       pinned.push_back(&op);
   for (Operation *op : pinned) {
+    if (auto alias = dyn_cast<pyc::AliasOp>(op)) {
+      alias.getResult().replaceAllUsesWith(alias.getIn());
+      if (alias->getAttrs().empty())
+        alias->erase();
+      else
+        alias->moveBefore(block.getTerminator());
+      continue;
+    }
     pyc::AliasOp alias = materializeObservationAlias(
         builder, op->getLoc(), op->getResult(0), op);
     for (NamedAttribute attr : alias->getAttrs())

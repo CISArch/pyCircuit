@@ -17,10 +17,12 @@ import re, sys
 ir = sys.stdin.read()
 combs = ir.count("pyc.comb(")
 body = re.search(r"pyc\.comb\(.*?\n    \}", ir, re.S).group(0)
-if combs != 1 or body.count("pyc.not") != 3 or "v_broadcast_dim" not in body:
+if (combs != 1 or body.count("pyc.not") != 3 or "v_broadcast_dim" not in body
+        or "pyc.alias" in body):
     raise SystemExit(f"fail: run did not fuse into one comb\n{ir}")
-if not re.search(r"pyc\.alias %0#0 \{pyc\.name = \"mid\"\}", ir):
-    raise SystemExit(f"fail: observed name is not a leaf alias\n{ir}")
+leaves = re.findall(r"pyc\.alias %0#\d+ \{pyc\.name = \"(\w+)\"\}", ir)
+if sorted(leaves) != ["fwd", "mid"] or ir.count("pyc.alias") != 2:
+    raise SystemExit(f"fail: names are not leaf aliases\n{ir}")
 '
 
 echo "fuse_comb_observe_smoke: PASS"
