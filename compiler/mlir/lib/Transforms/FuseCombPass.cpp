@@ -176,19 +176,39 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
 
   void fuseBlock(Block &block) {
     llvm::SmallVector<Operation *> run;
+    llvm::DenseSet<Operation *> inRun;
 
     auto flushRun = [&]() {
-      if (llvm::all_of(run, [](Operation *op) { return isa<pyc::ConstantOp>(op); })) {
-        run.clear();
-        return;
-      }
-      fuseRun(run);
+      if (!llvm::all_of(run, [](Operation *op) { return isa<pyc::ConstantOp>(op); }))
+        fuseRun(run);
       run.clear();
+      inRun.clear();
+    };
+
+    // A comb body computes into locals and publishes at the end, so the wire
+    // member it reads still holds the pre-pass value.  An op reading a wire
+    // that an earlier op of the run drives must start a new run, which does
+    // publish that value first.
+    auto readsWireDrivenInRun = [&](Operation *op) {
+      for (Value v : op->getOperands()) {
+        if (!v.getDefiningOp<pyc::WireOp>())
+          continue;
+        for (OpOperand &use : v.getUses()) {
+          auto assign = dyn_cast<pyc::AssignOp>(use.getOwner());
+          if (assign && use.getOperandNumber() == 0 &&
+              inRun.contains(assign.getSrc().getDefiningOp()))
+            return true;
+        }
+      }
+      return false;
     };
 
     for (Operation &op : llvm::make_early_inc_range(block)) {
       if (isFusableCombOp(&op)) {
+        if (readsWireDrivenInRun(&op))
+          flushRun();
         run.push_back(&op);
+        inRun.insert(&op);
         continue;
       }
       flushRun();
