@@ -104,9 +104,12 @@ if grep -q '_pyc_comb_1_input_0' "${state_cpp}"; then
   echo "fail: dirty comb still polls register Q instead of commit fanout" >&2
   exit 1
 fi
-# State-optimize shifts temp numbering, so match the pattern, not reg_4.
-grep -qE '_pyc_commit_changed_pyc_reg_[0-9]+_inst' "${state_cpp}"
-grep -qE 'if \(_pyc_commit_changed_pyc_reg_[0-9]+_inst\)' "${state_cpp}"
+# Register commit wake is table-driven since the FusedLaneWake walk: the
+# reg's q fanout lives in a constexpr table applied on the commit bitmap
+# (fused direct_commit or phased commit), instead of per-lane emitted
+# commit-changed aliases.
+grep -q 'FusedLaneWake<' "${state_cpp}"
+grep -qE '\.apply\(reg_loop_[0-9]+\.(direct_commit|commit)\(\), _pyc_comb_dirty\)' "${state_cpp}"
 grep -q '_pyc_comb_dirty.markWordUnchecked' "${state_cpp}"
 "${CXX}" -std=c++17 -O0 \
   -I"${state_dir}" -I"${ROOT}/.pycircuit_out/toolchain/install/include" \

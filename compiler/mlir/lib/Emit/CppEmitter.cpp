@@ -1215,6 +1215,30 @@ static void emitMetadataCombFanout(
   os << indent << "  _pyc_comb_dirty.markWordUnchecked(_pyc_w, _pyc_m);\n";
 }
 
+// Emit one constexpr pyc::cpp::FusedLaneWake table named `name` (per-lane
+// prefix offsets into `entries`) for a table-driven set-bit wake walk. Used
+// by the fused direct_commit walk and the phased commit() walk.
+static void emitFusedLaneWake(
+    llvm::raw_ostream &os, llvm::StringRef name,
+    const llvm::SmallVectorImpl<unsigned> &offsets,
+    const llvm::SmallVectorImpl<std::pair<unsigned, uint64_t>> &entries,
+    llvm::StringRef indent) {
+  os << indent << "static constexpr pyc::cpp::FusedLaneWake<"
+     << offsets.size() - 1 << ", " << entries.size() << "> " << name
+     << "{{{";
+  llvm::interleaveComma(offsets, os, [&](unsigned o) { os << o << "u"; });
+  if (entries.empty()) {
+    // std::array<T, 0> initializes from {} — no element braces.
+    os << "}},{{}}};\n";
+  } else {
+    os << "}},{{";
+    llvm::interleaveComma(entries, os, [&](const auto &e) {
+      os << "{" << e.first << "u, 0x" << llvm::utohexstr(e.second) << "ull}";
+    });
+    os << "}}};\n";
+  }
+}
+
 static bool isDirtyDrivenInput(Value input) {
   Operation *producer = input.getDefiningOp();
   return producer && isChangeScheduleNode(producer);
@@ -4302,22 +4326,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       }
       wakeOffsets.push_back(wakeEntries.size());
       std::string wake = "_pyc_fused_wake_" + loop;
-      os << "      static constexpr pyc::cpp::FusedLaneWake<"
-         << wakeOffsets.size() - 1 << ", " << wakeEntries.size() << "> "
-         << wake << "{{{";
-      llvm::interleaveComma(wakeOffsets, os,
-                            [&](unsigned o) { os << o << "u"; });
-      if (wakeEntries.empty()) {
-        // std::array<T, 0> initializes from {} — no element braces.
-        os << "}},{{}}};\n";
-      } else {
-        os << "}},{{";
-        llvm::interleaveComma(wakeEntries, os, [&](const auto &e) {
-          os << "{" << e.first << "u, 0x" << llvm::utohexstr(e.second)
-             << "ull}";
-        });
-        os << "}}};\n";
-      }
+      emitFusedLaneWake(os, wake, wakeOffsets, wakeEntries, "      ");
       os << "      " << wake << ".apply(" << loop
          << ".direct_commit(), _pyc_comb_dirty);\n";
     }
@@ -4393,30 +4402,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   for (int64_t loopId : fusedRegLoopIds)
     os << "    reg_loop_" << loopId << ".retire();\n";
   // RegLoop commit: per-lane dirty bitmap keeps the change-driven wake as
-  // precise as the per-reg path.
+  // precise as the per-reg path. The wake itself is table-driven (same
+  // FusedLaneWake shape as the fused walk): commit()'s bitmap feeds one
+  // set-bit iteration over constexpr fanout tables, replacing the per-lane
+  // emitted dirty tests and word guards.
   for (int64_t loopId : phasedRegLoopIds) {
     std::string loop = "reg_loop_" + std::to_string(loopId);
-    os << "    const auto &_pyc_loop_dirty_" << loopId << " = " << loop
-       << ".commit();\n";
-    unsigned lane = 0;
+    llvm::SmallVector<unsigned> wakeOffsets;
+    llvm::SmallVector<std::pair<unsigned, uint64_t>> wakeEntries;
     for (pyc::RegOp r : regLoopRegs[loopId]) {
-      // Named per-lane commit-changed alias keeps the comb-dirty smoke
-      // assertions meaningful under the loop lowering (same pattern as the
-      // per-reg path); the condition is unchanged.
-      std::string changed =
-          "_pyc_commit_changed_" + nt.get(r.getQ()) + "_inst";
-      const std::string word = "_pyc_loop_dirty_" + std::to_string(loopId) +
-                               "[" + std::to_string(lane >> 6) + "u]";
-      openLaneWord(lane, word);
-      os << "      const bool " << changed << " = ((" << word << " >> "
-         << (lane & 63) << "u) & 1u);\n";
-      os << "      if (" << changed << ") {\n";
-      emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt, "        ");
-      os << "      }\n";
-      ++lane;
+      wakeOffsets.push_back(wakeEntries.size());
+      collectFanoutWordMasks(r.getQ(), *schedule, combIndex, wakeEntries);
     }
-    if (lane)
-      os << "    }\n";
+    wakeOffsets.push_back(wakeEntries.size());
+    std::string wake = "_pyc_commit_wake_" + loop;
+    emitFusedLaneWake(os, wake, wakeOffsets, wakeEntries, "    ");
+    os << "    " << wake << ".apply(" << loop
+       << ".commit(), _pyc_comb_dirty);\n";
   }
   for (auto r : regs) {
     std::string key = nt.get(r.getQ()) + "_inst";
