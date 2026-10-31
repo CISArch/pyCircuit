@@ -86,7 +86,7 @@ struct CppEmitterOptions {
   /// and the walk was provably a no-op. Sub-module recursion and clocked
   /// fifo/mem/cdc primitives keep their unconditional tick_commit: they
   /// maintain their own edge state. Off by default for A/B.
-  bool fallCommitGate = false;
+  bool fallCommitGate = true;
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,
