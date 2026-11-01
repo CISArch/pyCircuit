@@ -1443,25 +1443,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << "\n";
 
-  // Internal wires for op results (including inside pyc.comb regions).
-  struct Decl {
-    std::string name;
-    Type ty;
-  };
-  std::vector<Decl> decls;
-  decls.reserve(256);
-  f.walk([&](Operation *op) {
-    for (Value r : op->getResults()) {
-      if (getValueCppStorage(r) != CppStorageKind::Struct)
-        continue;
-      decls.push_back(Decl{nt.get(r), r.getType()});
-    }
-  });
-  std::sort(decls.begin(), decls.end(), [](const Decl &a, const Decl &b) { return a.name < b.name; });
-  for (const Decl &d : decls)
-    os << "  " << cppType(d.ty) << " " << d.name << "{};\n";
-  os << "\n";
-
   // Sequential primitive instances.
   llvm::SmallVector<pyc::RegOp> regs;
   llvm::SmallVector<pyc::DelayLineOp> delayLines;
@@ -1645,6 +1626,38 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   delayLines.clear();
   for (pyc::DelayLineOp dl : unloopedDelays)
     delayLines.push_back(dl);
+
+  // Internal wires for op results (including inside pyc.comb regions).
+  // Looped regs first: their q storage lives in the RegLoop's contiguous
+  // qStore_, so remap the name table onto qRef(lane) and skip declaring a
+  // standalone member — every later reference (comb bodies, wake tables,
+  // probes, trace) emits the qRef expression and reads the store directly.
+  llvm::DenseSet<Value> loopStoredQ;
+  for (auto &kv : regLoopRegs)
+    for (auto [lane, r] : llvm::enumerate(kv.second)) {
+      loopStoredQ.insert(r.getQ());
+      nt.names[r.getQ()] = "reg_loop_" + std::to_string(kv.first) +
+                           ".qRef(" + std::to_string(lane) + "u)";
+    }
+  struct Decl {
+    std::string name;
+    Type ty;
+  };
+  std::vector<Decl> decls;
+  decls.reserve(256);
+  f.walk([&](Operation *op) {
+    for (Value r : op->getResults()) {
+      if (getValueCppStorage(r) != CppStorageKind::Struct)
+        continue;
+      if (loopStoredQ.contains(r))
+        continue;
+      decls.push_back(Decl{nt.get(r), r.getType()});
+    }
+  });
+  std::sort(decls.begin(), decls.end(), [](const Decl &a, const Decl &b) { return a.name < b.name; });
+  for (const Decl &d : decls)
+    os << "  " << cppType(d.ty) << " " << d.name << "{};\n";
+  os << "\n";
 
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
   // DelayLoop-aware binding text: {inst, pending, qNext}. inst is empty when
@@ -2777,6 +2790,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
        << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
   }
+  for (int64_t loopId : regLoopIds)
+    os << "    reg_loop_" << loopId << ".reserve("
+       << regLoopRegs[loopId].size() << "u);\n";
   for (int64_t loopId : regLoopIds) {
     os << "    reg_loop_" << loopId << ".add_lanes({";
     bool firstLane = true;
@@ -2784,7 +2800,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       if (!firstLane)
         os << ", ";
       firstLane = false;
-      os << "{&" << nt.get(r.getQ()) << ", &" << nt.get(r.getNext()) << ", &"
+      // q storage is loop-owned (qStore_); lane.q is unused (nullptr).
+      os << "{nullptr, &" << nt.get(r.getNext()) << ", &"
          << nt.get(r.getRst()) << ", &" << nt.get(r.getEn()) << ", &"
          << nt.get(r.getInit()) << "}";
     }
