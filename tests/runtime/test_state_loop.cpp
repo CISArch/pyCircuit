@@ -33,8 +33,7 @@ int main() {
   std::mt19937_64 rng(12345);
   Wire<1> clk{0}, rst{0}, en{1};
 
-  std::vector<Wire<8>> rd(kRegLanes), rinit(kRegLanes), rqRef(kRegLanes),
-      rqLoop(kRegLanes), rqFused(kRegLanes), rqMix(kRegLanes);
+  std::vector<Wire<8>> rd(kRegLanes), rinit(kRegLanes), rqRef(kRegLanes);
   std::vector<pyc_reg<8>> regRef;
   regRef.reserve(kRegLanes);
   RegLoop<8> regLoop, fusedLoop;  // fusedLoop: tick-fuse single-phase lanes
@@ -46,10 +45,10 @@ int main() {
     rd[i] = Wire<8>{i * 7 + 3};
     rinit[i] = Wire<8>{i + 1};
     regRef.emplace_back(clk, rst, en, rd[i], rinit[i], rqRef[i]);
-    regLoop.add_lanes({{&rqLoop[i], &rd[i], &rst, &en, &rinit[i]}});
-    fusedLoop.add_lanes({{&rqFused[i], &rd[i], &rst, &en, &rinit[i]}});
+    regLoop.add_lanes({{nullptr, &rd[i], &rst, &en, &rinit[i]}});
+    fusedLoop.add_lanes({{nullptr, &rd[i], &rst, &en, &rinit[i]}});
     mixedLoop.add_lanes(
-        {{&rqMix[i], &rd[i], &rst, (i & 1) ? &en2 : &en, &rinit[i]}});
+        {{nullptr, &rd[i], &rst, (i & 1) ? &en2 : &en, &rinit[i]}});
   }
 
   std::vector<Wire<8>> dd(kDelayLanes), dinit(kDelayLanes), dqRef(kDelayLanes),
@@ -125,18 +124,18 @@ int main() {
         return 1;
       }
       if (bit(fusedDirty, i) != changed ||
-          rqFused[i].value() != rqRef[i].value()) {
+          fusedLoop.qRef(i).value() != rqRef[i].value()) {
         std::fprintf(stderr, "FUSED MISMATCH cycle %u lane %u\n", c, i);
         return 1;
       }
       if (bit(mixDirty, i) != changed ||
-          rqMix[i].value() != rqRef[i].value()) {
+          mixedLoop.qRef(i).value() != rqRef[i].value()) {
         std::fprintf(stderr, "NON-UNIFORM CTRL MISMATCH cycle %u lane %u\n",
                      c, i);
         return 1;
       }
       ref.mix(rqRef[i].value() + i);
-      loop.mix(rqLoop[i].value() + i);
+      loop.mix(regLoop.qRef(i).value() + i);
     }
     for (unsigned i = 0; i < kDelayLanes; ++i) {
       const bool pending = delayRef[i].has_pending();
