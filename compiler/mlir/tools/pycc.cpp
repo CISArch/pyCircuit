@@ -1161,6 +1161,7 @@ static LogicalResult emitPrimitivesFile(llvm::StringRef outPath, llvm::StringRef
       "pyc_byte_mem.v",
       "pyc_sync_mem.v",
       "pyc_sync_mem_dp.v",
+      "pyc_sync_mem_2w.v",
       "pyc_async_fifo.v",
       "pyc_cdc_sync.v",
   };
