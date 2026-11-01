@@ -384,6 +384,28 @@ def PYC_SyncMemDPOp : PYC_Op<"sync_mem_dp", [MemoryEffects<[MemRead, MemWrite]>,
   let assemblyFormat = "$clk `,` $rst `,` $ren0 `,` $raddr0 `,` $ren1 `,` $raddr1 `,` $wvalid `,` $waddr `,` $wdata `,` $wstrb attr-dict `:` type($raddr0) `,` type($rdata0) `,` type($wstrb)";
 }
 
+def PYC_SyncMem2WOp : PYC_Op<"sync_mem_2w", [MemoryEffects<[MemRead, MemWrite]>,
+                                              AllTypesMatch<["raddr", "waddr0", "waddr1"]>,
+                                              AllTypesMatch<["wdata0", "wdata1", "rdata"]>,
+                                              AllTypesMatch<["wstrb0", "wstrb1"]>]> {
+  let summary = "Synchronous 1R2W memory (dual-write, registered output; write port 1 wins same-address conflicts, prototype)";
+  let arguments = (ins PYC_ClockType:$clk,
+                        PYC_ResetType:$rst,
+                        I1:$ren,
+                        AnyInteger:$raddr,
+                        I1:$wvalid0,
+                        AnyInteger:$waddr0,
+                        AnyInteger:$wdata0,
+                        AnyInteger:$wstrb0,
+                        I1:$wvalid1,
+                        AnyInteger:$waddr1,
+                        AnyInteger:$wdata1,
+                        AnyInteger:$wstrb1);
+  let results = (outs AnyInteger:$rdata);
+  let hasVerifier = 1;
+  let assemblyFormat = "$clk `,` $rst `,` $ren `,` $raddr `,` $wvalid0 `,` $waddr0 `,` $wdata0 `,` $wstrb0 `,` $wvalid1 `,` $waddr1 `,` $wdata1 `,` $wstrb1 attr-dict `:` type($raddr) `,` type($rdata) `,` type($wstrb0)";
+}
+
 def PYC_AsyncFifoOp : PYC_Op<"async_fifo", [MemoryEffects<[MemRead, MemWrite]>, AllTypesMatch<["in_data", "out_data"]>]> {
   let summary = "Ready/valid async FIFO (dual-clock, strict handshake, prototype)";
   let arguments = (ins PYC_ClockType:$in_clk,

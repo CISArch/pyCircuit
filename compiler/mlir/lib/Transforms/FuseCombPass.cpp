@@ -99,7 +99,7 @@ static void detachObservationAttrs(Block &block) {
 
 static bool isSourceOp(Operation *op) {
   return isa<pyc::RegOp, pyc::DelayLineOp, pyc::DelayTapOp, pyc::SyncMemOp,
-             pyc::SyncMemDPOp, pyc::CdcSyncOp>(op);
+             pyc::SyncMemDPOp, pyc::SyncMem2WOp, pyc::CdcSyncOp>(op);
 }
 
 // State outputs are fixed during one eval, so state ops never need to sit

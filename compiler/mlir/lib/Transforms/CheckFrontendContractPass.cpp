@@ -359,6 +359,8 @@ public:
             opKind = "sync_mem";
           else if (isa<pyc::SyncMemDPOp>(op))
             opKind = "sync_mem_dp";
+          else if (isa<pyc::SyncMem2WOp>(op))
+            opKind = "sync_mem_2w";
           else
             return;
 
