@@ -114,9 +114,11 @@ public:
 
   // Applies pending updates, writes back through the lane's q pointer, and
   // returns the per-lane dirty bitmap (bit i set == lane i's q changed).
-  const std::vector<std::uint64_t> &commit() {
+  // The returned bitmap is consumed (and cleared) by FusedLaneWake::apply,
+  // so no upfront memset: the only reader in generated code clears as it
+  // walks, and add_lanes zero-initializes once.
+  std::vector<std::uint64_t> &commit() {
     const std::size_t n = qStore_.size();
-    dirty_.assign(loop_word_count(n), 0);
     for (std::size_t i = 0; i < n; ++i) {
       if (__builtin_expect(pending_[i] != 0, 0)) {
         Wire<Width> &q = qStore_[i];
@@ -136,10 +138,10 @@ public:
   // after a rising edge; such a loop never uses compute_rise()/commit().
   // pending/qNext are still recorded so write-intent probes see the update;
   // retire() clears pending at the point where commit() would have.
-  const std::vector<std::uint64_t> &direct_commit() {
+  // Consumed (and cleared) by FusedLaneWake::apply — see commit().
+  std::vector<std::uint64_t> &direct_commit() {
     const std::size_t n = qStore_.size();
     clkPrev_ = true;
-    dirty_.assign(loop_word_count(n), 0);
     if (sharedCtrl_) {
       // Uniform rst/en: one read replaces two dependent loads per lane; a
       // disabled edge skips the whole lane walk (qNext keeps its last value,
@@ -182,6 +184,10 @@ public:
 
   // Fused loops: the commit() counterpart for pending bookkeeping only.
   void retire() { clear_pending(); }
+
+  // Diagnostic/helper reset of the consumed-in-place dirty bitmap; generated
+  // code never calls this (FusedLaneWake::apply clears as it consumes).
+  void clearDirty() { dirty_.assign(loop_word_count(qStore_.size()), 0); }
 
   // Probe/trace write-intent bindings: stable addresses for lane i's pending
   // flag and sampled next value (mirror pyc_reg::pending/qNext). pending_
