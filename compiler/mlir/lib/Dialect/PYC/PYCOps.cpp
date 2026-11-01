@@ -1257,8 +1257,8 @@ LogicalResult SyncMemNMOp::verify() {
     return emitOpError("requires integer attributes `rd_ports`/`wr_ports`");
   int64_t R = rdAttr.getValue().getSExtValue();
   int64_t W = wrAttr.getValue().getSExtValue();
-  if (R <= 0 || R > 32)
-    return emitOpError("rd_ports must be in 1..32");
+  if (R <= 0 || R > 64)
+    return emitOpError("rd_ports must be in 1..64");
   if (W <= 0)
     return emitOpError("wr_ports must be > 0");
   if ((int64_t)getRens().size() != R || (int64_t)getRaddrs().size() != R)

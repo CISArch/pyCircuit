@@ -807,10 +807,10 @@ class pyc_sync_mem_nm {
 public:
   static_assert(DataWidth > 0, "pyc_sync_mem_nm requires DataWidth > 0");
   static_assert(DepthEntries > 0, "pyc_sync_mem_nm DepthEntries must be > 0");
-  static_assert(RPorts > 0 && RPorts <= 32, "pyc_sync_mem_nm RPorts in 1..32");
+  static_assert(RPorts > 0 && RPorts <= 64, "pyc_sync_mem_nm RPorts in 1..64");
   static_assert(WPorts > 0, "pyc_sync_mem_nm WPorts must be > 0");
   static constexpr unsigned StrbWidth = (DataWidth + 7) / 8;
-  using change_mask_t = std::uint32_t;
+  using change_mask_t = std::uint64_t;
 
   pyc_sync_mem_nm(Wire<1> &clk,
                   Wire<1> &rst,
