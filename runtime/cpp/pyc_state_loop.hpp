@@ -43,49 +43,54 @@ public:
   using Lane = RegLoopLane<Width>;
 
   // Bulk form used by generated code: add_lanes({a,b,c,d,e}, {f,g,h,i,j}).
+  // Lane pointers are stored structure-of-arrays: the hot sampling loops
+  // stream q/d/init (and rst/en on non-uniform loops) as contiguous pointer
+  // arrays instead of chasing 40-byte interleaved lane structs.
   void add_lanes(std::initializer_list<Lane> lanes) {
     for (const Lane &lane : lanes) {
-      if (!lanes_.empty() && (lane.rst != lanes_.front().rst ||
-                              lane.en != lanes_.front().en))
+      if (!q_.empty() && (lane.rst != rst_[0] || lane.en != en_[0]))
         sharedCtrl_ = false;
-      lanes_.push_back(lane);
+      q_.push_back(lane.q);
+      d_.push_back(lane.d);
+      rst_.push_back(lane.rst);
+      en_.push_back(lane.en);
+      init_.push_back(lane.init);
       qNext_.emplace_back();
       pending_.push_back(0);
     }
-    dirty_.assign(loop_word_count(lanes_.size()), 0);
+    dirty_.assign(loop_word_count(q_.size()), 0);
   }
 
-  std::size_t size() const { return lanes_.size(); }
+  std::size_t size() const { return q_.size(); }
 
   // Caller guarantees a 0->1 edge just occurred on this loop's clock.
   void compute_rise() {
     clkPrev_ = true;
-    const std::size_t n = lanes_.size();
+    const std::size_t n = q_.size();
     if (sharedCtrl_) {
       // Every lane samples the same rst/en wires; read them once instead of
       // two dependent pointer chases per lane (all DavinciTop loops are
       // uniform). qNext stays written for every lane, as in the generic path.
-      const bool r = lanes_[0].rst->toBool();
-      const bool e = lanes_[0].en->toBool();
+      const bool r = rst_[0]->toBool();
+      const bool e = en_[0]->toBool();
       const bool go = r | e;
       for (std::size_t i = 0; i < n; ++i) {
         pending_[i] = static_cast<char>(go);
         if (r)
-          qNext_[i] = *lanes_[i].init;
+          qNext_[i] = *init_[i];
         else
-          qNext_[i] = *lanes_[i].d;
+          qNext_[i] = *d_[i];
       }
       return;
     }
     for (std::size_t i = 0; i < n; ++i) {
-      const Lane &lane = lanes_[i];
-      const bool r = lane.rst->toBool();
-      const bool e = lane.en->toBool();
+      const bool r = rst_[i]->toBool();
+      const bool e = en_[i]->toBool();
       pending_[i] = static_cast<char>(r | e);
       if (r)
-        qNext_[i] = *lane.init;
+        qNext_[i] = *init_[i];
       else
-        qNext_[i] = *lane.d;
+        qNext_[i] = *d_[i];
     }
   }
 
@@ -106,11 +111,11 @@ public:
   // Applies pending updates, writes back through the lane's q pointer, and
   // returns the per-lane dirty bitmap (bit i set == lane i's q changed).
   const std::vector<std::uint64_t> &commit() {
-    const std::size_t n = lanes_.size();
+    const std::size_t n = q_.size();
     dirty_.assign(loop_word_count(n), 0);
     for (std::size_t i = 0; i < n; ++i) {
       if (__builtin_expect(pending_[i] != 0, 0)) {
-        Wire<Width> &q = *lanes_[i].q;
+        Wire<Width> &q = *q_[i];
         const bool changed = q != qNext_[i];
         q = qNext_[i];
         pending_[i] = 0;
@@ -128,21 +133,21 @@ public:
   // pending/qNext are still recorded so write-intent probes see the update;
   // retire() clears pending at the point where commit() would have.
   const std::vector<std::uint64_t> &direct_commit() {
-    const std::size_t n = lanes_.size();
+    const std::size_t n = q_.size();
     clkPrev_ = true;
     dirty_.assign(loop_word_count(n), 0);
     if (sharedCtrl_) {
       // Uniform rst/en: one read replaces two dependent loads per lane; a
       // disabled edge skips the whole lane walk (qNext keeps its last value,
       // exactly as the generic path's `continue`).
-      const bool r = lanes_[0].rst->toBool();
-      const bool go = r | lanes_[0].en->toBool();
+      const bool r = rst_[0]->toBool();
+      const bool go = r | en_[0]->toBool();
       if (go) {
         for (std::size_t i = 0; i < n; ++i) {
           pending_[i] = 1;
-          const Wire<Width> &nxt = r ? *lanes_[i].init : *lanes_[i].d;
+          const Wire<Width> &nxt = r ? *init_[i] : *d_[i];
           qNext_[i] = nxt;
-          Wire<Width> &q = *lanes_[i].q;
+          Wire<Width> &q = *q_[i];
           if (q != nxt) {
             q = nxt;
             dirty_[i >> 6] |= std::uint64_t{1} << (i & 63);
@@ -155,15 +160,14 @@ public:
       return dirty_;
     }
     for (std::size_t i = 0; i < n; ++i) {
-      const Lane &lane = lanes_[i];
-      const bool r = lane.rst->toBool();
-      const bool go = r | lane.en->toBool();
+      const bool r = rst_[i]->toBool();
+      const bool go = r | en_[i]->toBool();
       pending_[i] = static_cast<char>(go);
       if (!go)
         continue;
-      const Wire<Width> &nxt = r ? *lane.init : *lane.d;
+      const Wire<Width> &nxt = r ? *init_[i] : *d_[i];
       qNext_[i] = nxt;
-      Wire<Width> &q = *lane.q;
+      Wire<Width> &q = *q_[i];
       if (q != nxt) {
         q = nxt;
         dirty_[i >> 6] |= std::uint64_t{1} << (i & 63);
@@ -185,9 +189,12 @@ public:
   Wire<Width> *lane_qnext(std::size_t i) { return &qNext_[i]; }
 
 private:
-  void clear_pending() { pending_.assign(lanes_.size(), 0); }
+  void clear_pending() { pending_.assign(q_.size(), 0); }
 
-  std::vector<Lane> lanes_;
+  // Lane pointers in structure-of-arrays layout (see add_lanes).
+  std::vector<Wire<Width> *> q_, d_;
+  std::vector<Wire<1> *> rst_, en_;
+  std::vector<const Wire<Width> *> init_;
   std::vector<Wire<Width>> qNext_;
   std::vector<char> pending_;  // char (not vector<bool>): stable lane addresses
   std::vector<std::uint64_t> dirty_;
