@@ -4,13 +4,13 @@
 #include <cstdint>
 #include <iostream>
 
-// Independent model of `q' = a & b` (enable is constant 1), `out = q ^ a`.
-// Checked after the rising edge, matching the generated C++ step order:
-// reset loads the init, otherwise q becomes this cycle's a & b, then out
-// is computed from that q.
+// Independent model of the stage-gap + parallel-copy circuit:
+//   q1' = a & b, q2' = q1, qc' = a, out = q1 ^ q2 ^ qc  (enable constant 1,
+//   init 0; reset loads the init). Checked after the rising edge, matching
+// the generated C++ step order.
 int main() {
-  pyc::gen::hoist_upstream_model model;
-  std::uint8_t q = 0;
+  pyc::gen::fork_merge_model model;
+  std::uint8_t q1 = 0, q2 = 0, qc = 0;
   std::uint64_t checksum = 0;
   constexpr unsigned kCycles = 64;
   for (unsigned cycle = 0; cycle < kCycles; ++cycle) {
@@ -25,11 +25,18 @@ int main() {
     model.clk = pyc::cpp::Wire<1>(1);
     model.step();
 
-    if (reset)
-      q = 0;
-    else
-      q = static_cast<std::uint8_t>(a & b);
-    const auto expected = static_cast<std::uint8_t>(q ^ a);
+    if (reset) {
+      q1 = 0;
+      q2 = 0;
+      qc = 0;
+    } else {
+      const std::uint8_t nextQ1 = static_cast<std::uint8_t>(a & b);
+      q2 = q1;
+      qc = a;
+      q1 = nextQ1;
+    }
+    const auto expected =
+        static_cast<std::uint8_t>(q1 ^ q2 ^ qc);
     assert(model.out.value() == expected);
     checksum = checksum * 131u + expected;
   }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Gate for upstream register hoisting: FileCheck on the rewrite, then a
-# generated C++ model checked against an independent cycle model.
+# Gate for fork-merge retiming: FileCheck on the rewrite, then a generated
+# C++ model checked against an independent cycle model.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -26,22 +26,22 @@ if [[ -z "${FILECHECK_BIN}" || ! -x "${FILECHECK_BIN}" ]]; then
   exit 1
 fi
 
-TMP_DIR="$(mktemp -d /tmp/pyc-reg-upstream.XXXXXX)"
+TMP_DIR="$(mktemp -d /tmp/pyc-fork-merge.XXXXXX)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
-"${PYC_OPT}" "${TEST}/reg_upstream_hoist.mlir" \
-  --pass-pipeline='builtin.module(func.func(pyc-hoist-regs-upstream))' \
-  -o "${TMP_DIR}/hoisted.mlir"
-"${FILECHECK_BIN}" "${TEST}/reg_upstream_hoist.mlir" \
-  --input-file="${TMP_DIR}/hoisted.mlir"
+"${PYC_OPT}" "${TEST}/fork_merge_retime.mlir" \
+  --pass-pipeline='builtin.module(func.func(pyc-fork-merge-retime))' \
+  -o "${TMP_DIR}/merged.mlir"
+"${FILECHECK_BIN}" "${TEST}/fork_merge_retime.mlir" \
+  --input-file="${TMP_DIR}/merged.mlir"
 
-"${PYCC}" "${TEST}/reg_upstream_hoist_model.mlir" --emit=cpp \
+"${PYCC}" "${TEST}/fork_merge_retime_model.mlir" --emit=cpp \
   -o "${TMP_DIR}/model.hpp"
 "${CXX}" -std=c++17 -O2 -I"${ROOT}/runtime" \
   -DMODEL_HEADER="\"${TMP_DIR}/model.hpp\"" \
-  "${TEST}/reg_upstream_hoist_model.cpp" \
+  "${TEST}/fork_merge_retime_model.cpp" \
   -o "${TMP_DIR}/model"
 "${TMP_DIR}/model" >"${TMP_DIR}/model.out"
 grep -q '^cycles=64 checksum=' "${TMP_DIR}/model.out"
 
-echo "reg_upstream_hoist_smoke: PASS"
+echo "fork_merge_retime_smoke: PASS"
