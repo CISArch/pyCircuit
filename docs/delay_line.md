@@ -21,8 +21,11 @@ frontend 为平衡周期插入的 `_v5_bal_*` 串行寄存器链，在 C++ model
 
 ## 3. `pyc-state-optimize` 流程（仅 `--emit=cpp`）
 
-`pyc-eliminate-dead-state` → `pyc-retime-pipelines` → canonicalize+CSE（pass 内）→
-`pyc-eliminate-dead-state` → `pyc-combine-delay-chains`（成链 + 等价 history 共享）。
+`pyc-eliminate-dead-state` → `pyc-hoist-regs-upstream` → `pyc-retime-pipelines` →
+canonicalize+CSE（pass 内）→ `pyc-eliminate-dead-state` →
+`pyc-combine-delay-chains`（成链 + 等价 history 共享）。
+
+- **寄存器上移**：把寄存器跨过生产 `next` 的那一个组合操作，使该操作落到 `q` 的下游。多输入操作为每个非常量输入放一个寄存器（位数可以增加）。初值无解、自环、或输出侧没有组合用户时跳过。
 
 - **成链**：`consumer.next` 只经透明 alias 到达前驱 `q`，且 clk/rst/en/init 等价；
   中间级允许只读 fanout，改写成 `delay_tap`。

@@ -4343,6 +4343,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     // replacing one emitted branch per lane with a shared tiny loop; the
     // per-lane fanout (comb word, OR mask) pairs live in constexpr rodata.
     os << "    if (_pyc_fused_rise) {\n";
+    // A fused loop still type-checks apply() against a dirty bitset when the
+    // module has no comb. Declare a local one; the wake table is empty.
+    if (combs.empty())
+      os << "      pyc::cpp::DirtyBitset<1> _pyc_comb_dirty{};\n";
     for (int64_t loopId : fusedRegLoopIds) {
       std::string loop = "reg_loop_" + std::to_string(loopId);
       llvm::SmallVector<unsigned> wakeOffsets;
@@ -4441,6 +4445,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // FusedLaneWake shape as the fused walk): commit()'s bitmap feeds one
   // set-bit iteration over constexpr fanout tables, replacing the per-lane
   // emitted dirty tests and word guards.
+  if (combs.empty() && !phasedRegLoopIds.empty())
+    os << "    pyc::cpp::DirtyBitset<1> _pyc_comb_dirty{};\n";
   for (int64_t loopId : phasedRegLoopIds) {
     std::string loop = "reg_loop_" + std::to_string(loopId);
     llvm::SmallVector<unsigned> wakeOffsets;
