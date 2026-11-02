@@ -28,7 +28,7 @@ static bool isIntType(Type t) { return isa<IntegerType>(t); }
 
 static bool isSequentialCut(Operation *op) {
   return isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp,
-             pyc::SyncMemDPOp, pyc::SyncMem2WOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(op);
+             pyc::SyncMemDPOp, pyc::SyncMem2WOp, pyc::SyncMemNMOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(op);
 }
 
 struct FuncClockSummary {
@@ -201,6 +201,12 @@ public:
           return out;
         }
         if (auto m = dyn_cast<pyc::SyncMem2WOp>(def)) {
+          out = domOfClock(m.getClk());
+          domVisiting_.erase(v);
+          domMemo_.try_emplace(v, out);
+          return out;
+        }
+        if (auto m = dyn_cast<pyc::SyncMemNMOp>(def)) {
           out = domOfClock(m.getClk());
           domVisiting_.erase(v);
           domMemo_.try_emplace(v, out);
@@ -615,6 +621,17 @@ public:
         checkSampled(op,
                      m.getClk(),
                      {m.getRen(), m.getRaddr(), m.getWvalid0(), m.getWaddr0(), m.getWdata0(), m.getWstrb0(), m.getWvalid1(), m.getWaddr1(), m.getWdata1(), m.getWstrb1()});
+        return;
+      }
+      if (auto m = dyn_cast<pyc::SyncMemNMOp>(op)) {
+        SmallVector<Value, 32> sampled;
+        sampled.append(m.getRens().begin(), m.getRens().end());
+        sampled.append(m.getRaddrs().begin(), m.getRaddrs().end());
+        sampled.append(m.getWvalids().begin(), m.getWvalids().end());
+        sampled.append(m.getWaddrs().begin(), m.getWaddrs().end());
+        sampled.append(m.getWdatas().begin(), m.getWdatas().end());
+        sampled.append(m.getWstrbs().begin(), m.getWstrbs().end());
+        checkSampled(op, m.getClk(), sampled);
         return;
       }
       if (auto m = dyn_cast<pyc::ByteMemOp>(op)) {

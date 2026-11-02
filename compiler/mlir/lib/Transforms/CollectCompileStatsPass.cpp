@@ -103,6 +103,10 @@ public:
         addMem(m.getRdata().getType());
         return;
       }
+      if (auto m = dyn_cast<pyc::SyncMemNMOp>(op)) {
+        addMem(m.getRdatas()[0].getType());
+        return;
+      }
     });
 
     auto *ctx = f.getContext();
