@@ -368,6 +368,14 @@ private:
     Value prev = base;
     for (unsigned k = 1; k <= delay; ++k) {
       const StageSem &stage = sig[sig.size() - k];
+      // The stage semantics come from a register that delayed this exact
+      // value on the original path, so its init must be as wide as the
+      // chain level. A width mismatch means the delay crossed a
+      // width-changing op (zext/trunc/concat/extract); inheriting the init
+      // there is not sound, so skip the whole chain.
+      auto prevWidth = scalarWidth(prev.getType());
+      if (!prevWidth || stage.init.getBitWidth() != *prevWidth)
+        return std::nullopt;
       std::pair<Value, unsigned> mapKey{prev, internStage(stage)};
       auto found = chainLevel.find(mapKey);
       if (found != chainLevel.end()) {
@@ -381,8 +389,7 @@ private:
           if (!after || after->isBeforeInBlock(def))
             after = def;
       setBuilderAfter(builder, after);
-      Type initType = IntegerType::get(base.getContext(),
-                                       stage.init.getBitWidth());
+      Type initType = IntegerType::get(base.getContext(), *prevWidth);
       Value init = builder.create<pyc::ConstantOp>(
           function.getLoc(), initType,
           IntegerAttr::get(initType, stage.init));

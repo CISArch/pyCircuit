@@ -51,6 +51,12 @@
 // CHECK: pyc.add %arg3, %arg4 {pyc.name = "sum"}
 // CHECK: pyc.xor %[[CL]], %arg3
 
+// A delay that crosses a width-changing op cannot inherit the stage init
+// (its width no longer matches the chain host); the sink stays untouched.
+// CHECK-LABEL: func.func @cross_width
+// CHECK-SAME: pyc.stats.fork_merge_sinks_rewritten = 0
+// CHECK-NOT: pyc.optimized_by = "fork_merge_retime"
+
 module {
   func.func @merge_copies(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %a: i8) -> i8 {
     %zero = pyc.constant 0 : i8
@@ -101,6 +107,14 @@ module {
     %n = pyc.add %a, %b {pyc.name = "sum"} : i8, i8 -> i8
     %q = pyc.reg %clk, %rst, %en, %n, %zero : i8
     %u = pyc.xor %q, %a : i8, i8 -> i8
+    func.return %u : i8
+  }
+
+  func.func @cross_width(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %s: i1) -> i8 {
+    %zero = pyc.constant 0 : i8
+    %z = pyc.zext %s : i1 -> i8
+    %q = pyc.reg %clk, %rst, %en, %z, %zero : i8
+    %u = pyc.xor %q, %z : i8, i8 -> i8
     func.return %u : i8
   }
 }
