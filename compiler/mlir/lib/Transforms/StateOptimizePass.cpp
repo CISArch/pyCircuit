@@ -42,16 +42,15 @@ struct StateOptimizePass
   StringRef getArgument() const override { return "pyc-state-optimize"; }
   StringRef getDescription() const override {
     return "Unified structural state optimization: dead-state cleanup, "
-           "fork-merge retiming, retime, then delay-line chain "
+           "parallel register copy merging, retime, then delay-line chain "
            "formation with observation identities preserved";
   }
 
   void runOnOperation() override {
     func::FuncOp function = getOperation();
     runEliminateDeadState(function);
-    // Merge the common register stages of each fork upstream (extra stages
-    // stay on the branch edge) before pipeline folding, so a later direct
-    // chain can still become a delay line.
+    // Collapse parallel register copies before pipeline folding: identical
+    // copies would otherwise each become their own chain.
     runForkMergeRetime(function);
     runRetimePipelines(function);
     // Sinking moves consumer cones onto source.next, into the same

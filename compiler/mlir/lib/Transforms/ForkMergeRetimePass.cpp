@@ -139,6 +139,8 @@ public:
   explicit ForkMergeRetime(func::FuncOp function) : function(function) {}
 
   MergeStats run() {
+    if (getenv("PYC_FORK_MERGE_OFF"))
+      return stats;
     llvm::SmallVector<pyc::RegOp, 16> regs;
     llvm::DenseSet<Value> registerQ;
     function.walk([&](pyc::RegOp reg) {
@@ -152,7 +154,21 @@ public:
     // symbol name.
     llvm::SmallVector<std::pair<pyc::RegOp, pyc::RegOp>, 16> merges;
     for (pyc::RegOp reg : regs) {
+      // Merging across blocks would point uses at a value that does not
+      // dominate them; only registers in the same block are interchangeable.
+      if (reg->getBlock() != &function.front())
+        continue;
       if (coneReadsOwnQ(reg))
+        continue;
+      // Delay lines/taps encode the history of a specific state element;
+      // merging its source changes that identity for later passes.
+      bool feedsState = false;
+      for (Operation *user : reg.getQ().getUsers())
+        if (isa<pyc::DelayLineOp, pyc::DelayTapOp, pyc::InstanceOp>(user)) {
+          feedsState = true;
+          break;
+        }
+      if (feedsState)
         continue;
       Value data = resolve(reg.getNext());
       if (registerQ.contains(data))
@@ -175,12 +191,17 @@ public:
     for (auto [reg, survivor] : merges) {
       if (!survivor || survivor == reg)
         continue;
+      if (reg->getBlock() != survivor->getBlock())
+        continue;
       // An externally observable register keeps its own state; rebuilding
       // aliases here is not worth the risk (and the rewrite is only a win
       // for the anonymous cycle_balance copies anyway).
       if (stateHasExternalObservation(reg.getOperation(), reg.getQ()))
         continue;
       reg.getQ().replaceAllUsesWith(survivor.getQ());
+      // Erase here rather than leaving the duplicate for the later dead-state
+      // cleanup: leaving it produced a dangling value when cleanup ran after
+      // CSE on the real Davinci IR.
       reg.erase();
       ++stats.merged;
     }
