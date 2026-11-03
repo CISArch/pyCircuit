@@ -147,7 +147,10 @@ public:
     });
 
     llvm::StringMap<pyc::RegOp> owner;
-    llvm::SmallVector<pyc::RegOp, 16> victims;
+    // (victim, survivor) pairs recorded directly: stuffing the grouping key
+    // into a FlatSymbolRefAttr corrupts memory because the key is not a valid
+    // symbol name.
+    llvm::SmallVector<std::pair<pyc::RegOp, pyc::RegOp>, 16> merges;
     for (pyc::RegOp reg : regs) {
       if (coneReadsOwnQ(reg))
         continue;
@@ -166,24 +169,17 @@ public:
         ++stats.groups;
         continue;
       }
-      victims.push_back(reg);
-      victims.back()->setAttr(
-          "pyc.fork_merge.survivor",
-          FlatSymbolRefAttr::get(reg.getContext(), key));
+      merges.push_back({reg, found->second});
     }
 
-    for (pyc::RegOp reg : victims) {
-      auto attr = reg->getAttrOfType<FlatSymbolRefAttr>(
-          "pyc.fork_merge.survivor");
-      if (!attr)
+    for (auto [reg, survivor] : merges) {
+      if (!survivor || survivor == reg)
         continue;
-      auto found = owner.find(attr.getValue());
-      if (found == owner.end() || found->second == reg)
+      // An externally observable register keeps its own state; rebuilding
+      // aliases here is not worth the risk (and the rewrite is only a win
+      // for the anonymous cycle_balance copies anyway).
+      if (stateHasExternalObservation(reg.getOperation(), reg.getQ()))
         continue;
-      pyc::RegOp survivor = found->second;
-      OpBuilder builder(reg.getContext());
-      builder.setInsertionPoint(reg);
-      remapStateOpIdentity(builder, reg, survivor.getQ());
       reg.getQ().replaceAllUsesWith(survivor.getQ());
       reg.erase();
       ++stats.merged;
