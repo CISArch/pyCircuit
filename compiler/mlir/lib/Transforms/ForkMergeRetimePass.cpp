@@ -35,6 +35,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cstring>
 #include <optional>
 #include <string>
 
@@ -139,8 +140,6 @@ public:
   explicit ForkMergeRetime(func::FuncOp function) : function(function) {}
 
   MergeStats run() {
-    if (getenv("PYC_FORK_MERGE_OFF"))
-      return stats;
     llvm::SmallVector<pyc::RegOp, 16> regs;
     llvm::DenseSet<Value> registerQ;
     function.walk([&](pyc::RegOp reg) {
@@ -160,8 +159,18 @@ public:
         continue;
       if (coneReadsOwnQ(reg))
         continue;
-      // Delay lines/taps encode the history of a specific state element;
-      // merging its source changes that identity for later passes.
+      // Only merge copies whose data comes straight from a constant or a
+      // function input. Merging copies that share a combinational producer
+      // makes retime/CSE/dead-state interact over one producer with several
+      // former consumers, which crashes the real Davinci pipeline (dangling
+      // MLIR type / block order). The safe subset is still the bulk of the
+      // anonymous copies and costs nothing.
+      Value data = resolve(reg.getNext());
+      Operation *dataDef = data.getDefiningOp();
+      if (dataDef && !isa<pyc::ConstantOp>(dataDef))
+        continue;
+      // A register that feeds a delay line or an instance is part of that
+      // state element's history identity; leave it alone.
       bool feedsState = false;
       for (Operation *user : reg.getQ().getUsers())
         if (isa<pyc::DelayLineOp, pyc::DelayTapOp, pyc::InstanceOp>(user)) {
@@ -170,9 +179,6 @@ public:
         }
       if (feedsState)
         continue;
-      Value data = resolve(reg.getNext());
-      if (registerQ.contains(data))
-        continue; // following a register is not a duplicate of it
       auto init = constantValue(reg.getInit());
       auto width = scalarWidth(reg.getQ().getType());
       if (!init || !width || init->getBitWidth() != *width)
