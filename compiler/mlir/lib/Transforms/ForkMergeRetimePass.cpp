@@ -229,8 +229,16 @@ public:
       // every cycle. Keep the erased register's own observable names readable
       // through a read-only alias of the survivor placed at the old position:
       // the survivor is upstream, so the alias stays dominated and a probe
-      // reads the identical value. (remapStateOpIdentity is not used here: it
-      // crashes the real Davinci pipeline.)
+      // reads the identical value.
+      //
+      // The alias is a leaf by construction (nothing references it): it only
+      // serves name -> value lookup, so it never enters the dataflow, the
+      // change-driven schedule, or the state loops, and costs nothing at
+      // runtime. This matches the repo convention that observation aliases
+      // are leaves with readers bound straight to the source.
+      //
+      // remapStateOpIdentity is deliberately not used: it crashes the real
+      // Davinci pipeline.
       if (hasExternalObservationIdentity(reg.getOperation())) {
         OpBuilder builder(reg.getContext());
         builder.setInsertionPoint(reg);
