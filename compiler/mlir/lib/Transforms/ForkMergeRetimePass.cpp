@@ -135,6 +135,31 @@ static bool coneReadsOwnQ(pyc::RegOp reg) {
   return false;
 }
 
+static bool isStateConsumer(Operation *op) {
+  return isa<pyc::DelayLineOp, pyc::DelayTapOp, pyc::InstanceOp>(op);
+}
+
+// True when `value` reaches a delay line/tap/instance through aliases and
+// single-driver wires.
+static bool reachesStateConsumer(Value value) {
+  llvm::DenseSet<Value> seen;
+  llvm::SmallVector<Value, 8> work{value};
+  while (!work.empty()) {
+    Value current = work.pop_back_val();
+    if (!seen.insert(current).second)
+      continue;
+    for (Operation *user : current.getUsers()) {
+      if (isStateConsumer(user))
+        return true;
+      if (auto alias = dyn_cast<pyc::AliasOp>(user))
+        work.push_back(alias.getResult());
+      else if (auto assign = dyn_cast<pyc::AssignOp>(user))
+        work.push_back(assign.getDst());
+    }
+  }
+  return false;
+}
+
 class ForkMergeRetime {
 public:
   explicit ForkMergeRetime(func::FuncOp function) : function(function) {}
@@ -159,25 +184,19 @@ public:
         continue;
       if (coneReadsOwnQ(reg))
         continue;
-      // Only merge copies whose data comes straight from a constant or a
-      // function input. Merging copies that share a combinational producer
-      // makes retime/CSE/dead-state interact over one producer with several
-      // former consumers, which crashes the real Davinci pipeline (dangling
-      // MLIR type / block order). The safe subset is still the bulk of the
-      // anonymous copies and costs nothing.
-      Value data = resolve(reg.getNext());
-      Operation *dataDef = data.getDefiningOp();
+      // Merging copies that share a combinational producer makes the later
+      // state passes (retime / CSE / dead-state / chain forming) interact
+      // over one producer with several former consumers, which crashes the
+      // real Davinci pipeline wherever this pass is placed. Copies rooted at
+      // a constant or a function input are safe and are the bulk of the
+      // anonymous cycle_balance duplicates.
+      Operation *dataDef = resolve(reg.getNext()).getDefiningOp();
       if (dataDef && !isa<pyc::ConstantOp>(dataDef))
         continue;
-      // A register that feeds a delay line or an instance is part of that
-      // state element's history identity; leave it alone.
-      bool feedsState = false;
-      for (Operation *user : reg.getQ().getUsers())
-        if (isa<pyc::DelayLineOp, pyc::DelayTapOp, pyc::InstanceOp>(user)) {
-          feedsState = true;
-          break;
-        }
-      if (feedsState)
+      // A register whose value reaches a delay line, tap or instance is part
+      // of that state element's history identity. The chain former usually
+      // reaches it through aliases, so look through them.
+      if (reachesStateConsumer(reg.getQ()))
         continue;
       auto init = constantValue(reg.getInit());
       auto width = scalarWidth(reg.getQ().getType());
@@ -199,11 +218,26 @@ public:
         continue;
       if (reg->getBlock() != survivor->getBlock())
         continue;
-      // An externally observable register keeps its own state; rebuilding
-      // aliases here is not worth the risk (and the rewrite is only a win
-      // for the anonymous cycle_balance copies anyway).
-      if (stateHasExternalObservation(reg.getOperation(), reg.getQ()))
-        continue;
+      // Two copies with identical clock/reset/enable/init and the same data
+      // input are one flip-flop, so the survivor holds the same value on
+      // every cycle. Keep the erased register's observable names readable by
+      // materializing them as read-only aliases of the survivor at the old
+      // position: the survivor is upstream, so the alias stays dominated and
+      // a probe still reads the identical value.
+      // Two copies with identical clock/reset/enable/init and the same data
+      // input are one flip-flop, so the survivor holds the same value on
+      // every cycle. Keep the erased register's own observable names readable
+      // through a read-only alias of the survivor placed at the old position:
+      // the survivor is upstream, so the alias stays dominated and a probe
+      // reads the identical value. (remapStateOpIdentity is not used here: it
+      // crashes the real Davinci pipeline.)
+      if (hasExternalObservationIdentity(reg.getOperation())) {
+        OpBuilder builder(reg.getContext());
+        builder.setInsertionPoint(reg);
+        auto alias = builder.create<pyc::AliasOp>(
+            reg.getLoc(), reg.getQ().getType(), survivor.getQ());
+        copyExternalObservationAttrs(reg.getOperation(), alias.getOperation());
+      }
       reg.getQ().replaceAllUsesWith(survivor.getQ());
       // Erase here rather than leaving the duplicate for the later dead-state
       // cleanup: leaving it produced a dangling value when cleanup ran after

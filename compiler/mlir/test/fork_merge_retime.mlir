@@ -34,11 +34,13 @@
 // CHECK-SAME: pyc.stats.fork_merge_merged = 0
 // CHECK: pyc.reg
 
-// An externally observable register keeps its own state: no merge.
+// An externally observable copy still merges: its name survives as a
+// read-only alias of the survivor, so a probe reads the identical value.
 // CHECK-LABEL: func.func @named_copies
-// CHECK-SAME: pyc.stats.fork_merge_merged = 0
-// CHECK: pyc.reg
-// CHECK: pyc.reg
+// CHECK-SAME: pyc.stats.fork_merge_merged = 1
+// CHECK: %[[Q:.*]] = pyc.reg %arg0, %arg1, %arg2, %arg3
+// CHECK: pyc.alias %[[Q]] {pyc.name = "keep_me"}
+// CHECK-NOT: pyc.reg
 
 module {
   func.func @merge_copies(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %a: i8) -> i8 {

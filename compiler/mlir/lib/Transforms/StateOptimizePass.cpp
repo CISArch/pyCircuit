@@ -49,9 +49,6 @@ struct StateOptimizePass
   void runOnOperation() override {
     func::FuncOp function = getOperation();
     runEliminateDeadState(function);
-    // Collapse parallel register copies before pipeline folding: identical
-    // copies would otherwise each become their own chain.
-    runForkMergeRetime(function);
     runRetimePipelines(function);
     // Sinking moves consumer cones onto source.next, into the same
     // combinational cone as the producers of next. The fusion win (shared
