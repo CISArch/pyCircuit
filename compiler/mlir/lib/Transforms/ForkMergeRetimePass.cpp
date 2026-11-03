@@ -52,6 +52,29 @@ static std::optional<unsigned> scalarWidth(Type type) {
   return std::nullopt;
 }
 
+// Move the whole user cone of `root` below it so every use stays dominated
+// after handles were materialized late in the block.
+static void sinkUsersBelow(Operation *root) {
+  llvm::DenseSet<Operation *> seen;
+  llvm::SmallVector<Operation *> wave{root};
+  seen.insert(root);
+  while (!wave.empty()) {
+    Operation *def = wave.pop_back_val();
+    llvm::SmallVector<Operation *> users;
+    for (Value result : def->getResults())
+      for (Operation *user : result.getUsers())
+        users.push_back(user);
+    for (Operation *user : users) {
+      if (user->getBlock() != def->getBlock())
+        continue;
+      if (!def->isBeforeInBlock(user))
+        user->moveAfter(def);
+      if (seen.insert(user).second)
+        wave.push_back(user);
+    }
+  }
+}
+
 static bool isLiftableOp(Operation *op) {
   return isa<pyc::AddOp, pyc::SubOp, pyc::MulOp, pyc::AndOp, pyc::OrOp,
               pyc::XorOp, pyc::NotOp, pyc::MuxOp, pyc::EqOp, pyc::UltOp,
@@ -514,6 +537,11 @@ private:
       remapStateOpIdentity(builder, reg, *handle);
       reg.getQ().replaceAllUsesWith(*handle);
       reg.erase();
+      // The handle is materialized after its dependencies, which can sit
+      // later in the block than the sink's existing users; move that user
+      // cone below the handle so every use stays dominated.
+      if (Operation *handleDef = handle->getDefiningOp())
+        sinkUsersBelow(handleDef);
       ++stats.sinksRewritten;
     }
   }
