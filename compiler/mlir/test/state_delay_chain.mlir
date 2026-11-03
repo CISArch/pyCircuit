@@ -19,14 +19,9 @@
 // CHECK: pyc.delay_tap
 // CHECK-SAME: depth = 1 : i64
 // CHECK-NOT: pyc.reg
-// CHECK-LABEL: func.func @sink_stateful_fanout
-// CHECK: pyc.delay_line
-// CHECK-SAME: depth = 2 : i64
-// CHECK: %[[TAP:.*]] = pyc.delay_tap
-// CHECK-SAME: depth = 1 : i64
-// CHECK: pyc.reg
-// CHECK-SAME: %[[TAP]]
-// CHECK-NOT: pyc.reg
+// CHECK-LABEL: func.func @keep_stateful_fanout
+// CHECK-COUNT-3: pyc.reg
+// CHECK-NOT: pyc.delay_line
 // CHECK-LABEL: func.func @keep_debug_state
 // CHECK: pyc.delay_line
 // CHECK-SAME: depth = 2 : i64
@@ -75,7 +70,7 @@ module {
     func.return %q0, %q1 : i8, i8
   }
 
-  func.func @sink_stateful_fanout(
+  func.func @keep_stateful_fanout(
       %clk: !pyc.clock, %rst: !pyc.reset, %in: i8, %en2: i1) -> (i8, i8) {
     %en = pyc.constant 1 : i1
     %init = pyc.constant 0 : i8

@@ -40,13 +40,8 @@ static void combineStateChains(func::FuncOp function) {
     llvm::SmallVector<pyc::RegOp> chainFromTail{tail};
     llvm::SmallVector<StateChainLink> linksFromTail;
     pyc::RegOp cursor = tail;
-    llvm::DenseSet<Operation *> visited{tail.getOperation()};
     while (auto link = matchStateChainPredecessor(cursor, tail)) {
       if (erased.contains(link->predecessor.getOperation()))
-        break;
-      // Guard against a feedback edge that would make the walk cyclic now
-      // that stateful fanout no longer stops the chain.
-      if (!visited.insert(link->predecessor.getOperation()).second)
         break;
       linksFromTail.push_back(*link);
       cursor = link->predecessor;
@@ -55,9 +50,48 @@ static void combineStateChains(func::FuncOp function) {
     if (chainFromTail.size() < 2)
       continue;
 
-    // Intermediate fanout is legal: every extra reader (state included) is
-    // replaced by a fixed-depth delay tap below, so nothing has to be
-    // duplicated or blocked here.
+    // Preflight all intermediate fanout before creating the replacement. A
+    // second stateful consumer cannot be represented by a read-only tap.
+    bool hasIllegalFanout = false;
+    for (unsigned i = 1; i < chainFromTail.size() && !hasIllegalFanout; ++i) {
+      pyc::RegOp reg = chainFromTail[i];
+      const StateChainLink &link = linksFromTail[i - 1];
+      Operation *requiredUser = nullptr;
+      if (link.aliasesFromConsumerToProducer.empty()) {
+        requiredUser = chainFromTail[i - 1].getOperation();
+      } else {
+        pyc::AliasOp requiredAlias =
+            link.aliasesFromConsumerToProducer.back();
+        requiredUser = requiredAlias.getOperation();
+      }
+      for (Operation *user : reg.getQ().getUsers()) {
+        if (user != requiredUser && isStatefulConsumer(user)) {
+          hasIllegalFanout = true;
+          break;
+        }
+      }
+      for (auto aliasIt = link.aliasesFromConsumerToProducer.rbegin();
+           aliasIt != link.aliasesFromConsumerToProducer.rend() &&
+           !hasIllegalFanout;
+           ++aliasIt) {
+        pyc::AliasOp alias = *aliasIt;
+        auto nextAlias = std::next(aliasIt);
+        if (nextAlias == link.aliasesFromConsumerToProducer.rend()) {
+          requiredUser = chainFromTail[i - 1].getOperation();
+        } else {
+          pyc::AliasOp nextAliasOp = *nextAlias;
+          requiredUser = nextAliasOp.getOperation();
+        }
+        for (Operation *user : alias.getResult().getUsers()) {
+          if (user != requiredUser && isStatefulConsumer(user)) {
+            hasIllegalFanout = true;
+            break;
+          }
+        }
+      }
+    }
+    if (hasIllegalFanout)
+      continue;
 
     const int64_t depth = static_cast<int64_t>(chainFromTail.size());
     pyc::RegOp head = chainFromTail.back();
