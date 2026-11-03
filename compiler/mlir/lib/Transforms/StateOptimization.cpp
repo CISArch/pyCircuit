@@ -199,11 +199,11 @@ matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg) {
     return std::nullopt;
 
   Value expectedProducer = predecessor.getQ();
+  // Any extra reader of an intermediate stage is fine: the chain rewrite
+  // replaces each such read with a fixed-depth delay tap, state readers
+  // included. Only the state-to-state edge that defines the chain is
+  // required to be present.
   auto hasRequiredUser = [&](Value value, Operation *required) {
-    for (Operation *user : value.getUsers()) {
-      if (user != required && isStatefulConsumer(user))
-        return false;
-    }
     return llvm::is_contained(value.getUsers(), required);
   };
   for (pyc::AliasOp alias :
