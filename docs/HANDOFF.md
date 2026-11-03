@@ -227,7 +227,16 @@ func pass 并行执行，dump 文件序号交错；**按函数名配对**（afte
 
 用户提出用 **DFS 归并 retiming** 替换选项 B 的逐步上移：后序 DFS 回退时统计分叉节点各下游支路的寄存器级数，公共级数（min）合并到分叉上游成一条共享链，额外级数贴在分叉紧邻下游的支路边。设计与实现纪见 **`docs/reg_upstream_dfs_merge_plan.md`**（§8 实现纪要含实测与两个探针纠偏）。
 
-实现要点：pass `pyc-fork-merge-retime`（替换 `runHoistRegsUpstream` 槽位，旧 pass 文件与测试已删）；延迟事件 (值, 延迟, 语义序列) 传播 + 惰性 liftCone（链级身份 =(输入值, 级语义) 天然前缀共享）；预算守卫（位宽×2.0 / 克隆×2.0 / MAX_DELAY 8）超限整函数退化纯归并。**gm_interface 真实 IR 实测 2454→182 reg（0.03s）**；scoreboard 因全上游化位宽比 ×153 被守卫正确拦截退化为归并；门禁/`state_retime_smoke`/`make smoke` 全过。auto_perf 尚未提测（本分支仅剩一次机会，推送 CI 绿后再用）。
+实现要点：pass `pyc-fork-merge-retime`（替换 `runHoistRegsUpstream` 槽位，旧 pass 文件与测试已删）；延迟事件 (值, 延迟, 语义序列) 传播 + 惰性 liftCone（链级身份 =(输入值, 级语义) 天然前缀共享）；预算守卫（位宽×2.0 / 克隆×2.0 / MAX_DELAY 8）超限整函数退化纯归并。**gm_interface 真实 IR 实测 2454→182 reg（0.03s）**；scoreboard 因全上游化位宽比 ×153 被守卫正确拦截退化为归并；门禁/`state_retime_smoke`/`make smoke` 全过。
+
+## 8C. auto_perf 提测记录（2026-11-03 上午，分支两次名额已用完）
+
+| 提交 | 任务 | 结果 | 根因 |
+| --- | --- | --- | --- |
+| `0cfcd5b` | local:ab257892 | partial（34/34 C++ 侧失败，8 分钟） | `pyc.reg` verifier：链 init 类型用了级语义来源寄存器的位宽，跨宽度穿透（zext/concat/trunc/extract 改变事件值宽度）后 next/init/q 不同型 |
+| `59f19bb` | local:447f1d03 | partial（同上） | 共享 handle（okMemo 跨 sink 复用）物化在依赖之后、位置晚于其它 sink 的既有用户，RAUW 后 `operand does not dominate this use` |
+
+两次都在 **cpp-generate 阶段**（pycc IR 管线）失败，不是超时——对比旧实现 7200s 被杀，编译时间问题已解决。修复链：`59f19bb`（init 宽度失配即放弃整链，保守回退，+cross_width 门禁用例）→ `fae0932`（RAUW 后 sinkUsersBelow 把用户锥沉到 handle 之下，恢复旧 pass 同款做法）。本地门禁/state_retime/gm_interface（2454→182）全绿。**`fae0932` 尚未提测**——第三次需用户确认（约定每分支最多两次已用完）。
 
 ## 9. 名词
 

@@ -1,61 +1,44 @@
 // RUN: pyc-opt %s --pass-pipeline='builtin.module(func.func(pyc-fork-merge-retime))' | FileCheck %s
 
-// Parallel copies with identical stage semantics collapse into one shared
-// chain register (fork-merge of the common stage).
+// Parallel copies with identical control and data collapse into one register.
 // CHECK-LABEL: func.func @merge_copies
-// CHECK-SAME: pyc.stats.fork_merge_regs_created = 1
-// CHECK-SAME: pyc.stats.fork_merge_sinks_rewritten = 2
-// CHECK: %[[Q:.*]] = pyc.reg %arg0, %arg1, %arg2, %arg3, %{{.*}} {pyc.optimized_by = "fork_merge_retime"}
-// CHECK: pyc.xor %[[Q]], %[[Q]]
+// CHECK-SAME: pyc.stats.fork_merge_merged = 1
+// CHECK: %[[Q:.*]] = pyc.reg %arg0, %arg1, %arg2, %arg3
 // CHECK-NOT: pyc.reg
 
-// A stage-gap path shares the common stage chain: level 1 (next = %a / %b)
-// is shared, the extra stage chains on top of it, and the crossed and is
-// cloned downstream once per delay.
-// CHECK-LABEL: func.func @stage_gap
-// CHECK-SAME: pyc.stats.fork_merge_regs_created = 4
-// CHECK-SAME: pyc.stats.fork_merge_sinks_rewritten = 2
-// CHECK: %[[B1:.*]] = pyc.reg %arg0, %arg1, %arg2, %arg4, %{{.*}} {pyc.optimized_by = "fork_merge_retime"}
-// CHECK: %[[B2:.*]] = pyc.reg %arg0, %arg1, %arg2, %[[B1]], %{{.*}} {pyc.optimized_by = "fork_merge_retime"}
-// CHECK: %[[A1:.*]] = pyc.reg %arg0, %arg1, %arg2, %arg3, %{{.*}} {pyc.optimized_by = "fork_merge_retime"}
-// CHECK: %[[A2:.*]] = pyc.reg %arg0, %arg1, %arg2, %[[A1]], %{{.*}} {pyc.optimized_by = "fork_merge_retime"}
-// CHECK: %[[X2:.*]] = pyc.and %[[A2]], %[[B2]] {pyc.optimized_by = "fork_merge_retime"}
-// CHECK: %[[X1:.*]] = pyc.and %[[A1]], %[[B1]] {pyc.optimized_by = "fork_merge_retime"}
-// CHECK: pyc.xor %[[X1]], %[[X2]]
-
-// Different enable semantics never share one chain.
+// Same data but different enable: not the same flip-flop, keep both.
 // CHECK-LABEL: func.func @distinct_en
-// CHECK-SAME: pyc.stats.fork_merge_regs_created = 2
-// CHECK-SAME: pyc.stats.fork_merge_sinks_rewritten = 2
+// CHECK-SAME: pyc.stats.fork_merge_merged = 0
 // CHECK: pyc.reg %arg0, %arg1, %arg2, %arg3
-// CHECK: pyc.reg %arg0, %arg1, %[[ONE:.*]], %arg3
+// CHECK: pyc.reg %arg0, %arg1, %{{.*}}, %arg3
 
-// Hold loops (next reads own q through a mux) stay untouched.
+// Different init: different power-up value, keep both.
+// CHECK-LABEL: func.func @distinct_init
+// CHECK-SAME: pyc.stats.fork_merge_merged = 0
+// CHECK: pyc.reg
+// CHECK: pyc.reg
+
+// A register that follows another register is not a duplicate of it.
+// CHECK-LABEL: func.func @follows_register
+// CHECK-SAME: pyc.stats.fork_merge_merged = 0
+// CHECK: %[[A:.*]] = pyc.reg %arg0, %arg1, %arg2, %arg3
+// CHECK: pyc.reg %arg0, %arg1, %arg2, %[[A]]
+
+// Hold loops stay untouched.
 // CHECK-LABEL: func.func @hold_loop
-// CHECK-SAME: pyc.stats.fork_merge_sinks_rewritten = 0
+// CHECK-SAME: pyc.stats.fork_merge_merged = 0
 // CHECK: pyc.mux
-// CHECK-NOT: pyc.optimized_by = "fork_merge_retime"
 
 // Non-constant init is out of scope.
 // CHECK-LABEL: func.func @nonconst_init
-// CHECK-SAME: pyc.stats.fork_merge_sinks_rewritten = 0
-// CHECK-NOT: pyc.optimized_by = "fork_merge_retime"
+// CHECK-SAME: pyc.stats.fork_merge_merged = 0
+// CHECK: pyc.reg
 
-// Observation names stay on the original op (same cycle); the lifted clone
-// carries no observation identity.
-// CHECK-LABEL: func.func @named_op
-// CHECK-SAME: pyc.stats.fork_merge_clones = 1
-// CHECK: %[[RB:.*]] = pyc.reg %arg0, %arg1, %arg2, %arg4, %{{.*}} {pyc.optimized_by = "fork_merge_retime"}
-// CHECK: %[[RA:.*]] = pyc.reg %arg0, %arg1, %arg2, %arg3, %{{.*}} {pyc.optimized_by = "fork_merge_retime"}
-// CHECK: %[[CL:.*]] = pyc.add %[[RA]], %[[RB]] {pyc.optimized_by = "fork_merge_retime"}
-// CHECK: pyc.add %arg3, %arg4 {pyc.name = "sum"}
-// CHECK: pyc.xor %[[CL]], %arg3
-
-// A delay that crosses a width-changing op cannot inherit the stage init
-// (its width no longer matches the chain host); the sink stays untouched.
-// CHECK-LABEL: func.func @cross_width
-// CHECK-SAME: pyc.stats.fork_merge_sinks_rewritten = 0
-// CHECK-NOT: pyc.optimized_by = "fork_merge_retime"
+// Observation names survive the merge: the erased register keeps a readable
+// alias of the survivor.
+// CHECK-LABEL: func.func @named_copies
+// CHECK-SAME: pyc.stats.fork_merge_merged = 1
+// CHECK: pyc.alias %{{.*}} {pyc.name = "keep_me"}
 
 module {
   func.func @merge_copies(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %a: i8) -> i8 {
@@ -66,21 +49,30 @@ module {
     func.return %u : i8
   }
 
-  func.func @stage_gap(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %a: i8, %b: i8) -> i8 {
-    %zero = pyc.constant 0 : i8
-    %x = pyc.and %a, %b : i8, i8 -> i8
-    %q1 = pyc.reg %clk, %rst, %en, %x, %zero : i8
-    %q2 = pyc.reg %clk, %rst, %en, %q1, %zero : i8
-    %out = pyc.xor %q1, %q2 : i8, i8 -> i8
-    func.return %out : i8
-  }
-
   func.func @distinct_en(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %a: i8) -> i8 {
     %one = pyc.constant 1 : i1
     %zero = pyc.constant 0 : i8
     %q1 = pyc.reg %clk, %rst, %en, %a, %zero : i8
     %q2 = pyc.reg %clk, %rst, %one, %a, %zero : i8
     %u = pyc.xor %q1, %q2 : i8, i8 -> i8
+    func.return %u : i8
+  }
+
+  func.func @distinct_init(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %a: i8) -> i8 {
+    %zero = pyc.constant 0 : i8
+    %one = pyc.constant 1 : i8
+    %q1 = pyc.reg %clk, %rst, %en, %a, %zero : i8
+    %q2 = pyc.reg %clk, %rst, %en, %a, %one : i8
+    %u = pyc.xor %q1, %q2 : i8, i8 -> i8
+    func.return %u : i8
+  }
+
+  func.func @follows_register(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %a: i8) -> i8 {
+    %zero = pyc.constant 0 : i8
+    %q1 = pyc.reg %clk, %rst, %en, %a, %zero : i8
+    %q2 = pyc.reg %clk, %rst, %en, %q1, %zero : i8
+    %q3 = pyc.reg %clk, %rst, %en, %q1, %zero : i8
+    %u = pyc.xor %q2, %q3 : i8, i8 -> i8
     func.return %u : i8
   }
 
@@ -97,24 +89,17 @@ module {
   }
 
   func.func @nonconst_init(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %a: i8, %k: i8) -> i8 {
-    %q = pyc.reg %clk, %rst, %en, %a, %k : i8
-    %u = pyc.xor %q, %a : i8, i8 -> i8
+    %q1 = pyc.reg %clk, %rst, %en, %a, %k : i8
+    %q2 = pyc.reg %clk, %rst, %en, %a, %k : i8
+    %u = pyc.xor %q1, %q2 : i8, i8 -> i8
     func.return %u : i8
   }
 
-  func.func @named_op(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %a: i8, %b: i8) -> i8 {
+  func.func @named_copies(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %a: i8) -> i8 {
     %zero = pyc.constant 0 : i8
-    %n = pyc.add %a, %b {pyc.name = "sum"} : i8, i8 -> i8
-    %q = pyc.reg %clk, %rst, %en, %n, %zero : i8
-    %u = pyc.xor %q, %a : i8, i8 -> i8
-    func.return %u : i8
-  }
-
-  func.func @cross_width(%clk: !pyc.clock, %rst: !pyc.reset, %en: i1, %s: i1) -> i8 {
-    %zero = pyc.constant 0 : i8
-    %z = pyc.zext %s : i1 -> i8
-    %q = pyc.reg %clk, %rst, %en, %z, %zero : i8
-    %u = pyc.xor %q, %z : i8, i8 -> i8
+    %q1 = pyc.reg %clk, %rst, %en, %a, %zero : i8
+    %q2 = pyc.reg %clk, %rst, %en, %a, %zero {pyc.name = "keep_me"} : i8
+    %u = pyc.xor %q1, %q2 : i8, i8 -> i8
     func.return %u : i8
   }
 }
