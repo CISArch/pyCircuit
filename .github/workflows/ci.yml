@@ -207,6 +207,8 @@ jobs:
           unset PYC_SKIP_SEMANTIC_REGRESSIONS || true
           unset PYCC || true
           bash flows/scripts/run_examples.sh
+          PYCC="$PYC_TOOLCHAIN_ROOT/bin/pycc" \
+            bash compiler/mlir/test/pass_ir_dumper_smoke.sh
 
       - name: Write gate summary
         if: always()
