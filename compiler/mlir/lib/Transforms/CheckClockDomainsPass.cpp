@@ -28,7 +28,7 @@ static bool isIntType(Type t) { return isa<IntegerType>(t); }
 
 static bool isSequentialCut(Operation *op) {
   return isa<pyc::RegOp, pyc::DelayLineOp, pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp,
-             pyc::SyncMemDPOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(op);
+             pyc::SyncMemDPOp, pyc::SyncMem2WOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(op);
 }
 
 struct FuncClockSummary {
@@ -195,6 +195,12 @@ public:
           return out;
         }
         if (auto m = dyn_cast<pyc::SyncMemDPOp>(def)) {
+          out = domOfClock(m.getClk());
+          domVisiting_.erase(v);
+          domMemo_.try_emplace(v, out);
+          return out;
+        }
+        if (auto m = dyn_cast<pyc::SyncMem2WOp>(def)) {
           out = domOfClock(m.getClk());
           domVisiting_.erase(v);
           domMemo_.try_emplace(v, out);
@@ -603,6 +609,12 @@ public:
         checkSampled(op,
                      m.getClk(),
                      {m.getRen0(), m.getRaddr0(), m.getRen1(), m.getRaddr1(), m.getWvalid(), m.getWaddr(), m.getWdata(), m.getWstrb()});
+        return;
+      }
+      if (auto m = dyn_cast<pyc::SyncMem2WOp>(op)) {
+        checkSampled(op,
+                     m.getClk(),
+                     {m.getRen(), m.getRaddr(), m.getWvalid0(), m.getWaddr0(), m.getWdata0(), m.getWstrb0(), m.getWvalid1(), m.getWaddr1(), m.getWdata1(), m.getWstrb1()});
         return;
       }
       if (auto m = dyn_cast<pyc::ByteMemOp>(op)) {
