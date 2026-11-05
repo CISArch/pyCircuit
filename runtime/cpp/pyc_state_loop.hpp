@@ -28,6 +28,9 @@ constexpr std::size_t loop_word_count(std::size_t lanes) {
 
 template <unsigned Width>
 struct RegLoopLane {
+  // q is unused by RegLoop since the q-store change: the loop owns each
+  // lane's current value in its contiguous qStore_ (qRef(i)). The field
+  // stays so existing add_lanes callers keep compiling; pass nullptr.
   Wire<Width> *q;
   Wire<Width> *d;
   Wire<1> *rst;
@@ -43,14 +46,15 @@ public:
   using Lane = RegLoopLane<Width>;
 
   // Bulk form used by generated code: add_lanes({a,b,c,d,e}, {f,g,h,i,j}).
-  // Lane pointers are stored structure-of-arrays: the hot sampling loops
-  // stream q/d/init (and rst/en on non-uniform loops) as contiguous pointer
-  // arrays instead of chasing 40-byte interleaved lane structs.
+  // Lane values live in the loop: q storage is the contiguous qStore_
+  // (accessed via qRef) so the sampling loops stream q linearly and can
+  // vectorize; d/init (and rst/en on non-uniform loops) stay SoA pointer
+  // arrays.
   void add_lanes(std::initializer_list<Lane> lanes) {
     for (const Lane &lane : lanes) {
-      if (!q_.empty() && (lane.rst != rst_[0] || lane.en != en_[0]))
+      if (!qStore_.empty() && (lane.rst != rst_[0] || lane.en != en_[0]))
         sharedCtrl_ = false;
-      q_.push_back(lane.q);
+      qStore_.emplace_back();
       d_.push_back(lane.d);
       rst_.push_back(lane.rst);
       en_.push_back(lane.en);
@@ -58,15 +62,15 @@ public:
       qNext_.emplace_back();
       pending_.push_back(0);
     }
-    dirty_.assign(loop_word_count(q_.size()), 0);
+    dirty_.assign(loop_word_count(qStore_.size()), 0);
   }
 
-  std::size_t size() const { return q_.size(); }
+  std::size_t size() const { return qStore_.size(); }
 
   // Caller guarantees a 0->1 edge just occurred on this loop's clock.
   void compute_rise() {
     clkPrev_ = true;
-    const std::size_t n = q_.size();
+    const std::size_t n = qStore_.size();
     if (sharedCtrl_) {
       // Every lane samples the same rst/en wires; read them once instead of
       // two dependent pointer chases per lane (all DavinciTop loops are
@@ -111,11 +115,11 @@ public:
   // Applies pending updates, writes back through the lane's q pointer, and
   // returns the per-lane dirty bitmap (bit i set == lane i's q changed).
   const std::vector<std::uint64_t> &commit() {
-    const std::size_t n = q_.size();
+    const std::size_t n = qStore_.size();
     dirty_.assign(loop_word_count(n), 0);
     for (std::size_t i = 0; i < n; ++i) {
       if (__builtin_expect(pending_[i] != 0, 0)) {
-        Wire<Width> &q = *q_[i];
+        Wire<Width> &q = qStore_[i];
         const bool changed = q != qNext_[i];
         q = qNext_[i];
         pending_[i] = 0;
@@ -133,7 +137,7 @@ public:
   // pending/qNext are still recorded so write-intent probes see the update;
   // retire() clears pending at the point where commit() would have.
   const std::vector<std::uint64_t> &direct_commit() {
-    const std::size_t n = q_.size();
+    const std::size_t n = qStore_.size();
     clkPrev_ = true;
     dirty_.assign(loop_word_count(n), 0);
     if (sharedCtrl_) {
@@ -147,7 +151,7 @@ public:
           pending_[i] = 1;
           const Wire<Width> &nxt = r ? *init_[i] : *d_[i];
           qNext_[i] = nxt;
-          Wire<Width> &q = *q_[i];
+          Wire<Width> &q = qStore_[i];
           if (q != nxt) {
             q = nxt;
             dirty_[i >> 6] |= std::uint64_t{1} << (i & 63);
@@ -167,7 +171,7 @@ public:
         continue;
       const Wire<Width> &nxt = r ? *init_[i] : *d_[i];
       qNext_[i] = nxt;
-      Wire<Width> &q = *q_[i];
+      Wire<Width> &q = qStore_[i];
       if (q != nxt) {
         q = nxt;
         dirty_[i >> 6] |= std::uint64_t{1} << (i & 63);
@@ -187,12 +191,33 @@ public:
     return reinterpret_cast<bool *>(&pending_[i]);
   }
   Wire<Width> *lane_qnext(std::size_t i) { return &qNext_[i]; }
+  // Current value storage for lane i; the emitter maps every reference to a
+  // looped reg's q onto qRef(lane), so combs, probes and trace read the
+  // contiguous store directly. data()+i keeps address arithmetic defined
+  // even during construction (see reserve).
+  Wire<Width> &qRef(std::size_t i) { return *(qStore_.data() + i); }
+
+  // Fix every lane array's capacity before any add_lanes: phased lanes may
+  // reference another loop's qRef(lane) as their d, so &qRef addresses are
+  // taken while that loop is still empty — with capacity pre-paid the
+  // storage block never moves and the later emplace_backs land in place.
+  void reserve(std::size_t lanes) {
+    qStore_.reserve(lanes);
+    qNext_.reserve(lanes);
+    pending_.reserve(lanes);
+    d_.reserve(lanes);
+    rst_.reserve(lanes);
+    en_.reserve(lanes);
+    init_.reserve(lanes);
+  }
 
 private:
-  void clear_pending() { pending_.assign(q_.size(), 0); }
+  void clear_pending() { pending_.assign(qStore_.size(), 0); }
 
-  // Lane pointers in structure-of-arrays layout (see add_lanes).
-  std::vector<Wire<Width> *> q_, d_;
+  // Lane state: q values are loop-owned and contiguous (qStore_); the
+  // remaining lane pointers stay structure-of-arrays (see add_lanes).
+  std::vector<Wire<Width>> qStore_;
+  std::vector<Wire<Width> *> d_;
   std::vector<Wire<1> *> rst_, en_;
   std::vector<const Wire<Width> *> init_;
   std::vector<Wire<Width>> qNext_;
