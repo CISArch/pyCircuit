@@ -48,6 +48,11 @@ std::unique_ptr<::mlir::Pass> createVectorUnrollPass();
 /// Phase runners shared with the unified StateOptimizePass. Defined next to
 /// the passes whose cores they drive.
 void runRetimePipelines(::mlir::func::FuncOp function);
+/// Move each eligible pyc.reg one combinational op upstream. Multi-input ops
+/// get one new register per non-constant input. See
+/// docs/reg_upstream_retime_plan.md.
+void runHoistRegsUpstream(::mlir::func::FuncOp function);
+std::unique_ptr<::mlir::Pass> createHoistRegsUpstreamPass();
 void runDelayChainFormAndShare(::mlir::func::FuncOp function);
 void runEliminateDeadState(::mlir::func::FuncOp function);
 
