@@ -45,6 +45,9 @@ public:
   // Bulk form used by generated code: add_lanes({a,b,c,d,e}, {f,g,h,i,j}).
   void add_lanes(std::initializer_list<Lane> lanes) {
     for (const Lane &lane : lanes) {
+      if (!lanes_.empty() && (lane.rst != lanes_.front().rst ||
+                              lane.en != lanes_.front().en))
+        sharedCtrl_ = false;
       lanes_.push_back(lane);
       qNext_.emplace_back();
       pending_.push_back(0);
@@ -58,6 +61,22 @@ public:
   void compute_rise() {
     clkPrev_ = true;
     const std::size_t n = lanes_.size();
+    if (sharedCtrl_) {
+      // Every lane samples the same rst/en wires; read them once instead of
+      // two dependent pointer chases per lane (all DavinciTop loops are
+      // uniform). qNext stays written for every lane, as in the generic path.
+      const bool r = lanes_[0].rst->toBool();
+      const bool e = lanes_[0].en->toBool();
+      const bool go = r | e;
+      for (std::size_t i = 0; i < n; ++i) {
+        pending_[i] = static_cast<char>(go);
+        if (r)
+          qNext_[i] = *lanes_[i].init;
+        else
+          qNext_[i] = *lanes_[i].d;
+      }
+      return;
+    }
     for (std::size_t i = 0; i < n; ++i) {
       const Lane &lane = lanes_[i];
       const bool r = lane.rst->toBool();
@@ -112,6 +131,29 @@ public:
     const std::size_t n = lanes_.size();
     clkPrev_ = true;
     dirty_.assign(loop_word_count(n), 0);
+    if (sharedCtrl_) {
+      // Uniform rst/en: one read replaces two dependent loads per lane; a
+      // disabled edge skips the whole lane walk (qNext keeps its last value,
+      // exactly as the generic path's `continue`).
+      const bool r = lanes_[0].rst->toBool();
+      const bool go = r | lanes_[0].en->toBool();
+      if (go) {
+        for (std::size_t i = 0; i < n; ++i) {
+          pending_[i] = 1;
+          const Wire<Width> &nxt = r ? *lanes_[i].init : *lanes_[i].d;
+          qNext_[i] = nxt;
+          Wire<Width> &q = *lanes_[i].q;
+          if (q != nxt) {
+            q = nxt;
+            dirty_[i >> 6] |= std::uint64_t{1} << (i & 63);
+          }
+        }
+      } else {
+        for (std::size_t i = 0; i < n; ++i)
+          pending_[i] = 0;
+      }
+      return dirty_;
+    }
     for (std::size_t i = 0; i < n; ++i) {
       const Lane &lane = lanes_[i];
       const bool r = lane.rst->toBool();
@@ -150,6 +192,7 @@ private:
   std::vector<char> pending_;  // char (not vector<bool>): stable lane addresses
   std::vector<std::uint64_t> dirty_;
   bool clkPrev_ = false;
+  bool sharedCtrl_ = true;  // all lanes share one rst and one en pointer
 };
 
 template <unsigned Width>
@@ -171,6 +214,9 @@ public:
 
   void add_lanes(std::initializer_list<Lane> lanes) {
     for (const Lane &lane : lanes) {
+      if (!lanes_.empty() && (lane.rst != lanes_.front().rst ||
+                              lane.en != lanes_.front().en))
+        sharedCtrl_ = false;
       lanes_.push_back(lane);
       stages_.emplace_back(lane.depth);
       head_.push_back(0);
@@ -189,6 +235,24 @@ public:
   void compute_rise() {
     clkPrev_ = true;
     const std::size_t n = lanes_.size();
+    if (sharedCtrl_) {
+      // Uniform rst/en: one read replaces two dependent loads per lane.
+      const bool r = lanes_[0].rst->toBool();
+      const bool e = lanes_[0].en->toBool();
+      const bool go = r | e;
+      for (std::size_t i = 0; i < n; ++i) {
+        const Lane &lane = lanes_[i];
+        pendingReset_[i] = r;
+        pending_[i] = static_cast<char>(go);
+        if (r)
+          qNext_[i] = *lane.init;
+        else if (e) {
+          sampled_[i] = *lane.d;
+          qNext_[i] = stages_[i][next_head(i, lane.depth)];
+        }
+      }
+      return;
+    }
     for (std::size_t i = 0; i < n; ++i) {
       const Lane &lane = lanes_[i];
       const bool r = lane.rst->toBool();
@@ -312,6 +376,7 @@ private:
   std::vector<std::uint64_t> dirty_;
   std::vector<std::uint64_t> advanced_;
   bool clkPrev_ = false;
+  bool sharedCtrl_ = true;  // all lanes share one rst and one en pointer
 };
 
 }  // namespace pyc::cpp
