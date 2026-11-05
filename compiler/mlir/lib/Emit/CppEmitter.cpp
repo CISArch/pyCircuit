@@ -55,6 +55,8 @@ static bool isSequentialClockUse(OpOperand &use) {
     return mem.getClk() == value;
   if (auto mem = dyn_cast<pyc::SyncMem2WOp>(owner))
     return mem.getClk() == value;
+  if (auto mem = dyn_cast<pyc::SyncMemNMOp>(owner))
+    return mem.getClk() == value;
   if (auto mem = dyn_cast<pyc::ByteMemOp>(owner))
     return mem.getClk() == value;
   if (auto fifo = dyn_cast<pyc::FifoOp>(owner))
@@ -537,6 +539,7 @@ static bool functionHasSequentialState(func::FuncOp f,
             pyc::SyncMemOp,
             pyc::SyncMemDPOp,
             pyc::SyncMem2WOp,
+            pyc::SyncMemNMOp,
             pyc::AsyncFifoOp,
             pyc::CdcSyncOp>(op)) {
       hasSeq = true;
@@ -1455,6 +1458,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   llvm::SmallVector<pyc::SyncMemOp> syncMems;
   llvm::SmallVector<pyc::SyncMemDPOp> syncMemDPs;
   llvm::SmallVector<pyc::SyncMem2WOp> syncMem2Ws;
+  llvm::SmallVector<pyc::SyncMemNMOp> syncMemNMs;
   llvm::SmallVector<pyc::AsyncFifoOp> asyncFifos;
   llvm::SmallVector<pyc::CdcSyncOp> cdcSyncs;
   llvm::SmallVector<pyc::InstanceOp> instances;
@@ -1477,6 +1481,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       syncMemDPs.push_back(mem);
     else if (auto mem = dyn_cast<pyc::SyncMem2WOp>(op))
       syncMem2Ws.push_back(mem);
+    else if (auto mem = dyn_cast<pyc::SyncMemNMOp>(op))
+      syncMemNMs.push_back(mem);
     else if (auto fifo = dyn_cast<pyc::AsyncFifoOp>(op))
       asyncFifos.push_back(fifo);
     else if (auto s = dyn_cast<pyc::CdcSyncOp>(op))
@@ -1519,6 +1525,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   for (auto mem : syncMem2Ws)
     stateOutputs.insert(mem.getRdata());
+  for (auto mem : syncMemNMs)
+    for (auto rd : mem.getRdatas())
+      stateOutputs.insert(rd);
   for (auto fifo : asyncFifos) {
     stateOutputs.insert(fifo.getInReady());
     stateOutputs.insert(fifo.getOutValid());
@@ -1746,6 +1755,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       return sanitizeId(nameAttr.getValue());
     return nt.get(m.getRdata());
   };
+  llvm::DenseMap<Operation *, std::string> syncMemNMInstName;  // NM names, filled post-sort
+  auto syncMemNMKey = [&](pyc::SyncMemNMOp m) -> std::string {
+    if (auto nameAttr = m->getAttrOfType<StringAttr>("name"))
+      return sanitizeId(nameAttr.getValue());
+    return m.getRdatas().empty() ? "" : nt.get(*m.getRdatas().begin());
+  };
   auto cdcKey = [&](pyc::CdcSyncOp s) { return nt.get(s.getOut()); };
 
   std::sort(regs.begin(), regs.end(), [&](pyc::RegOp a, pyc::RegOp b) { return regKey(a) < regKey(b); });
@@ -1760,6 +1775,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   std::sort(syncMems.begin(), syncMems.end(), [&](pyc::SyncMemOp a, pyc::SyncMemOp b) { return syncMemKey(a) < syncMemKey(b); });
   std::sort(syncMemDPs.begin(), syncMemDPs.end(), [&](pyc::SyncMemDPOp a, pyc::SyncMemDPOp b) { return syncMemDPKey(a) < syncMemDPKey(b); });
   std::sort(syncMem2Ws.begin(), syncMem2Ws.end(), [&](pyc::SyncMem2WOp a, pyc::SyncMem2WOp b) { return syncMem2WKey(a) < syncMem2WKey(b); });
+  std::sort(syncMemNMs.begin(), syncMemNMs.end(), [&](pyc::SyncMemNMOp a, pyc::SyncMemNMOp b) { return syncMemNMKey(a) < syncMemNMKey(b); });
+  {
+    unsigned nmSeq = 0;
+    for (auto mem : syncMemNMs) {
+      std::string instName = "m" + std::to_string(nmSeq++) + "_inst";
+      if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
+        instName = sanitizeId(nameAttr.getValue());
+      syncMemNMInstName.try_emplace(mem.getOperation(), instName);
+    }
+  }
   std::sort(cdcSyncs.begin(), cdcSyncs.end(), [&](pyc::CdcSyncOp a, pyc::CdcSyncOp b) { return cdcKey(a) < cdcKey(b); });
   auto scheduleSlot = [&](Operation *op) -> uint64_t {
     if (!op || op->getNumResults() == 0)
@@ -1789,7 +1814,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
           "C++ emitter cannot map schedule node to a comb execution unit");
     if (!isa<pyc::CombOp, pyc::InstanceOp, pyc::RegOp, pyc::DelayLineOp,
              pyc::FifoOp, pyc::ByteMemOp, pyc::SyncMemOp, pyc::SyncMemDPOp,
-             pyc::SyncMem2WOp, pyc::AsyncFifoOp, pyc::CdcSyncOp>(node.operation))
+             pyc::SyncMem2WOp, pyc::SyncMemNMOp, pyc::AsyncFifoOp,
+             pyc::CdcSyncOp>(node.operation))
       return node.operation->emitError(
           "C++ emitter cannot map schedule node to a supported execution or state-source unit");
   }
@@ -2435,6 +2461,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	       << "->pendingWrite0, &" << instName << "->latchedWaddr0, &" << instName << "->latchedWdata0, &" << instName
 	       << "->latchedWstrb0);\n";
 	  }
+	  for (auto mem : syncMemNMs) {
+	    std::string instName = syncMemNMInstName.lookup(mem.getOperation());
+	    os << "    if (" << instName << ") reg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
+	       << "->pendingWrite[0], &" << instName << "->latchedWaddr[0], &" << instName << "->latchedWdata[0], &" << instName
+	       << "->latchedWstrb[0]);\n";
+	  }
 	  if (!instInfos.empty()) {
 	    os << "    auto reg_child = [&](auto &child, const char *seg) {\n";
 	    os << "      std::string p = prefix;\n";
@@ -2673,6 +2705,29 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  pyc::cpp::pyc_sync_mem_2w<" << addrW << ", " << dataW << ", " << depth << "> *" << instName
        << " = nullptr;\n";
   }
+  for (auto mem : syncMemNMs) {
+    auto addrTy = dyn_cast<IntegerType>(mem.getRaddrs()[0].getType());
+    auto dataTy = dyn_cast<IntegerType>(mem.getRdatas()[0].getType());
+    if (!addrTy || !dataTy)
+      return mem.emitError("C++ emitter only supports integer sync_mem_nm types");
+    unsigned addrW = addrTy.getWidth();
+    unsigned dataW = dataTy.getWidth();
+    if (addrW == 0)
+      return mem.emitError("invalid sync_mem_nm addr width");
+    if (dataW == 0)
+      return mem.emitError("invalid sync_mem_nm data width");
+
+    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
+    if (!depthAttr)
+      return mem.emitError("missing integer attribute `depth`");
+    auto depth = depthAttr.getValue().getZExtValue();
+    unsigned rp = mem.getRens().size();
+    unsigned wp = mem.getWvalids().size();
+
+    std::string instName = syncMemNMInstName.lookup(mem.getOperation());
+    os << "  pyc::cpp::pyc_sync_mem_nm<" << addrW << ", " << dataW << ", " << depth << ", " << rp
+       << ", " << wp << "> *" << instName << " = nullptr;\n";
+  }
   for (auto fifo : asyncFifos) {
     unsigned w = bitWidth(fifo.getOutData().getType());
     if (w == 0 || w > 64)
@@ -2742,6 +2797,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   for (auto mem : syncMem2Ws)
     emitTickSnapshotDecls(syncMem2WInstName.lookup(mem.getOperation()),
                           mem->getOperands());
+  for (auto mem : syncMemNMs)
+    emitTickSnapshotDecls(syncMemNMInstName.lookup(mem.getOperation()),
+                          mem->getOperands());
   for (auto fifo : asyncFifos)
     emitTickSnapshotDecls(nt.get(fifo.getInReady()) + "_inst",
                           fifo->getOperands());
@@ -2786,6 +2844,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   for (auto mem : syncMem2Ws) {
     std::string instName = syncMem2WInstName.lookup(mem.getOperation());
     os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem_2w binding: " << instName
+       << "\" << \"\\n\"; std::abort(); }\n";
+  }
+  for (auto mem : syncMemNMs) {
+    std::string instName = syncMemNMInstName.lookup(mem.getOperation());
+    os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem_nm binding: " << instName
        << "\" << \"\\n\"; std::abort(); }\n";
   }
   os << "  }\n\n";
@@ -2944,6 +3007,43 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
        << nt.get(mem.getWvalid1()) << ", " << nt.get(mem.getWaddr1()) << ", " << nt.get(mem.getWdata1()) << ", "
        << nt.get(mem.getWstrb1()) << ");\n";
   }
+  for (auto mem : syncMemNMs) {
+    auto addrTy = dyn_cast<IntegerType>(mem.getRaddrs()[0].getType());
+    auto dataTy = dyn_cast<IntegerType>(mem.getRdatas()[0].getType());
+    if (!addrTy || !dataTy)
+      return mem.emitError("C++ emitter only supports integer sync_mem_nm types");
+    unsigned addrW = addrTy.getWidth();
+    unsigned dataW = dataTy.getWidth();
+    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
+    if (!depthAttr)
+      return mem.emitError("missing integer attribute `depth`");
+    auto depth = depthAttr.getValue().getZExtValue();
+    unsigned rp = mem.getRens().size();
+    unsigned wp = mem.getWvalids().size();
+    std::string instName = syncMemNMInstName.lookup(mem.getOperation());
+    auto joinNames = [&](auto range) {
+      std::string s;
+      for (auto v : range) {
+        if (!s.empty()) s += ", ";
+        s += "&" + nt.get(v);
+      }
+      return s;
+    };
+    os << "    {\n";
+    os << "      static const pyc::cpp::Wire<1> *const nm_rens_" << instName << "[] = {" << joinNames(mem.getRens()) << "};\n";
+    os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_ras_" << instName << "[] = {" << joinNames(mem.getRaddrs()) << "};\n";
+    os << "      pyc::cpp::Wire<" << dataW << "> *const nm_rds_" << instName << "[] = {" << joinNames(mem.getRdatas()) << "};\n";
+    os << "      static const pyc::cpp::Wire<1> *const nm_wvs_" << instName << "[] = {" << joinNames(mem.getWvalids()) << "};\n";
+    os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_was_" << instName << "[] = {" << joinNames(mem.getWaddrs()) << "};\n";
+    os << "      static const pyc::cpp::Wire<" << dataW << "> *const nm_wds_" << instName << "[] = {" << joinNames(mem.getWdatas()) << "};\n";
+    os << "      static const pyc::cpp::Wire<" << ((dataW + 7) / 8) << "> *const nm_wss_" << instName << "[] = {" << joinNames(mem.getWstrbs()) << "};\n";
+    os << "      " << instName << " = new pyc::cpp::pyc_sync_mem_nm<" << addrW << ", " << dataW << ", " << depth
+       << ", " << rp << ", " << wp << ">("
+       << nt.get(mem.getClk()) << ", " << nt.get(mem.getRst()) << ", "
+       << "nm_rens_" << instName << ", nm_ras_" << instName << ", nm_rds_" << instName << ", "
+       << "nm_wvs_" << instName << ", nm_was_" << instName << ", nm_wds_" << instName << ", nm_wss_" << instName << ");\n";
+    os << "    }\n";
+  }
   os << "    _pyc_validate_primitive_bindings();\n";
   os << "    _pyc_init_runtime_controls();\n";
   os << "    #ifdef PYC_ENABLE_CTOR_EVAL\n";
@@ -2969,7 +3069,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) ||
           isa<pyc::DelayLineOp>(op) || isa<pyc::SyncMemOp>(op) ||
           isa<pyc::SyncMemDPOp>(op) || isa<pyc::SyncMem2WOp>(op) ||
-          isa<pyc::CdcSyncOp>(op))
+          isa<pyc::SyncMemNMOp>(op) || isa<pyc::CdcSyncOp>(op))
         return false;
       if (!includePrims &&
           (isa<pyc::FifoOp>(op) || isa<pyc::AsyncFifoOp>(op) || isa<pyc::ByteMemOp>(op) || isa<pyc::InstanceOp>(op)))
@@ -3239,6 +3339,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             pyc::ByteMemOp,
             pyc::SyncMemOp,
             pyc::SyncMemDPOp,
+            pyc::SyncMem2WOp,
+            pyc::SyncMemNMOp,
             pyc::CdcSyncOp,
             pyc::InstanceOp,
             pyc::RegOp,
@@ -3821,7 +3923,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op) || isa<pyc::RegOp>(op) ||
           isa<pyc::DelayLineOp>(op) || isa<pyc::SyncMemOp>(op) ||
           isa<pyc::SyncMemDPOp>(op) || isa<pyc::SyncMem2WOp>(op) ||
-          isa<pyc::CdcSyncOp>(op))
+          isa<pyc::SyncMemNMOp>(op) || isa<pyc::CdcSyncOp>(op))
         continue;
 
       unsigned idx = static_cast<unsigned>(nodes.size());
@@ -4405,6 +4507,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                            os << indent << key << "->tick_compute();\n";
                          });
   }
+  for (auto mem : syncMemNMs) {
+    std::string key = syncMemNMInstName.lookup(mem.getOperation());
+    emitStateTickCompute(key, mem->getOperands(), "    ",
+                         [&](llvm::StringRef indent) {
+                           os << indent << key << "->tick_compute();\n";
+                         });
+  }
   for (auto fifo : asyncFifos) {
     std::string key = nt.get(fifo.getInReady()) + "_inst";
     emitStateTickCompute(key, fifo->getOperands(), "    ",
@@ -4616,6 +4725,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     emitCommitWake(changed + " & std::remove_reference_t<decltype(*" + key +
                        ")>::kReadDataChanged",
                    mem.getRdata());
+  }
+  for (auto mem : syncMemNMs) {
+    std::string key = syncMemNMInstName.lookup(mem.getOperation());
+    std::string changed = "_pyc_commit_changed_" + key;
+    os << "    const auto " << changed << " = " << key
+       << "->tick_commit();\n";
+    for (auto [i, rd] : llvm::enumerate(mem.getRdatas()))
+      emitCommitWake(changed + " & (std::remove_reference_t<decltype(*" + key +
+                         ")>::change_mask_t{1} << " + std::to_string(i) + ")",
+                     rd);
   }
   for (auto fifo : asyncFifos) {
     std::string key = nt.get(fifo.getInReady()) + "_inst";

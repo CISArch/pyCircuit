@@ -406,6 +406,20 @@ def PYC_SyncMem2WOp : PYC_Op<"sync_mem_2w", [MemoryEffects<[MemRead, MemWrite]>,
   let assemblyFormat = "$clk `,` $rst `,` $ren `,` $raddr `,` $wvalid0 `,` $waddr0 `,` $wdata0 `,` $wstrb0 `,` $wvalid1 `,` $waddr1 `,` $wdata1 `,` $wstrb1 attr-dict `:` type($raddr) `,` type($rdata) `,` type($wstrb0)";
 }
 
+def PYC_SyncMemNMOp : PYC_Op<"sync_mem_nm", [MemoryEffects<[MemRead, MemWrite]>, AttrSizedOperandSegments]> {
+  let summary = "Synchronous NxM memory (N registered write-forward read ports, M write ports; higher write index wins same-address conflicts, prototype)";
+  let arguments = (ins Variadic<I1>:$rens,
+                        Variadic<AnyInteger>:$raddrs,
+                        Variadic<I1>:$wvalids,
+                        Variadic<AnyInteger>:$waddrs,
+                        Variadic<AnyInteger>:$wdatas,
+                        Variadic<AnyInteger>:$wstrbs,
+                        PYC_ClockType:$clk,
+                        PYC_ResetType:$rst);
+  let results = (outs Variadic<AnyInteger>:$rdatas);
+  let hasVerifier = 1;
+}
+
 def PYC_AsyncFifoOp : PYC_Op<"async_fifo", [MemoryEffects<[MemRead, MemWrite]>, AllTypesMatch<["in_data", "out_data"]>]> {
   let summary = "Ready/valid async FIFO (dual-clock, strict handshake, prototype)";
   let arguments = (ins PYC_ClockType:$in_clk,
