@@ -91,6 +91,10 @@ struct StateChainLink {
   llvm::SmallVector<pyc::AliasOp> aliasesFromConsumerToProducer;
 };
 
+/// Match a proven serial state chain: `consumer.next` reaches `keyReg`'s q
+/// only through transparent aliases, with equivalent clock/reset/enable/init.
+/// Read-only fanout off intermediate stages is allowed (mode permitting);
+/// the rewrite turns it into fixed-depth delay taps.
 std::optional<StateChainLink>
 matchStateChainPredecessor(pyc::RegOp consumer, pyc::RegOp keyReg,
                            DelayChainMode mode,

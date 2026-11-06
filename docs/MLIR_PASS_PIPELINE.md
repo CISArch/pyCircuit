@@ -33,40 +33,42 @@
 | 15 | `pyc-eliminate-wires` | function | 消除可直接替换的 `pyc.wire` / `pyc.assign` 中间连接。 | 始终 |
 | 16 | `pyc-eliminate-dead-state` | function | 删除对可观察行为无影响的寄存器、存储等状态；带外部可读身份的状态视为活。 | 始终 |
 | 17 | `pyc-state-optimize` | function | 统一结构化状态优化（仅 C++）：两轮等价状态合并（轮间 pass 内 canonicalize+CSE）→ retiming → 死状态清理 → 直连 delay-line/tap 成链与等价 history 共享 → 整数 state lane 打包。被删状态的 name/debug/probe/trace 身份全程挂到 survivor 的只读 alias 或 slice alias。 | `--emit=cpp` |
-| 18 | `pyc-slp-pack-wires` | function | 将可识别的同构标量 lane 重新打包成 Vector 操作。 | 未启用 `--unroll-vector` |
-| 19 | `pyc-comb-canonicalize` | function | PYC 组合图结构化简（mux、wire、get/create 重建）并将结构化 Vec 拆成 lane 级运算，使 dialect folder 能折叠可知 lane。 | 始终 |
-| 20 | `pyc-check-comb-cycles` | module | 构建组合依赖图并拒绝组合环。 | 始终 |
-| 21 | `pyc-check-clock-domains` | module | 检查跨时钟域连接、时钟/复位使用和 CDC 合法性。 | 始终 |
-| 22 | `pyc-pack-i1-regs` | function | 收集通用 state pack 留下的可合并标量 `i1` 寄存器，并把身份挂到 packed bit alias。 | 始终 |
-| 23 | `pyc-apply-observation-demand` | module | 状态优化重映射身份之后，把未声明的 `pyc.name` 标成懒查找（`pyc.observe_lazy` + 存储切片描述），声明过的探针（`@probe` source、`--trace-codegen-plan`、`debug_keep` / `observable` / `probe*` / `trace*`）仍急切。懒名字不钉 struct、不每拍抄，但 `findByPath` 仍可按名读。 | `--emit=cpp` 且 `--observe-named=demand`（默认） |
-| 24 | `pyc-fuse-comb` | function | 将连续组合逻辑融合为 `pyc.comb` 区域，减少 emitter 调度开销；仍带稳定名字或观测属性的 op 是 fusion barrier。 | 默认启用；仅当同时设置 `--sim-mode=cpp-only` 与 `--cpp-only-preserve-ops` 时跳过 |
-| 25 | `canonicalize` | module | 对前面 lowering/fusion 产生的新模式再次规范化。 | 始终 |
-| 26 | `cse` | module | 再次消除公共子表达式。 | 始终 |
-| 27 | `remove-dead-values` | module | 清理二次优化后的无用 SSA value。 | LLVM < 19；LLVM 19+ 跳过 |
-| 28 | `pyc-eliminate-dead-instances` | function | 再次删除优化后变得不可观察的实例。 | 始终 |
-| 29 | `symbol-dce` | module | 删除无用符号。 | 始终 |
-| 30 | `pyc-check-flat-types` | function | 验证所有 operand/result 类型均可被目标 emitter 表示。 | 始终 |
-| 31 | `pyc-check-no-dynamic` | function | 拒绝残留的 `scf.*`、`index` 等动态结构。 | 始终 |
-| 32 | `pyc-check-logic-depth` | module | 计算组合逻辑深度并按 `--logic-depth` 限制拒绝超限设计。 | 始终 |
-| 33 | `pyc-cpp-placement` | module | 为 C++ emit 标注 comb 方法切分与 struct/local 存储；此时仍带 `pyc.name` 的值留在结构体上，供探针和 trace 取样。 | 仅 `--emit=cpp` |
-| 34 | `pyc-collect-compile-stats` | function | 写入寄存器、存储和硬件位数等编译统计属性。 | 始终 |
+| 18 | `pyc-fork-merge-retime` | function | 分叉寄存器上游归并 retiming（仅 C++）：在统一 state-optimize 之后运行，把分叉路径的公共寄存器级数上游化共享、额外级数留在分支沿；retiming/成链 pass 不感知合并后的多重度。 | `--emit=cpp` |
+| 19 | `pyc-slp-pack-wires` | function | 将可识别的同构标量 lane 重新打包成 Vector 操作。 | 未启用 `--unroll-vector` |
+| 20 | `pyc-comb-canonicalize` | function | PYC 组合图结构化简（mux、wire、get/create 重建）并将结构化 Vec 拆成 lane 级运算，使 dialect folder 能折叠可知 lane。 | 始终 |
+| 21 | `pyc-check-comb-cycles` | module | 构建组合依赖图并拒绝组合环。 | 始终 |
+| 22 | `pyc-check-clock-domains` | module | 检查跨时钟域连接、时钟/复位使用和 CDC 合法性。 | 始终 |
+| 23 | `pyc-pack-i1-regs` | function | 收集通用 state pack 留下的可合并标量 `i1` 寄存器，并把身份挂到 packed bit alias。 | 始终 |
+| 24 | `pyc-state-loop-partition` | function | 分析 pass（仅 C++）：给同时钟域的标量 `pyc.reg` / `pyc.delay_line` 打 `pyc.loop_id`，供 emitter 生成每域一个更新循环。 | `--emit=cpp` 且 `--state-loop`（默认开） |
+| 25 | `pyc-apply-observation-demand` | module | 状态优化重映射身份之后，把未声明的 `pyc.name` 标成懒查找（`pyc.observe_lazy` + 存储切片描述），声明过的探针（`@probe` source、`--trace-codegen-plan`、`debug_keep` / `observable` / `probe*` / `trace*`）仍急切。懒名字不钉 struct、不每拍抄，但 `findByPath` 仍可按名读。 | `--emit=cpp` 且 `--observe-named=demand`（默认） |
+| 26 | `pyc-fuse-comb` | function | 将连续组合逻辑融合为 `pyc.comb` 区域，减少 emitter 调度开销；仍带稳定名字或观测属性的 op 是 fusion barrier。 | 默认启用；仅当同时设置 `--sim-mode=cpp-only` 与 `--cpp-only-preserve-ops` 时跳过 |
+| 27 | `canonicalize` | module | 对前面 lowering/fusion 产生的新模式再次规范化。 | 始终 |
+| 28 | `cse` | module | 再次消除公共子表达式。 | 始终 |
+| 29 | `remove-dead-values` | module | 清理二次优化后的无用 SSA value。 | LLVM < 19；LLVM 19+ 跳过 |
+| 30 | `pyc-eliminate-dead-instances` | function | 再次删除优化后变得不可观察的实例。 | 始终 |
+| 31 | `symbol-dce` | module | 删除无用符号。 | 始终 |
+| 32 | `pyc-check-flat-types` | function | 验证所有 operand/result 类型均可被目标 emitter 表示。 | 始终 |
+| 33 | `pyc-check-no-dynamic` | function | 拒绝残留的 `scf.*`、`index` 等动态结构。 | 始终 |
+| 34 | `pyc-check-logic-depth` | module | 计算组合逻辑深度并按 `--logic-depth` 限制拒绝超限设计。 | 始终 |
+| 35 | `pyc-cpp-placement` | module | 为 C++ emit 标注 comb 方法切分与 struct/local 存储；此时仍带 `pyc.name` 的值留在结构体上，供探针和 trace 取样。 | 仅 `--emit=cpp` |
+| 36 | `pyc-collect-compile-stats` | function | 写入寄存器、存储和硬件位数等编译统计属性。 | 始终 |
 
-通过第 30–32 项 legality gate 后，`pycc` 才调用 C++ 或 Verilog emitter。
-C++ 路径在统计和 emit 之前还会跑第 33 项 `pyc-cpp-placement`。
+通过第 32–34 项 legality gate 后，`pycc` 才调用 C++ 或 Verilog emitter。
+C++ 路径在统计和 emit 之前还会跑第 35 项 `pyc-cpp-placement`。
 
 ## Vector 分支
 
-第 14–16、18 项是 Vector 处理相关步骤。`pyc-eliminate-wires`（15）与
-`pyc-eliminate-dead-state`（16）**始终执行**；互斥的只有 unroll（14）与 SLP（18）：
+第 14–16、19 项是 Vector 处理相关步骤。`pyc-eliminate-wires`（15）与
+`pyc-eliminate-dead-state`（16）**始终执行**；互斥的只有 unroll（14）与 SLP（19）：
 
 ```text
 --unroll-vector
     └─ 14 pyc-unroll-vector → 15 eliminate-wires → 16 eliminate-dead-state
-       → 17 state-optimize                        （跳过 18 slp-pack-wires）
+       → 17 state-optimize → 18 fork-merge-retime （跳过 19 slp-pack-wires）
 
 默认（未开 --unroll-vector）
     └─ （跳过 14）→ 15 eliminate-wires → 16 eliminate-dead-state
-       → 17 state-optimize → 18 slp-pack-wires
+       → 17 state-optimize → 18 fork-merge-retime → 19 slp-pack-wires
 ```
 
 `pyc-unroll-vector` 与 `pyc-slp-pack-wires` 不会同时执行。启用 unroll 时，

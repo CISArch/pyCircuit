@@ -13,6 +13,7 @@
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Visitors.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -349,6 +350,11 @@ struct NameTable {
   std::string get(Value v) {
     if (auto it = names.find(v); it != names.end())
       return it->second;
+    if (Value target = getValueCppAliasTarget(v)) {
+      std::string n = get(target);
+      names.try_emplace(v, n);
+      return n;
+    }
     if (Operation *def = v.getDefiningOp()) {
       if (auto nAttr = def->getAttrOfType<StringAttr>("pyc.name")) {
         auto lazy = def->getAttrOfType<BoolAttr>("pyc.observe_lazy");
@@ -667,8 +673,41 @@ static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &
     os << "    " << nt.get(result) << " = " << ess.str() << ";\n";
 }
 
+inline const llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>>
+    kEmptyDelayLoops{};
+
+// Loop-aware delay tap read. Empty delayLoopLines = per-object expression.
+static std::string delayTapReadExpr(
+    pyc::DelayLineOp delay, unsigned depth, NameTable &nt,
+    const llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>> &delayLoopLines) {
+  const std::string inst = nt.get(delay.getQ()) + "_inst";
+  if (auto idAttr = delay->getAttrOfType<IntegerAttr>("pyc.loop_id")) {
+    if (!isa<VectorType>(delay.getQ().getType())) {
+      const int64_t raw = idAttr.getValue().getSExtValue();
+      const unsigned dw = bitWidth(delay.getQ().getType());
+      if (auto da = delay->getAttrOfType<IntegerAttr>("depth")) {
+        const int64_t key = raw * 65536 + static_cast<int64_t>(dw) * 256 +
+                            da.getValue().getZExtValue();
+        auto it = delayLoopLines.find(key);
+        if (it != delayLoopLines.end()) {
+          long lane = 0;
+          for (pyc::DelayLineOp c : it->second) {
+            if (c == delay)
+              break;
+            ++lane;
+          }
+          return "delay_loop_" + std::to_string(key) + ".lane_tap(" +
+                 std::to_string(lane) + "u, " + std::to_string(depth) + "u)";
+        }
+      }
+    }
+  }
+  return inst + "->tap(" + std::to_string(depth) + "u)";
+}
+
 static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTable &nt,
-                                    CppEmitterPlacementState *ps = nullptr) {
+                                    CppEmitterPlacementState *ps = nullptr,
+                                    const llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>> *delayLoopLines = nullptr) {
   if (ps) {
     for (Value v : op.getOperands())
       (void)ps->emitLocalDeclIfNeeded(v, v.getType(), nt.get(v), os);
@@ -718,6 +757,8 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     return success();
   }
   if (auto a = dyn_cast<pyc::AliasOp>(op)) {
+    if (getValueCppStorage(a.getResult()) == CppStorageKind::Alias)
+      return success();
     assignExpr(a.getResult(), a.getType(), os, nt,
                [&](llvm::raw_ostream &e) { e << nt.get(a.getIn()); }, ps);
     return success();
@@ -948,8 +989,11 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
       return tap.emitError("invalid delay tap source or depth");
     assignExpr(tap.getTap(), tap.getTap().getType(), os, nt,
                [&](llvm::raw_ostream &e) {
-                 e << nt.get(delay.getQ()) << "_inst->tap("
-                   << depth.getInt() << "u)";
+                 e << delayTapReadExpr(delay,
+                                       static_cast<unsigned>(depth.getInt()),
+                                       nt,
+                                       delayLoopLines ? *delayLoopLines
+                                                   : kEmptyDelayLoops);
                },
                ps);
     return success();
@@ -1217,10 +1261,13 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
   return op.emitError("unsupported combinational op for C++ emission");
 }
 
-static void emitMetadataCombFanout(
-    Value value, llvm::raw_ostream &os, const EmissionSchedule &schedule,
-    const llvm::DenseMap<Operation *, unsigned> &combIndices, NameTable &nt,
-    llvm::StringRef indent = "      ") {
+// Fanout wake of `value` as sorted (comb dirty word, OR mask) pairs, merged
+// per word: up to 64 combs sharing a dirty word collapse to one store.
+// Appends to `out` without merging across prior entries.
+static void collectFanoutWordMasks(
+    Value value, const EmissionSchedule &schedule,
+    const llvm::DenseMap<Operation *, unsigned> &combIndices,
+    llvm::SmallVectorImpl<std::pair<unsigned, uint64_t>> &out) {
   auto sourceIt = schedule.valueToNode.find(value);
   if (sourceIt == schedule.valueToNode.end())
     return;
@@ -1237,19 +1284,25 @@ static void emitMetadataCombFanout(
   llvm::SmallVector<unsigned> fanouts(uniqueFanouts.begin(),
                                       uniqueFanouts.end());
   llvm::sort(fanouts);
-  if (fanouts.empty())
-    return;
-  // Emit fanout wake as per-word OR masks instead of a mark loop: each group
-  // of up to 64 combs sharing a dirty word collapses to one store.
-  llvm::SmallVector<std::pair<unsigned, uint64_t>> wordMasks;
+  const std::size_t start = out.size();
   for (unsigned fanout : fanouts) {
     unsigned word = fanout / 64;
     uint64_t mask = uint64_t{1} << (fanout % 64);
-    if (!wordMasks.empty() && wordMasks.back().first == word)
-      wordMasks.back().second |= mask;
+    if (out.size() > start && out.back().first == word)
+      out.back().second |= mask;
     else
-      wordMasks.emplace_back(word, mask);
+      out.emplace_back(word, mask);
   }
+}
+
+static void emitMetadataCombFanout(
+    Value value, llvm::raw_ostream &os, const EmissionSchedule &schedule,
+    const llvm::DenseMap<Operation *, unsigned> &combIndices, NameTable &nt,
+    llvm::StringRef indent = "      ") {
+  llvm::SmallVector<std::pair<unsigned, uint64_t>> wordMasks;
+  collectFanoutWordMasks(value, schedule, combIndices, wordMasks);
+  if (wordMasks.empty())
+    return;
   std::string fanoutName = "_pyc_direct_fanout_" + sanitizeId(nt.get(value));
   os << indent << "static constexpr std::array<std::pair<unsigned, std::uint64_t>, "
      << wordMasks.size() << "> " << fanoutName << "{{";
@@ -1259,6 +1312,30 @@ static void emitMetadataCombFanout(
   os << "}};\n";
   os << indent << "for (const auto &[_pyc_w, _pyc_m] : " << fanoutName << ")\n";
   os << indent << "  _pyc_comb_dirty.markWordUnchecked(_pyc_w, _pyc_m);\n";
+}
+
+// Emit one constexpr pyc::cpp::FusedLaneWake table named `name` (per-lane
+// prefix offsets into `entries`) for a table-driven set-bit wake walk. Used
+// by the fused direct_commit walk and the phased commit() walk.
+static void emitFusedLaneWake(
+    llvm::raw_ostream &os, llvm::StringRef name,
+    const llvm::SmallVectorImpl<unsigned> &offsets,
+    const llvm::SmallVectorImpl<std::pair<unsigned, uint64_t>> &entries,
+    llvm::StringRef indent) {
+  os << indent << "static constexpr pyc::cpp::FusedLaneWake<"
+     << offsets.size() - 1 << ", " << entries.size() << "> " << name
+     << "{{{";
+  llvm::interleaveComma(offsets, os, [&](unsigned o) { os << o << "u"; });
+  if (entries.empty()) {
+    // std::array<T, 0> initializes from {} — no element braces.
+    os << "}},{{}}};\n";
+  } else {
+    os << "}},{{";
+    llvm::interleaveComma(entries, os, [&](const auto &e) {
+      os << "{" << e.first << "u, 0x" << llvm::utohexstr(e.second) << "ull}";
+    });
+    os << "}}};\n";
+  }
 }
 
 static bool isDirtyDrivenInput(Value input) {
@@ -1274,10 +1351,9 @@ static bool hasDirtyPolledBoundaryInput(pyc::CombOp comb) {
 
 static void emitCombInputGuard(
     pyc::CombOp comb, llvm::raw_ostream &os, NameTable &nt, unsigned idx) {
-  os << "    bool _pyc_comb_should_eval = _pyc_comb_take_active(" << idx
+  os << "    bool _pyc_comb_should_eval = _pyc_comb_dirty.take(" << idx
      << "u);\n";
-  os << "    bool _pyc_comb_inputs_changed = !_pyc_comb_" << idx
-     << "_inputs_valid;\n";
+  os << "    bool _pyc_comb_inputs_changed = _pyc_comb_should_eval;\n";
   for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
     if (isDirtyDrivenInput(input))
       continue;
@@ -1288,12 +1364,9 @@ static void emitCombInputGuard(
     os << "      _pyc_comb_inputs_changed = true;\n";
     os << "    }\n";
   }
-  os << "    _pyc_comb_inputs_changed = _pyc_comb_inputs_changed || "
-        "_pyc_comb_should_eval;\n";
   os << "    if (!_pyc_comb_inputs_changed) {\n";
   os << "      return;\n";
   os << "    }\n";
-  os << "    _pyc_comb_" << idx << "_inputs_valid = true;\n";
 }
 
 static void emitCombResultPublish(
@@ -1319,7 +1392,9 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
                                     const CppEmitterOptions &opts,
                                     const EmissionSchedule &schedule,
                                     const llvm::DenseMap<Operation *, unsigned>
-                                        &combIndices) {
+                                        &combIndices,
+                                    const llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>>
+                                        *delayLoopLines = nullptr) {
   if (comb.getBody().empty())
     return comb.emitError("pyc.comb must have a non-empty region");
 
@@ -1361,7 +1436,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
       os << "  inline void " << partName << "() {\n";
       placement.beginMethod(partName);
       for (Operation *op : part.second) {
-        if (failed(emitCombAssign(*op, os, nt, &placement)))
+        if (failed(emitCombAssign(*op, os, nt, &placement, delayLoopLines)))
           return failure();
       }
       os << "  }\n\n";
@@ -1390,7 +1465,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   placement.beginMethod(methodName);
   emitCombInputGuard(comb, os, nt, idx);
   for (Operation *op : combOps) {
-    if (failed(emitCombAssign(*op, os, nt, &placement)))
+    if (failed(emitCombAssign(*op, os, nt, &placement, delayLoopLines)))
       return failure();
   }
 
@@ -1467,25 +1542,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << "\n";
 
-  // Internal wires for op results (including inside pyc.comb regions).
-  struct Decl {
-    std::string name;
-    Type ty;
-  };
-  std::vector<Decl> decls;
-  decls.reserve(256);
-  f.walk([&](Operation *op) {
-    for (Value r : op->getResults()) {
-      if (getValueCppStorage(r) == CppStorageKind::Local)
-        continue;
-      decls.push_back(Decl{nt.get(r), r.getType()});
-    }
-  });
-  std::sort(decls.begin(), decls.end(), [](const Decl &a, const Decl &b) { return a.name < b.name; });
-  for (const Decl &d : decls)
-    os << "  " << cppType(d.ty) << " " << d.name << "{};\n";
-  os << "\n";
-
   // Sequential primitive instances.
   llvm::SmallVector<pyc::RegOp> regs;
   llvm::SmallVector<pyc::DelayLineOp> delayLines;
@@ -1527,7 +1583,237 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  " << cppType(tap.getTap().getType()) << " " << nt.get(tap.getTap())
        << "_qNext{};\n";
 
+  // Tick-fuse (compute/commit merge) classification. A reg is direct-write-safe
+  // iff its d/rst/en do not depend, through the value graph, on any state
+  // output of this module (reg/delay q and tap, mem/fifo/cdc outputs,
+  // instance results): those only change at their own commit, so reading them
+  // in another element's single-phase update is an ordering hazard. Comb
+  // results, top ports and pure ops over them are stable snapshots for this
+  // edge. Only enabled when every reg/delay shares one clock (fast edge).
+  llvm::DenseSet<Value> stateOutputs;
+  for (auto r : regs)
+    stateOutputs.insert(r.getQ());
+  for (auto delay : delayLines)
+    stateOutputs.insert(delay.getQ());
+  for (auto tap : delayTaps)
+    stateOutputs.insert(tap.getTap());
+  for (auto fifo : fifos) {
+    stateOutputs.insert(fifo.getInReady());
+    stateOutputs.insert(fifo.getOutValid());
+    stateOutputs.insert(fifo.getOutData());
+  }
+  for (auto mem : byteMems)
+    stateOutputs.insert(mem.getRdata());
+  for (auto mem : syncMems)
+    stateOutputs.insert(mem.getRdata());
+  for (auto mem : syncMemDPs) {
+    stateOutputs.insert(mem.getRdata0());
+    stateOutputs.insert(mem.getRdata1());
+  }
+  for (auto fifo : asyncFifos) {
+    stateOutputs.insert(fifo.getInReady());
+    stateOutputs.insert(fifo.getOutValid());
+    stateOutputs.insert(fifo.getOutData());
+  }
+  for (auto sync : cdcSyncs)
+    stateOutputs.insert(sync.getOut());
+  for (auto inst : instances)
+    for (Value out : inst.getResults())
+      stateOutputs.insert(out);
+  auto dependsOnState = [&](Value root) -> bool {
+    llvm::SmallSet<Operation *, 32> visited;
+    llvm::SmallVector<Value> work{root};
+    while (!work.empty()) {
+      Value v = work.pop_back_val();
+      if (stateOutputs.count(v))
+        return true;
+      Operation *def = v.getDefiningOp();
+      if (!def || isa<pyc::CombOp>(def))
+        continue; // top port, or comb boundary evaluated before the edge
+      if (!visited.insert(def).second)
+        continue;
+      for (Value operand : def->getOperands())
+        work.push_back(operand);
+    }
+    return false;
+  };
+  bool tickFuseSingleClock = true;
+  std::string tickFuseClk;
+  auto noteTickFuseClk = [&](Value clk) {
+    std::string name = nt.get(clk);
+    if (tickFuseClk.empty())
+      tickFuseClk = std::move(name);
+    else if (tickFuseClk != name)
+      tickFuseSingleClock = false;
+  };
+  for (auto r : regs)
+    noteTickFuseClk(r.getClk());
+  for (auto delay : delayLines)
+    noteTickFuseClk(delay.getClk());
+  llvm::DenseSet<Operation *> fusedRegOps;
+  if (tickFuseSingleClock && !tickFuseClk.empty())
+    for (auto r : regs)
+      if (!dependsOnState(r.getNext()) && !dependsOnState(r.getRst()) &&
+          !dependsOnState(r.getEn()))
+        fusedRegOps.insert(r.getOperation());
+
+  // RegLoop grouping: scalar regs carrying pyc.loop_id lower into
+  // per-loop pyc::cpp::RegLoop<W> members; everything else keeps the
+  // per-reg expansion. Map: loop id -> (width, regs in IR order).
+  llvm::DenseMap<int64_t, unsigned> regLoopWidth;
+  llvm::DenseSet<int64_t> fusedRegLoops; // loops whose lanes are all fused
+  llvm::DenseMap<int64_t, llvm::SmallVector<pyc::RegOp>> regLoopRegs;
+  llvm::SmallVector<pyc::RegOp> unloopedRegs;
+  for (pyc::RegOp r : regs) {
+    auto idAttr = r->getAttrOfType<IntegerAttr>("pyc.loop_id");
+    if (isa<VectorType>(r.getQ().getType()) || !idAttr) {
+      unloopedRegs.push_back(r);
+      continue;
+    }
+    const int64_t id = idAttr.getValue().getSExtValue();
+    unsigned w = bitWidth(r.getQ().getType());
+    // Regs rewritten by earlier passes (retiming/packing) may carry a width
+    // different from the partition-time majority; split into a per-width
+    // sub-loop keyed (id, width) so RegLoop<W>'s single template width holds.
+    // Fused (single-phase) and phased lanes live in separate loops.
+    const bool fused = fusedRegOps.count(r.getOperation());
+    const int64_t key = (id * 4096 + static_cast<int64_t>(w)) * 2 + fused;
+    if (fused)
+      fusedRegLoops.insert(key);
+    regLoopWidth.try_emplace(key, w);
+    regLoopRegs[key].push_back(r);
+    r->setAttr("pyc.loop_id",
+               IntegerAttr::get(IntegerType::get(r->getContext(), 64), key));
+  }
+  llvm::SmallVector<int64_t> regLoopIds;
+  for (auto &kv : regLoopRegs)
+    regLoopIds.push_back(kv.first);
+  std::sort(regLoopIds.begin(), regLoopIds.end());
+  // Loops that keep the two-phase compute/commit protocol.
+  llvm::SmallVector<int64_t> phasedRegLoopIds;
+  llvm::SmallVector<int64_t> fusedRegLoopIds;
+  for (int64_t loopId : regLoopIds)
+    (fusedRegLoops.count(loopId) ? fusedRegLoopIds : phasedRegLoopIds)
+        .push_back(loopId);
+  // Rewrite the reg list so the per-reg paths skip looped regs.
+  regs.clear();
+  for (pyc::RegOp r : unloopedRegs)
+    regs.push_back(r);
+
+  // DelayLoop buckets: key = (clk, width, depth); vector delays stay per-object.
+  llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>> delayLoopLines;
+  llvm::DenseMap<int64_t, std::pair<unsigned, unsigned>> delayLoopShape;
+  llvm::SmallVector<pyc::DelayLineOp> unloopedDelays;
+  for (pyc::DelayLineOp dl : delayLines) {
+    auto idAttr = dl->getAttrOfType<IntegerAttr>("pyc.loop_id");
+    auto depthAttr = dl->getAttrOfType<IntegerAttr>("depth");
+    if (isa<VectorType>(dl.getQ().getType()) || !idAttr || !depthAttr) {
+      unloopedDelays.push_back(dl);
+      continue;
+    }
+    unsigned w = bitWidth(dl.getQ().getType());
+    const int64_t raw = idAttr.getValue().getSExtValue();
+    const int64_t key = raw * 65536 + static_cast<int64_t>(w) * 256 +
+                        depthAttr.getValue().getZExtValue();
+    delayLoopShape.try_emplace(key, std::make_pair(w, depthAttr.getValue().getZExtValue()));
+    delayLoopLines[key].push_back(dl);
+  }
+  llvm::SmallVector<int64_t> delayLoopIds;
+  for (auto &kv : delayLoopLines)
+    delayLoopIds.push_back(kv.first);
+  std::sort(delayLoopIds.begin(), delayLoopIds.end());
+  delayLines.clear();
+  for (pyc::DelayLineOp dl : unloopedDelays)
+    delayLines.push_back(dl);
+
+  // Internal wires for op results (including inside pyc.comb regions).
+  // Looped regs first: their q storage lives in the RegLoop's contiguous
+  // qStore_, so remap the name table onto qRef(lane) and skip declaring a
+  // standalone member — every later reference (comb bodies, wake tables,
+  // probes, trace) emits the qRef expression and reads the store directly.
+  llvm::DenseSet<Value> loopStoredQ;
+  for (auto &kv : regLoopRegs)
+    for (auto [lane, r] : llvm::enumerate(kv.second)) {
+      loopStoredQ.insert(r.getQ());
+      nt.names[r.getQ()] = "reg_loop_" + std::to_string(kv.first) +
+                           ".qRef(" + std::to_string(lane) + "u)";
+    }
+  struct Decl {
+    std::string name;
+    Type ty;
+  };
+  std::vector<Decl> decls;
+  decls.reserve(256);
+  f.walk([&](Operation *op) {
+    for (Value r : op->getResults()) {
+      if (getValueCppStorage(r) != CppStorageKind::Struct)
+        continue;
+      if (loopStoredQ.contains(r))
+        continue;
+      decls.push_back(Decl{nt.get(r), r.getType()});
+    }
+  });
+  std::sort(decls.begin(), decls.end(), [](const Decl &a, const Decl &b) { return a.name < b.name; });
+  for (const Decl &d : decls)
+    os << "  " << cppType(d.ty) << " " << d.name << "{};\n";
+  os << "\n";
+
   auto regKey = [&](pyc::RegOp r) { return nt.get(r.getQ()); };
+  // DelayLoop-aware binding text: {inst, pending, qNext}. inst is empty when
+  // looped; callers use the accessors (pointer-returning) verbatim.
+  auto delayBinding = [&](pyc::DelayLineOp delay)
+      -> std::tuple<std::string, std::string, std::string> {
+    const std::string inst = nt.get(delay.getQ()) + "_inst";
+    if (auto idAttr = delay->getAttrOfType<IntegerAttr>("pyc.loop_id")) {
+      if (!isa<VectorType>(delay.getQ().getType())) {
+        const int64_t raw = idAttr.getValue().getSExtValue();
+        const unsigned dw = bitWidth(delay.getQ().getType());
+        if (auto da = delay->getAttrOfType<IntegerAttr>("depth")) {
+          const int64_t key = raw * 65536 + static_cast<int64_t>(dw) * 256 +
+                              da.getValue().getZExtValue();
+          auto it = delayLoopLines.find(key);
+          if (it != delayLoopLines.end()) {
+            long lane = 0;
+            for (pyc::DelayLineOp c : it->second) {
+              if (c == delay)
+                break;
+              ++lane;
+            }
+            const std::string loop = "delay_loop_" + std::to_string(key);
+            return {"", loop + ".lane_pending(" + std::to_string(lane) + "u)",
+                    loop + ".lane_qnext(" + std::to_string(lane) + "u)"};
+          }
+        }
+      }
+    }
+    return {inst, inst + "->pending", inst + "->qNext"};
+  };
+  // Probe write-intent binding for a scalar reg: either its pyc_reg inst
+  // (unlooped) or the owning RegLoop's lane storage. Returns the C++ text
+  // for `&...pending` and `&...qNext`.
+  auto probePendingNext = [&](pyc::RegOp r) -> std::pair<std::string, std::string> {
+    if (auto idAttr = r->getAttrOfType<IntegerAttr>("pyc.loop_id")) {
+      if (!isa<VectorType>(r.getQ().getType())) {
+        const int64_t id = idAttr.getValue().getSExtValue();
+        // Lane index within the loop = position in regLoopRegs[id].
+        long lane = 0;
+        if (auto it = regLoopRegs.find(id); it != regLoopRegs.end()) {
+          for (pyc::RegOp cand : it->second) {
+            if (cand == r)
+              break;
+            ++lane;
+          }
+        }
+        std::string loop = "reg_loop_" + std::to_string(id);
+        // lane_pending/lane_qnext return pointers; keep the '&' at the call
+        // site out of this string (callers concatenate it verbatim after &).
+        return {loop + ".lane_pending(" + std::to_string(lane) + "u)",
+                loop + ".lane_qnext(" + std::to_string(lane) + "u)"};
+      }
+    }
+    return {nt.get(r.getQ()) + "_inst->pending",
+            nt.get(r.getQ()) + "_inst->qNext"};
+  };
   auto delayKey = [&](pyc::DelayLineOp delay) { return nt.get(delay.getQ()); };
   auto delayTapKey = [&](pyc::DelayTapOp tap) { return nt.get(tap.getTap()); };
   auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
@@ -1597,7 +1883,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   if (!combs.empty()) {
     os << "  // Per-comb input snapshots for change-driven evaluation.\n";
     for (auto [index, comb] : llvm::enumerate(combs)) {
-      os << "  bool _pyc_comb_" << index << "_inputs_valid = false;\n";
       for (auto [inputIndex, input] : llvm::enumerate(comb.getInputs())) {
         if (isDirtyDrivenInput(input))
           continue;
@@ -1612,15 +1897,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  // Runtime-owned local fused-comb dirty set.\n";
     os << "  pyc::cpp::DirtyBitset<" << combs.size()
        << "> _pyc_comb_dirty{};\n";
-    os << "  inline bool _pyc_comb_take_active(unsigned id) {\n";
-    os << "    return _pyc_comb_dirty.take(id);\n";
-    os << "  }\n";
-    os << "  inline bool _pyc_comb_is_active(unsigned id) const {\n";
-    os << "    return _pyc_comb_dirty.test(id);\n";
-    os << "  }\n";
-    os << "  inline void _pyc_mark_comb_dirty(unsigned id) {\n";
-    os << "    _pyc_comb_dirty.mark(id);\n";
-    os << "  }\n\n";
   }
 
   sortBySchedule(instances);
@@ -1804,12 +2080,53 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         if (!seenNamedFields.insert(fieldPath).second)
           return;
         auto regQ = findStateStorageSource(value);
-        std::string regInst =
-            regQ ? (nt.get(regQ->q) + "_inst") : std::string();
+        std::string regInst;
         std::string regNext;
-        if (regQ)
-          regNext = regQ->tap ? (nt.get(regQ->tap) + "_qNext")
-                              : (regInst + "->qNext");
+        if (regQ) {
+          // RegLoop lanes carry the pending/qNext storage for their reg.
+          pyc::RegOp srcReg;
+          if (!regQ->tap) {
+            Value qVal = regQ->q;
+            if (auto *def = qVal.getDefiningOp())
+              if (auto alias = dyn_cast<pyc::AliasOp>(def))
+                qVal = alias.getOperand();
+            if (auto *d2 = qVal.getDefiningOp())
+              srcReg = dyn_cast<pyc::RegOp>(d2);
+          }
+          if (srcReg) {
+            auto pn = probePendingNext(srcReg);
+            regInst = pn.first;   // full `&expr` text
+            regNext = pn.second;
+          } else if (auto srcDelayOnly =
+                         dyn_cast<pyc::DelayLineOp>(regQ->storage)) {
+            // Looped/unlooped delay tail probe (no tap indirection).
+            auto [dinst, dpend, dnext] = delayBinding(srcDelayOnly);
+            if (dinst.empty()) {
+              regInst = dpend;
+              regNext = dnext;
+            } else {
+              regInst = "&" + dpend;
+              regNext = "&" + dnext;
+            }
+          } else if (regQ->tap) {
+            // Delay-tap probe: pending lives on the source delay; route
+            // through DelayLoop when looped (TapView static, pointer text).
+            if (auto srcDelay = regQ->tap.getDefiningOp<pyc::DelayLineOp>()) {
+              auto [dinst, dpend, dnext] = delayBinding(srcDelay);
+              if (dinst.empty()) {
+                regInst = dpend;  // looped accessor (pointer, no &)
+              } else {
+                regInst = "&" + dpend;
+              }
+            } else {
+              regInst = "&" + nt.get(regQ->q) + "_inst->pending";
+            }
+            regNext = "&" + nt.get(regQ->tap) + "_qNext";
+          } else {
+            regInst = "&" + nt.get(regQ->q) + "_inst->pending";
+            regNext = "&" + nt.get(regQ->q) + "_inst->qNext";
+          }
+        }
         namedProbes.push_back(NamedProbeInfo{
             fieldPath,
             nt.get(value),
@@ -1880,19 +2197,57 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 			    if (outIsReg[i] && !isa<VectorType>(f.getResultTypes()[i])) {
 		      const auto &source = *outRegQ[i];
 		      const unsigned storageWidth = bitWidth(source.q.getType());
+		      // Resolve the owning pyc.reg (if any) for RegLoop lane bindings.
+		      pyc::RegOp srcReg;
+		      if (!source.tap) {
+		        Value qVal = source.q;
+		        if (auto *def = qVal.getDefiningOp())
+		          if (auto alias = dyn_cast<pyc::AliasOp>(def))
+		            qVal = alias.getOperand();
+		        if (auto *d2 = qVal.getDefiningOp())
+		          srcReg = dyn_cast<pyc::RegOp>(d2);
+		      }
+		      std::string refP, refN;
+		      std::string pendBase = nt.get(source.q) + "_inst->pending";
+		      std::string nextBase = source.tap
+		                                         ? (nt.get(source.tap) + "_qNext")
+		                                         : (nt.get(source.q) + "_inst->qNext");
+		      if (srcReg) {
+		        auto pn = probePendingNext(srcReg);
+		        pendBase = pn.first;
+		        nextBase = pn.second;
+		      } else if (auto tailDelay =
+		                     dyn_cast<pyc::DelayLineOp>(source.storage)) {
+		        auto [dinst, dpend, dnext] = delayBinding(tailDelay);
+		        if (dinst.empty()) {
+		          pendBase = dpend;
+		          nextBase = dnext;
+		        }
+		      } else if (source.tap) {
+		        if (auto srcDelay = dyn_cast<pyc::DelayLineOp>(source.storage)) {
+		          auto [dinst, dpend, dnext] = delayBinding(srcDelay);
+		          if (dinst.empty()) {
+		            pendBase = dpend;  // looped accessor (pointer)
+		            nextBase = "&" + nt.get(source.tap) + "_qNext";
+		            nextBase = dnext;  // looped qNext accessor (pointer)
+		          }
+		        }
+		      }
+		      const auto pendNext = std::pair<std::string, std::string>{pendBase, nextBase};
+		      const bool looped = pendNext.first.rfind("reg_loop_", 0) == 0 ||
+		                              pendNext.first.rfind("delay_loop_", 0) == 0;
+		      refP = looped ? pendNext.first : "&" + pendNext.first;
+		      refN = looped ? pendNext.second : "&" + pendNext.second;
 		      if (source.lsb != 0 || storageWidth != w) {
 			        os << "    reg.addRegSlice<" << w << ", " << storageWidth
 			           << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &"
-			           << outNames[i] << ", &" << nt.get(source.q)
-			           << "_inst->pending, &"
-                       << (source.tap ? nt.get(source.tap) + "_qNext"
-                                      : nt.get(source.q) + "_inst->qNext")
+			           << outNames[i] << ", " << refP << ", "
+                       << refN
                        << ", " << source.lsb << "u);\n";
 			      } else {
 			        os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
-			           << ", &" << nt.get(source.q) << "_inst->pending, &"
-                       << (source.tap ? nt.get(source.tap) + "_qNext"
-                                      : nt.get(source.q) + "_inst->qNext")
+			           << ", " << refP << ", "
+                       << refN
                        << ");\n";
 		      }
 		    } else {
@@ -1901,17 +2256,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		  }
       for (const auto &named : namedProbes) {
         if (named.isReg && !isa<VectorType>(named.type)) {
+          const bool loopedN = named.cppRegInst.rfind("reg_loop_", 0) == 0 ||
+                       named.cppRegInst.rfind("delay_loop_", 0) == 0;
           if (named.stateLsb != 0 ||
               named.stateStorageWidth != named.width) {
             os << "    reg.addRegSlice<" << named.width << ", "
                << named.stateStorageWidth << ">(reg_path("
                << cppStringLiteral(named.fieldPath) << "), &"
-               << named.cppValue << ", &" << named.cppRegInst
-               << "->pending, &" << named.cppRegNext << ", "
+               << named.cppValue << ", "
+               << (loopedN ? named.cppRegInst : "&" + named.cppRegInst)
+               << ", " << named.cppRegNext << ", "
                << named.stateLsb << "u);\n";
           } else {
-            os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
-               << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegNext << ");\n";
+            os << "    reg.addReg<" << named.width << ">(reg_path("
+               << cppStringLiteral(named.fieldPath) << "), &"
+               << named.cppValue << ", "
+               << (loopedN ? named.cppRegInst : "&" + named.cppRegInst)
+               << ", " << named.cppRegNext << ");\n";
           }
         } else {
           emitWireProbes(os, named.type, named.width, named.fieldPath, named.cppValue);
@@ -1928,6 +2289,27 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         if (storageWidth == 0)
           return storage->emitError("lazy probe storage has empty width");
         const std::string inst = nt.get(q) + "_inst";
+        // RegLoop lane bindings when the storage is a looped reg's q: the q
+        // wire address is shared with the loop lane, so only pending/qNext
+        // switch to the loop accessors.
+        std::string pendText = "&" + inst + "->pending";
+        std::string nextText = "&" + inst + "->qNext";
+        std::string qText = "&" + inst + "->q";
+        {
+          Value qVal = q;
+          if (auto *def = qVal.getDefiningOp())
+            if (auto alias = dyn_cast<pyc::AliasOp>(def))
+              qVal = alias.getOperand();
+          if (auto *d2 = qVal.getDefiningOp())
+            if (auto srcReg = dyn_cast<pyc::RegOp>(d2)) {
+              auto pn = probePendingNext(srcReg);
+              if (pn.first.rfind("reg_loop_", 0) == 0) {
+                pendText = pn.first;
+                nextText = "&" + nt.get(q);
+                qText = "&" + nt.get(q);
+              }
+            }
+        }
         for (Attribute item : slices) {
           auto dict = dyn_cast<DictionaryAttr>(item);
           if (!dict)
@@ -1960,31 +2342,91 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                 break;
               }
             }
-            std::string tapWriteNext =
-                matchingTap ? (nt.get(matchingTap.getTap()) + "_qNext")
-                            : (inst + "->qNext");
+            std::string tapWriteNext;
+            // Looped detection for the fallback write-next.
+            std::string loopPend;
+            std::string loopQNext;
+            std::string tapViewRef;
+            {
+              Value qv = q;
+              if (auto *def = qv.getDefiningOp())
+                if (auto alias = dyn_cast<pyc::AliasOp>(def))
+                  qv = alias.getOperand();
+              if (auto *d2 = qv.getDefiningOp())
+                if (auto srcDelay = dyn_cast<pyc::DelayLineOp>(d2)) {
+                  auto [dinst, dpend, dnext] = delayBinding(srcDelay);
+                  if (dinst.empty()) {
+                    if (auto idAttr = srcDelay->getAttrOfType<IntegerAttr>(
+                            "pyc.loop_id")) {
+                      const int64_t raw = idAttr.getValue().getSExtValue();
+                      const unsigned dw = bitWidth(srcDelay.getQ().getType());
+                      if (auto da = srcDelay->getAttrOfType<IntegerAttr>("depth")) {
+                        const int64_t key = raw * 65536 +
+                                            static_cast<int64_t>(dw) * 256 +
+                                            da.getValue().getZExtValue();
+                        if (auto it = delayLoopLines.find(key);
+                            it != delayLoopLines.end()) {
+                          long lane = 0;
+                          for (pyc::DelayLineOp c : it->second) {
+                            if (c == srcDelay)
+                              break;
+                            ++lane;
+                          }
+                          const std::string loop =
+                              "delay_loop_" + std::to_string(key);
+                          loopPend = loop + ".lane_pending(" +
+                                     std::to_string(lane) + "u)";
+                          loopQNext = loop + ".lane_qnext(" +
+                                      std::to_string(lane) + "u)";
+                          tapViewRef = "&delay_tap_view_" +
+                                       std::to_string(key) + "_" +
+                                       std::to_string(lane);
+                        }
+                      }
+                    }
+                  }
+                }
+            }
+            if (matchingTap)
+              tapWriteNext = nt.get(matchingTap.getTap()) + "_qNext";
+            else if (!loopQNext.empty())
+              tapWriteNext = loopQNext;
+            else
+              tapWriteNext = inst + "->qNext";
+            if (tapViewRef.empty()) {
+              tapViewRef = inst;
+              if (loopPend.empty())
+                loopPend = "&" + inst + "->pending";
+            }
+            // Looped source delay: pass the lane's DelayLoop::TapView member
+            // as the DelayInst argument (same tap()/pending interface), with
+            // write-intent from the loop lane.
             if (lsb == 0 && width == storageWidth) {
+              const bool loopedW = tapWriteNext.rfind("delay_loop_", 0) == 0;
               os << "    reg.addRegLazyTap<" << width << ">(reg_path("
-                 << cppStringLiteral(field) << "), " << inst << ", " << tapDepth
-                 << "u, &" << inst << "->pending, &" << tapWriteNext << ");\n";
+                 << cppStringLiteral(field) << "), " << tapViewRef << ", "
+                 << tapDepth << "u, " << (loopPend.empty() ? ("&" + inst + "->pending") : loopPend)
+                 << ", " << (loopedW ? tapWriteNext : ("&" + tapWriteNext)) << ");\n";
             } else {
+              const bool loopedW2 = tapWriteNext.rfind("delay_loop_", 0) == 0;
               os << "    reg.addRegLazyTapSlice<" << width << ", "
                  << storageWidth << ">(reg_path(" << cppStringLiteral(field)
-                 << "), " << inst << ", " << tapDepth << "u, " << lsb
-                 << "u, &" << inst << "->pending, &" << tapWriteNext << ");\n";
+                 << "), " << tapViewRef << ", " << tapDepth << "u, " << lsb
+                 << "u, " << (loopPend.empty() ? ("&" + inst + "->pending") : loopPend)
+                 << ", " << (loopedW2 ? tapWriteNext : ("&" + tapWriteNext)) << ");\n";
             }
             continue;
           }
           if (lsb == 0 && width == storageWidth) {
             os << "    reg.addReg<" << width << ">(reg_path("
-               << cppStringLiteral(field) << "), &" << inst << "->q, &" << inst
-               << "->pending, &" << inst << "->qNext);\n";
+               << cppStringLiteral(field) << "), " << qText << ", "
+               << pendText << ", " << nextText << ");\n";
             continue;
           }
           os << "    reg.addRegLazySlice<" << width << ", " << storageWidth
-             << ">(reg_path(" << cppStringLiteral(field) << "), &" << inst
-             << "->q, " << lsb << "u, &" << inst << "->pending, &" << inst
-             << "->qNext);\n";
+             << ">(reg_path(" << cppStringLiteral(field) << "), " << qText
+             << ", " << lsb << "u, " << pendText << ", " << nextText
+             << ");\n";
         }
         return success();
       };
@@ -2097,6 +2539,20 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     else
       os << "  pyc::cpp::pyc_reg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
   }
+  for (int64_t loopId : regLoopIds) {
+    os << "  pyc::cpp::RegLoop<" << regLoopWidth[loopId] << "> reg_loop_"
+       << loopId << ";\n";
+  }
+  for (int64_t dbk : delayLoopIds) {
+    os << "  pyc::cpp::DelayLoop<" << delayLoopShape[dbk].first
+       << "> delay_loop_" << dbk << ";\n";
+    // One stable TapView per lane: probe lambdas keep a pointer to it, so it
+    // must live and die with this instance (not a function-local static).
+    for (size_t lane = 0; lane < delayLoopLines[dbk].size(); ++lane)
+      os << "  pyc::cpp::DelayLoop<" << delayLoopShape[dbk].first
+         << ">::TapView delay_tap_view_" << dbk << "_" << lane << "{&delay_loop_"
+         << dbk << ", " << lane << "u};\n";
+  }
   std::string fastClkName;
   bool fastClkUnique = true;
   auto noteFastClk = [&](Value clk) {
@@ -2110,10 +2566,21 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     noteFastClk(r.getClk());
   for (auto delay : delayLines)
     noteFastClk(delay.getClk());
+  for (int64_t loopId : regLoopIds)
+    for (pyc::RegOp r : regLoopRegs[loopId])
+      noteFastClk(r.getClk());
   const bool fastEdge = fastClkUnique && !fastClkName.empty();
+  if (!fastEdge && !fusedRegLoopIds.empty())
+    return f.emitError("tick-fuse loops require a single-clock fast edge");
   if (fastEdge) {
     os << "  bool _pyc_clk_prev = false;\n";
     os << "  bool _pyc_seq_armed = false;\n";
+    // Fall-commit gate: when tick_commit runs after only a falling edge (no
+    // preceding rise/unchanged tick_compute on this module), every local
+    // reg/delay-line has pending==0, so the walk is a no-op. tick_compute
+    // arms the flag; tick_commit consumes it.
+    if (opts.fallCommitGate)
+      os << "  bool _pyc_commit_needed = false;\n";
   }
   for (auto delay : delayLines) {
     unsigned w = bitWidth(delay.getQ().getType());
@@ -2405,6 +2872,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << " {\n";
   if (!combs.empty()) {
+    // The only guarantee that every comb runs on its first eval.
     os << "    for (unsigned _pyc_id = 0; _pyc_id < " << combs.size()
        << "u; ++_pyc_id)\n";
     os << "      _pyc_comb_dirty.mark(_pyc_id);\n";
@@ -2420,6 +2888,38 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pyc_reg<" << w << ">(";
     os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
        << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
+  }
+  for (int64_t loopId : regLoopIds)
+    os << "    reg_loop_" << loopId << ".reserve("
+       << regLoopRegs[loopId].size() << "u);\n";
+  for (int64_t loopId : regLoopIds) {
+    os << "    reg_loop_" << loopId << ".add_lanes({";
+    bool firstLane = true;
+    for (pyc::RegOp r : regLoopRegs[loopId]) {
+      if (!firstLane)
+        os << ", ";
+      firstLane = false;
+      // q storage is loop-owned (qStore_); lane.q is unused (nullptr).
+      os << "{nullptr, &" << nt.get(r.getNext()) << ", &"
+         << nt.get(r.getRst()) << ", &" << nt.get(r.getEn()) << ", &"
+         << nt.get(r.getInit()) << "}";
+    }
+    os << "});\n";
+  }
+  for (int64_t dbk : delayLoopIds) {
+    os << "    delay_loop_" << dbk << ".add_lanes({";
+    bool firstDL = true;
+    for (pyc::DelayLineOp dl : delayLoopLines[dbk]) {
+      if (!firstDL)
+        os << ", ";
+      firstDL = false;
+      auto da = dl->getAttrOfType<IntegerAttr>("depth");
+      os << "{&" << nt.get(dl.getQ()) << ", &" << nt.get(dl.getNext())
+         << ", &" << nt.get(dl.getRst()) << ", &" << nt.get(dl.getEn())
+         << ", &" << nt.get(dl.getInit()) << ", "
+         << da.getValue().getZExtValue() << "u}";
+    }
+    os << "});\n";
   }
   for (auto delay : delayLines) {
     unsigned w = bitWidth(delay.getQ().getType());
@@ -2478,7 +2978,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // Emit fused comb helpers. Indices match body order (same as placement).
   for (auto [i, comb] : llvm::enumerate(combs)) {
     if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts,
-                              *schedule, combIndex)))
+                              *schedule, combIndex, &delayLoopLines)))
       return failure();
   }
 
@@ -2625,12 +3125,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // clean one load+branch skips up to 64 per-comb checks.
   os << "  inline void eval_comb_pass() {\n";
   llvm::SmallVector<Operation *> ordered;
-  if (!topoOrder(/*includePrims=*/false, ordered)) {
+  const bool blockOrder = !topoOrder(/*includePrims=*/false, ordered);
+  if (blockOrder) {
     for (Operation &op : top) {
       if (isa<func::ReturnOp>(op) || isa<pyc::WireOp>(op))
         continue;
       ordered.push_back(&op);
     }
+    // Block order may wake a comb that already ran, so one pass can leave the
+    // design stale; repeat until every wake has been consumed.
+    os << "    for (unsigned _pyc_iter = 0; ; ++_pyc_iter) {\n";
   }
 
   unsigned openGuardWord = ~0u;
@@ -2665,7 +3169,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       closeGuardGroup();
     if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
       closeGuardGroup();
-      os << "    " << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
+      if (getValueCppStorage(a.getDst()) != CppStorageKind::Alias)
+        os << "    " << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
       ++opIdx;
       continue;
     }
@@ -2680,11 +3185,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                << "u)) {\n";
             openGuardWord = guardWord;
           }
-          os << "      if (_pyc_comb_is_active(" << index << "u)) {\n";
+          os << "      if (_pyc_comb_dirty.test(" << index << "u)) {\n";
           os << "        eval_comb_" << index << "();\n";
           os << "      }\n";
         } else {
-          os << "    if (_pyc_comb_is_active(" << index << "u)) {\n";
+          os << "    if (_pyc_comb_dirty.test(" << index << "u)) {\n";
           os << "      eval_comb_" << index << "();\n";
           os << "    }\n";
         }
@@ -2747,7 +3252,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       // combs, and downstream combs regardless of dirty state, so it must
       // never sit inside a wordClean guard group.
       closeGuardGroup();
-      if (failed(emitCombAssign(*op, os, nt)))
+      if (failed(emitCombAssign(*op, os, nt, /*ps=*/nullptr, &delayLoopLines)))
         return failure();
       ++opIdx;
       continue;
@@ -2774,6 +3279,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     return op->emitError("unsupported op for C++ emission: ") << op->getName();
   }
   closeGuardGroup();
+  if (blockOrder) {
+    os << "    if (_pyc_comb_dirty.empty()) break;\n";
+    os << "    if (_pyc_iter >= " << (combs.size() + 2) << "u) {\n";
+    os << "      std::cerr << \"pyc eval_comb_pass failed to converge\" << \"\\n\";\n";
+    os << "      std::abort();\n";
+    os << "    }\n";
+    os << "    }\n";
+  }
   os << "  }\n\n";
 
   llvm::SmallVector<Operation *> fullOrdered;
@@ -3235,7 +3748,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       return success();
     }
     if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
-      os << indent << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
+      if (getValueCppStorage(a.getDst()) != CppStorageKind::Alias)
+        os << indent << nt.get(a.getDst()) << " = " << nt.get(a.getSrc()) << ";\n";
       return success();
     }
     if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
@@ -3249,11 +3763,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                << "u)) {\n";
             guard->openGuardWord = guardWord;
           }
-          os << indent << "  if (_pyc_comb_is_active(" << index << "u)) {\n";
+          os << indent << "  if (_pyc_comb_dirty.test(" << index << "u)) {\n";
           os << indent << "    eval_comb_" << index << "();\n";
           os << indent << "  }\n";
         } else {
-          os << indent << "if (_pyc_comb_is_active(" << index << "u)) {\n";
+          os << indent << "if (_pyc_comb_dirty.test(" << index << "u)) {\n";
           os << indent << "  eval_comb_" << index << "();\n";
           os << indent << "}\n";
         }
@@ -3301,7 +3815,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             pyc::VAndReduceOp,
             pyc::VAddReduceOp,
             arith::SelectOp>(*op)) {
-      if (failed(emitCombAssign(*op, os, nt)))
+      if (failed(emitCombAssign(*op, os, nt, /*ps=*/nullptr, &delayLoopLines)))
         return failure();
       return success();
     }
@@ -3824,36 +4338,87 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       auto depth = tap->getAttrOfType<IntegerAttr>("depth");
       if (!delay || !depth)
         return tap.emitError("invalid delay tap source or depth");
-      os << indent << nt.get(tap.getTap()) << "_qNext = "
-         << nt.get(delay.getQ()) << "_inst->tap_next(" << depth.getInt()
-         << "u);\n";
+      std::string tapExpr;
+      if (auto idAttr = delay->getAttrOfType<IntegerAttr>("pyc.loop_id")) {
+        if (!isa<VectorType>(delay.getQ().getType())) {
+          // Locate the owning loop by width; the tap's own depth is NOT part
+          // of the loop key (it indexes the stage, not the loop).
+          const unsigned w = bitWidth(delay.getQ().getType());
+          for (int64_t dbk : delayLoopIds) {
+            if (delayLoopShape[dbk].first != w)
+              continue;
+            auto it = delayLoopLines.find(dbk);
+            if (it == delayLoopLines.end())
+              continue;
+            long lane = 0;
+            bool hit = false;
+            for (pyc::DelayLineOp c : it->second) {
+              if (c == delay) { hit = true; break; }
+              ++lane;
+            }
+            if (!hit)
+              continue;
+            tapExpr = "delay_loop_" + std::to_string(dbk) +
+                      ".lane_tap_next(" + std::to_string(lane) + "u, " +
+                      std::to_string(depth.getValue().getZExtValue()) + "u)";
+            break;
+          }
+        }
+      }
+      if (tapExpr.empty())
+        tapExpr = nt.get(delay.getQ()) + "_inst->tap_next(" +
+                  std::to_string(depth.getInt()) + "u)";
+      os << indent << nt.get(tap.getTap()) << "_qNext = " << tapExpr << ";\n";
     }
     return success();
   };
   if (fastEdge) {
     // One edge check for every register on this clock. A falling edge after
     // commit only keeps clkPrev; it does not sample next-state again.
+    if (!fusedRegLoopIds.empty())
+      os << "    bool _pyc_fused_rise = false;\n";
     os << "    {\n";
     os << "      bool _pyc_now = " << fastClkName << ".toBool();\n";
     os << "      bool _pyc_rise = !_pyc_clk_prev && _pyc_now;\n";
     os << "      bool _pyc_fall = _pyc_clk_prev && !_pyc_now;\n";
     os << "      _pyc_clk_prev = _pyc_now;\n";
     os << "      if (_pyc_rise) {\n";
+    if (!fusedRegLoopIds.empty())
+      os << "        _pyc_fused_rise = true;\n";
+    for (int64_t loopId : phasedRegLoopIds) {
+      os << "        reg_loop_" << loopId << ".compute_rise();\n";
+    }
+    for (int64_t dbk : delayLoopIds)
+      os << "        delay_loop_" << dbk << ".compute_rise();\n";
     emitEdgeCall("posedge_tick_compute", "        ");
     if (failed(emitTapUpdates("        ")))
       return failure();
     os << "        _pyc_seq_armed = true;\n";
+    if (opts.fallCommitGate)
+      os << "        _pyc_commit_needed = true;\n";
     os << "      } else if (_pyc_fall) {\n";
     os << "        if (_pyc_seq_armed) {\n";
+    for (int64_t loopId : phasedRegLoopIds) {
+      os << "          reg_loop_" << loopId << ".negedge();\n";
+    }
+    for (int64_t dbk : delayLoopIds)
+      os << "          delay_loop_" << dbk << ".negedge();\n";
     emitEdgeCall("negedge_update", "          ");
     os << "          _pyc_seq_armed = false;\n";
     os << "        }\n";
     if (failed(emitTapUpdates("        ")))
       return failure();
     os << "      } else {\n";
+    for (int64_t loopId : phasedRegLoopIds) {
+      os << "        reg_loop_" << loopId << ".compute_generic(_pyc_now);\n";
+    }
+    for (int64_t dbk : delayLoopIds)
+      os << "        delay_loop_" << dbk << ".compute_generic(_pyc_now);\n";
     emitEdgeCall("tick_compute", "        ");
     if (failed(emitTapUpdates("        ")))
       return failure();
+    if (opts.fallCommitGate)
+      os << "        _pyc_commit_needed = true;\n";
     os << "      }\n";
     os << "    }\n";
   } else {
@@ -3870,6 +4435,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                            [&](llvm::StringRef indent) {
                              os << indent << key << "->tick_compute();\n";
                            });
+    }
+    for (int64_t dbk : delayLoopIds) {
+      llvm::StringRef clkName =
+          fastClkName.empty()
+              ? nt.get(delayLoopLines[dbk].front().getClk())
+              : llvm::StringRef(fastClkName);
+      os << "    delay_loop_" << dbk << ".compute_generic(" << clkName
+         << ".toBool());\n";
     }
     if (failed(emitTapUpdates("    ")))
       return failure();
@@ -3916,6 +4489,34 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                            os << indent << key << ".tick_compute();\n";
                          });
   }
+  if (!fusedRegLoopIds.empty()) {
+    // Single-phase update for fused lanes: runs after every other element
+    // sampled its inputs, so no compute stage can observe a fused q early.
+    // The wake is table-driven: direct_commit()'s per-lane dirty bitmap is
+    // walked by FusedLaneWake::apply (set-bit iteration per 64-lane word),
+    // replacing one emitted branch per lane with a shared tiny loop; the
+    // per-lane fanout (comb word, OR mask) pairs live in constexpr rodata.
+    os << "    if (_pyc_fused_rise) {\n";
+    // A fused loop still type-checks apply() against a dirty bitset when the
+    // module has no comb. Declare a local one; the wake table is empty.
+    if (combs.empty())
+      os << "      pyc::cpp::DirtyBitset<1> _pyc_comb_dirty{};\n";
+    for (int64_t loopId : fusedRegLoopIds) {
+      std::string loop = "reg_loop_" + std::to_string(loopId);
+      llvm::SmallVector<unsigned> wakeOffsets;
+      llvm::SmallVector<std::pair<unsigned, uint64_t>> wakeEntries;
+      for (pyc::RegOp r : regLoopRegs[loopId]) {
+        wakeOffsets.push_back(wakeEntries.size());
+        collectFanoutWordMasks(r.getQ(), *schedule, combIndex, wakeEntries);
+      }
+      wakeOffsets.push_back(wakeEntries.size());
+      std::string wake = "_pyc_fused_wake_" + loop;
+      emitFusedLaneWake(os, wake, wakeOffsets, wakeEntries, "      ");
+      os << "      " << wake << ".apply(" << loop
+         << ".direct_commit(), _pyc_comb_dirty);\n";
+    }
+    os << "    }\n";
+  }
   os << "  }\n\n";
 
   os << "  void tick_commit() {\n";
@@ -3948,6 +4549,85 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                            (indent + "  ").str());
     os << indent << "}\n";
   };
+  // fall-commit-gate: on a falling edge the local reg/delay walk is
+  // provably empty (the rising tick_commit consumed every pending bit and
+  // _pyc_seq_armed), so wrap only this module's local walk in a flag check.
+  const bool gateLocalCommit = fastEdge && opts.fallCommitGate;
+  if (gateLocalCommit) {
+    os << "    if (_pyc_commit_needed) {\n";
+    os << "      _pyc_commit_needed = false;\n";
+  }
+  // A clean 64-lane dirty word skips all of its per-lane wake checks.
+  auto openLaneWord = [&](unsigned lane, const std::string &cond) {
+    if (lane & 63)
+      return;
+    if (lane)
+      os << "    }\n";
+    os << "    if (" << cond << ") {\n";
+  };
+  // DelayLoop commit: tail-dirty wakes q consumers, advanced wakes tap
+  // consumers (every enabled edge shifts every tap).
+  for (int64_t dbk : delayLoopIds) {
+    std::string loop = "delay_loop_" + std::to_string(dbk);
+    os << "    const auto &_pyc_dloop_res_" << dbk << " = " << loop
+       << ".commit();\n";
+    os << "    const auto &_pyc_dloop_tail_" << dbk
+       << " = _pyc_dloop_res_" << dbk << ".tailDirty;\n";
+    os << "    const auto &_pyc_dloop_adv_" << dbk
+       << " = _pyc_dloop_res_" << dbk << ".advanced;\n";
+    unsigned lane = 0;
+    for (pyc::DelayLineOp dl : delayLoopLines[dbk]) {
+      const std::string condT = "((_pyc_dloop_tail_" + std::to_string(dbk) +
+          "[" + std::to_string(lane >> 6) + "u] >> " +
+          std::to_string(lane & 63) + "u) & 1u)";
+      const std::string condA = "((_pyc_dloop_adv_" + std::to_string(dbk) +
+          "[" + std::to_string(lane >> 6) + "u] >> " +
+          std::to_string(lane & 63) + "u) & 1u)";
+      const std::string word =
+          std::to_string(dbk) + "[" + std::to_string(lane >> 6) + "u]";
+      openLaneWord(lane,
+                   "_pyc_dloop_tail_" + word + " | _pyc_dloop_adv_" + word);
+      os << "      if (" << condT << ") {\n";
+      emitMetadataCombFanout(dl.getQ(), os, *schedule, combIndex, nt, "        ");
+      os << "      }\n";
+      for (auto tap : delayTaps) {
+        auto src = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
+        if (src == dl) {
+          os << "      if (" << condA << ") {\n";
+          emitMetadataCombFanout(tap.getTap(), os, *schedule, combIndex, nt,
+                                 "        ");
+          os << "      }\n";
+        }
+      }
+      ++lane;
+    }
+    if (lane)
+      os << "    }\n";
+  }
+  // Fused loops already published q in tick_compute; only retire pending.
+  for (int64_t loopId : fusedRegLoopIds)
+    os << "    reg_loop_" << loopId << ".retire();\n";
+  // RegLoop commit: per-lane dirty bitmap keeps the change-driven wake as
+  // precise as the per-reg path. The wake itself is table-driven (same
+  // FusedLaneWake shape as the fused walk): commit()'s bitmap feeds one
+  // set-bit iteration over constexpr fanout tables, replacing the per-lane
+  // emitted dirty tests and word guards.
+  if (combs.empty() && !phasedRegLoopIds.empty())
+    os << "    pyc::cpp::DirtyBitset<1> _pyc_comb_dirty{};\n";
+  for (int64_t loopId : phasedRegLoopIds) {
+    std::string loop = "reg_loop_" + std::to_string(loopId);
+    llvm::SmallVector<unsigned> wakeOffsets;
+    llvm::SmallVector<std::pair<unsigned, uint64_t>> wakeEntries;
+    for (pyc::RegOp r : regLoopRegs[loopId]) {
+      wakeOffsets.push_back(wakeEntries.size());
+      collectFanoutWordMasks(r.getQ(), *schedule, combIndex, wakeEntries);
+    }
+    wakeOffsets.push_back(wakeEntries.size());
+    std::string wake = "_pyc_commit_wake_" + loop;
+    emitFusedLaneWake(os, wake, wakeOffsets, wakeEntries, "    ");
+    os << "    " << wake << ".apply(" << loop
+       << ".commit(), _pyc_comb_dirty);\n";
+  }
   for (auto r : regs) {
     std::string key = nt.get(r.getQ()) + "_inst";
     std::string changed = "_pyc_commit_changed_" + key;
@@ -3973,6 +4653,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       emitCommitWake(advanced, tap.getTap());
     }
   }
+  if (gateLocalCommit)
+    os << "    }\n";
   for (auto fifo : fifos) {
     std::string key = nt.get(fifo.getInReady()) + "_inst";
     std::string changed = "_pyc_commit_changed_" + key;
@@ -4115,6 +4797,8 @@ CppStorageKind getValueCppStorage(Value v) {
   if (auto a = op->getAttrOfType<StringAttr>(kCppStorageAttr)) {
     if (a.getValue() == "local")
       return CppStorageKind::Local;
+    if (a.getValue() == "alias")
+      return CppStorageKind::Alias;
   }
   return CppStorageKind::Struct;
 }
@@ -4184,6 +4868,7 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   os << "#include <type_traits>\n";
   os << "#include <utility>\n";
   os << "#include <cpp/pyc_sim.hpp>\n";
+  os << "#include <cpp/pyc_state_loop.hpp>\n";
   os << "#include <cpp/pyc_change_scheduler.hpp>\n";
   os << "#include <cpp/pyc_thread_pool.hpp>\n\n";
   os << "namespace pyc::gen {\n\n";

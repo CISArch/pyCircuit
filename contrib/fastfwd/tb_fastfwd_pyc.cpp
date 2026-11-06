@@ -8,7 +8,7 @@
 
 #include <cpp/pyc_tb.hpp>
 
-#include "FastFwd.hpp"
+#include "fastfwd.hpp"
 
 using pyc::cpp::Testbench;
 using pyc::cpp::Wire;
@@ -46,8 +46,8 @@ Args parseArgs(int argc, char **argv) {
 int main(int argc, char **argv) {
   const Args args = parseArgs(argc, argv);
 
-  pyc::gen::FastFwd dut{};
-  Testbench<pyc::gen::FastFwd> tb(dut);
+  pyc::gen::fastfwd dut{};
+  Testbench<pyc::gen::fastfwd> tb(dut);
 
   const std::array<Wire<1> *, 4> in_vld = {&dut.lane0_pkt_in_vld, &dut.lane1_pkt_in_vld, &dut.lane2_pkt_in_vld,
                                            &dut.lane3_pkt_in_vld};

@@ -76,6 +76,7 @@ add_library(pyc_transforms
   lib/Transforms/CheckLogicDepthPass.cpp
   lib/Transforms/CheckNoDynamicPass.cpp
   lib/Transforms/CheckCombCyclesPass.cpp
+  lib/Transforms/ApplyObservationDemandPass.cpp
   lib/Transforms/CheckClockDomainsPass.cpp
   lib/Transforms/ChangeDrivenSchedulePass.cpp
   lib/Transforms/ApplyObservationDemandPass.cpp
@@ -94,7 +95,9 @@ add_library(pyc_transforms
   lib/Transforms/LowerSCFToPYCStaticPass.cpp
   lib/Transforms/PrunePortsPass.cpp
   lib/Transforms/RetimePipelinesPass.cpp
+  lib/Transforms/ForkMergeRetimePass.cpp
   lib/Transforms/SLPPackWiresPass.cpp
+  lib/Transforms/StateLoopPartitionPass.cpp
   lib/Transforms/StateOptimization.cpp
   lib/Transforms/StateOptimizePass.cpp
   lib/Support/PassIRDumper.cpp
