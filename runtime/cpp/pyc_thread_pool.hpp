@@ -36,6 +36,24 @@
 //     dispatches costs no futex round trips. The spin loop re-reads the claim
 //     counter before touching it, so an exhausted frame costs no atomics.
 //   * only the thread that finishes the last index takes mutex_, to notify.
+//   * sticky-frame fast dispatch: a tick loop re-issues the same top-level
+//     dispatch every cycle. The first such dispatch goes through the full
+//     publish/unpublish protocol and its frame is then RETIRED-IN-PLACE as
+//     `sticky_` (it stays on the frame list). A later top-level dispatch that
+//     finds the pool otherwise idle (tlsDepth == 1, no concurrent dispatch,
+//     stickyBusy_ acquired) republishes that frame WITHOUT taking mutex_:
+//     plain stores to obj/call, atomic stores to count/remaining, then the
+//     generation bump rides the release store of `claim` (workers acquire
+//     through claim, so they can never observe the new generation with stale
+//     payloads). Parking is prevented from losing wakeups by the `parked_`
+//     handshake: workers count themselves about to sleep under mutex_; the
+//     fast dispatcher bumps activity_ before checking parked_, and re-notify
+//     under mutex_ whenever it sees any parked worker mid-dispatch. Both
+//     interleavings of (worker parks / dispatcher checks) are safe: either
+//     the worker re-evaluates activity_ under mutex_ and stays awake, or it
+//     sleeps and the dispatcher's notify_all wakes it. Anything that fails
+//     the fast-path preconditions - nesting, concurrent dispatch, frame pool
+//     exhaustion - silently uses the original slow path.
 //
 // Thread count is resolved once, when the pool is first used, from
 // pyc_set_threads() > PYC_THREADS env > hardware_concurrency; 0/1 selects
@@ -122,6 +140,14 @@ inline void cpuPause() {
 #endif
 }
 
+// Nesting depth of run() on this thread. 1 = a top-level dispatch (the tick
+// loop's own fork-join), >= 2 = nested inside a part. Used only to route
+// eligible dispatches to the sticky fast path.
+inline unsigned &tlsDepth() {
+  static thread_local unsigned depth = 0;
+  return depth;
+}
+
 // One fork-join dispatch frame. See the file comment for the generation-tagged
 // claim counter and the doubly-linked active list. alignas(64) keeps adjacent
 // frames off the same cache line.
@@ -135,7 +161,7 @@ struct alignas(64) Dispatch {
   std::atomic<unsigned> remaining{0}; // indices claimed but not yet finished
   unsigned slot = 0;                  // index in ForkJoinPool::frames_
   Dispatch *newer = nullptr;          // guarded by mutex_
-  Dispatch *older = nullptr;           // guarded by mutex_
+  Dispatch *older = nullptr;          // guarded by mutex_
 };
 
 class ForkJoinPool {
@@ -160,13 +186,48 @@ public:
       fn(0);
       return;
     }
-    Dispatch *f = publish(count, fn);
-    if (!f) { // frame pool exhausted: degrade to inline rather than drop work.
-      invokeAll(count, fn);
+    ++tlsDepth();
+    // Top-level dispatch over an idle pool with a retired sticky frame:
+    // republish it lock-free instead of the mutex publish/unpublish pair.
+    // Main-thread only: the pool creator runs the tick loop, and only its
+    // dispatches are semantically top-level. A worker calling run() is by
+    // construction nested inside someone's part (its tlsDepth is 1 there, so
+    // depth alone cannot tell them apart) and MUST use the slow path: a fast
+    // publish on the sticky frame is invisible to other threads while any
+    // other frame tops the list, which deadlocks the pool.
+    if (fastEnabled_ && std::this_thread::get_id() == mainTid_ && tlsDepth() == 1 &&
+        sticky_.load(std::memory_order_acquire) != nullptr &&
+        inflightDispatch_.load(std::memory_order_acquire) == 0 &&
+        stickyBusy_.exchange(true, std::memory_order_acq_rel)) {
+      fastDispatch(sticky_.load(std::memory_order_relaxed), count, fn);
+      --tlsDepth();
       return;
     }
-    participate(f);
-    unpublish(f);
+    {
+      Dispatch *f = publish(count, fn);
+      if (!f) { // frame pool exhausted: degrade to inline rather than drop work.
+        --tlsDepth();
+        invokeAll(count, fn);
+        return;
+      }
+      inflightDispatch_.fetch_add(1, std::memory_order_release);
+      participate(f);
+      bool keep;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Retire-in-place as the sticky frame when this was the pool's only
+        // dispatch: the tick loop re-issues it every cycle, so keeping it
+        // published lets later cycles take the lock-free path above.
+        keep = std::this_thread::get_id() == mainTid_ && tlsDepth() == 1 &&
+               sticky_.load(std::memory_order_relaxed) == nullptr && active_ == 1;
+        if (keep)
+          sticky_.store(f, std::memory_order_release);
+      }
+      if (!keep)
+        unpublish(f);
+      inflightDispatch_.fetch_sub(1, std::memory_order_release);
+    }
+    --tlsDepth();
   }
 
 private:
@@ -188,6 +249,74 @@ private:
 
   unsigned spinBudget() const { return spin_; }
   unsigned maxFrames() const { return maxFrames_; }
+
+  // Lock-free republish of a retired sticky frame. Ordering: obj/call are
+  // plain (only reachable after a successful claim of the new generation,
+  // which acquires everything released below); count/remaining are atomic
+  // stores sequenced before the release store of claim, so a worker that
+  // reads an old claim cannot latch onto new payloads, and one that reads
+  // the new claim sees the new count. No worker touches this frame between
+  // generations: a retired generation has all indices finished and workers
+  // only reach runOne/obj/call through a successful new-generation claim.
+  template <class F> void fastDispatch(Dispatch *f, unsigned count, F &fn) {
+    using Fn = typename std::remove_reference<F>::type;
+    const unsigned g = f->gen.load(std::memory_order_relaxed) + 1;
+    f->obj = const_cast<void *>(static_cast<const void *>(&fn));
+    f->call = &trampoline<Fn>;
+    f->count.store(count, std::memory_order_relaxed);
+    f->remaining.store(count, std::memory_order_release);
+    f->gen.store(g, std::memory_order_relaxed);
+    f->claim.store(static_cast<std::uint64_t>(g) << 32,
+                   std::memory_order_release);
+    inflightDispatch_.fetch_add(1, std::memory_order_release);
+    // Wake parked workers. activity_ is bumped BEFORE the parked_ check, so a
+    // worker that has not slept yet re-evaluates activity_ under mutex_ and
+    // stays awake; one that did sleep is caught by notify_all below.
+    activity_.fetch_add(1, std::memory_order_release);
+    if (parked_.load(std::memory_order_acquire) != 0) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      cvWork_.notify_all();
+    }
+    participateFast(f);
+    inflightDispatch_.fetch_sub(1, std::memory_order_release);
+    stickyBusy_.store(false, std::memory_order_release);
+  }
+
+  // Dispatcher side of a fast dispatch: help with the frame, spin for
+  // completion, and keep parked workers from being forgotten: any worker that
+  // parks mid-dispatch is re-notified under mutex_.
+  void participateFast(Dispatch *f) {
+    TpStatSlot *st = tpStatSlot();
+    int spins = static_cast<int>(spinBudget());
+    int sinceParkCheck = 0;
+    for (;;) {
+      Dispatch *t = nullptr;
+      unsigned localIdx = 0;
+      if (tryClaim(t, localIdx)) {
+        runOne(t, localIdx, st);
+        spins = static_cast<int>(spinBudget());
+        continue;
+      }
+      if (complete(f))
+        return;
+      if (--spins > 0) {
+        if (++sinceParkCheck >= 64) {
+          sinceParkCheck = 0;
+          if (parked_.load(std::memory_order_acquire) != 0) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cvWork_.notify_all();
+          }
+        }
+        cpuPause();
+        continue;
+      }
+      std::unique_lock<std::mutex> lock(mutex_);
+      if (complete(f))
+        return;
+      cvDone_.wait(lock, [&] { return complete(f); });
+      return;
+    }
+  }
 
   template <class F> Dispatch *publish(unsigned count, F &fn) {
     using Fn = typename std::remove_reference<F>::type;
@@ -331,9 +460,16 @@ private:
         continue;
       }
       {
+        // Announce the park BEFORE taking mutex_: fast-path dispatchers
+        // check parked_ after bumping activity_, so this thread is either
+        // seen here (and gets the notify below) or re-evaluates activity_
+        // under mutex_ and never sleeps.
+        parked_.fetch_add(1, std::memory_order_release);
         std::unique_lock<std::mutex> lock(mutex_);
-        if (shutdown_)
+        if (shutdown_) {
+          parked_.fetch_sub(1, std::memory_order_release);
           return;
+        }
         seen = activity_.load(std::memory_order_relaxed);
         // Sleep only on activity changes: publish and unpublish both bump
         // activity_, so a parked worker cannot miss a frame or wait forever
@@ -342,6 +478,7 @@ private:
           return shutdown_ ||
                  activity_.load(std::memory_order_relaxed) != seen;
         });
+        parked_.fetch_sub(1, std::memory_order_acquire);
         if (shutdown_)
           return;
         seen = activity_.load(std::memory_order_relaxed);
@@ -353,6 +490,7 @@ private:
   ForkJoinPool()
       : spin_(envUnsigned("PYC_TP_SPIN", 2000)),
         maxFrames_(std::min(kMaxFrames, std::max(1u, envUnsigned("PYC_TP_MAX_DEPTH", 32)))) {
+    fastEnabled_ = envUnsigned("PYC_TP_FAST", 1) != 0;
     for (unsigned i = 0; i < kMaxFrames; ++i) {
       frames_[i].slot = i;
       free_[i] = i;
@@ -414,15 +552,24 @@ private:
 
   unsigned spin_;
   unsigned maxFrames_;
+  bool fastEnabled_ = true; // PYC_TP_FAST=0 disables the sticky fast path
+  const std::thread::id mainTid_ = std::this_thread::get_id(); // tick-loop thread
   std::mutex mutex_;
   std::condition_variable cvWork_; // wakes parked workers on activity changes
   std::condition_variable cvDone_; // dispatcher waits here for completion
   std::atomic<Dispatch *> top_{nullptr};
   std::atomic<unsigned long long> activity_{0}; // bumped on publish/unpublish
+  // Sticky fast-path state. sticky_ stores under mutex_ with release and
+  // loads with acquire (nullptr -> frame is a one-way transition, so a stale
+  // nullptr read merely misses the fast path).
+  std::atomic<Dispatch *> sticky_{nullptr};     // retired-in-place fast frame
+  std::atomic<bool> stickyBusy_{false};     // exclusive fast-dispatch holder
+  std::atomic<unsigned> inflightDispatch_{0}; // slow+fast dispatches in flight
+  std::atomic<unsigned> parked_{0};         // workers inside cvWork_ wait
   unsigned free_[kMaxFrames];                  // free-slot stack, mutex_-guarded
   unsigned freeCount_ = kMaxFrames;             // guarded by mutex_
   unsigned active_ = 0;                         // guarded by mutex_
-  bool shutdown_ = false;                      // guarded by mutex_
+  bool shutdown_ = false;                       // guarded by mutex_
   Dispatch frames_[kMaxFrames];
   std::vector<std::thread> workers_;
 };
