@@ -6,9 +6,13 @@
 // Contract (mirrors the sequential emission it replaces):
 //   pyc_parallel_for(n, fn) invokes fn(i) exactly once for every i in [0, n),
 //   and blocks until all invocations return. Calls may nest: a dispatch made
-//   from inside a part publishes a new frame on top of the frame list and is
-//   served by every thread in the pool, so hierarchical module trees get real
-//   concurrency instead of degrading to a sequential loop.
+//   from inside a part can publish a new frame on top of the frame list to be
+//   served by every thread in the pool. By default, though, a nested call on a
+//   worker thread executes its parts inline (PYC_TP_NESTED_SEQ=1): the
+//   enclosing top-level dispatch already spans the whole module tree, so the
+//   set of concurrent leaves is unchanged while every per-tick nested
+//   mutex+notify round trip disappears. Set PYC_TP_NESTED_SEQ=0 to restore
+//   nested dispatch (hierarchical frames served by the whole pool).
 //
 // Frames and slot recycling:
 //   Frames live in a fixed pool `frames_[]` and are never freed, so a worker
@@ -184,6 +188,17 @@ public:
     }
     if (count == 1) {
       fn(0);
+      return;
+    }
+    // Nested dispatch running on a worker: execute the parts inline instead
+    // of publishing another frame. The enclosing top-level dispatch already
+    // gives this subtree real pool concurrency across sibling instances, so
+    // inlining only removes the nested fork-join round trips (mutex +
+    // notify_all per level, on the order of the 1.28 us task granularity)
+    // without changing which leaves can run concurrently. Main-thread callers
+    // keep the full dispatch paths above.
+    if (nestedSeqEnabled_ && std::this_thread::get_id() != mainTid_) {
+      invokeAll(count, fn);
       return;
     }
     ++tlsDepth();
@@ -491,6 +506,12 @@ private:
       : spin_(envUnsigned("PYC_TP_SPIN", 2000)),
         maxFrames_(std::min(kMaxFrames, std::max(1u, envUnsigned("PYC_TP_MAX_DEPTH", 32)))) {
     fastEnabled_ = envUnsigned("PYC_TP_FAST", 1) != 0;
+    // Nested inline pays off while every worker owns a whole subtree, but at
+    // wider pools the lost dynamic stealing (nested frames serve the whole
+    // pool) turns top-level weight imbalance into tail latency: default to
+    // inline only on narrow pools, keep nested dispatch on wide ones.
+    nestedSeqEnabled_ =
+        envUnsigned("PYC_TP_NESTED_SEQ", resolvedThreads() <= 4 ? 1 : 0) != 0;
     for (unsigned i = 0; i < kMaxFrames; ++i) {
       frames_[i].slot = i;
       free_[i] = i;
@@ -553,6 +574,7 @@ private:
   unsigned spin_;
   unsigned maxFrames_;
   bool fastEnabled_ = true; // PYC_TP_FAST=0 disables the sticky fast path
+  bool nestedSeqEnabled_ = true; // PYC_TP_NESTED_SEQ=0 restores nested dispatch
   const std::thread::id mainTid_ = std::this_thread::get_id(); // tick-loop thread
   std::mutex mutex_;
   std::condition_variable cvWork_; // wakes parked workers on activity changes
