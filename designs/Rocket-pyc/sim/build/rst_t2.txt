@@ -1,0 +1,4 @@
+PYC_TP_STATS: total busy = 39.3 ms across 3 threads
+PYC_TP_STATS: thread0  parts=75777  busy=   11.7 ms share= 29.7%
+PYC_TP_STATS: thread1  parts=61805  busy=   13.9 ms share= 35.5%
+PYC_TP_STATS: thread2  parts=62438  busy=   13.7 ms share= 34.8%
