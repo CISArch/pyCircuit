@@ -2683,6 +2683,55 @@ int main(int argc, char **argv) {
     pm.addInstrumentation(std::move(passIRDumperStorage));
   }
   pm.addPass(pyc::createCheckFrontendContractPass());
+  // F2P_DEBUG: trace Rocket mux count after every pass to find where the
+  // rf read-mux tree disappears.
+  {
+    auto *ctx = pm.getContext();
+    struct MuxCounter {
+      size_t after = 0, before = 0, total = 0;
+    };
+    static llvm::StringRef targetFn = "Rocket";
+    static bool traceEnabled = [] {
+      const char *e = ::getenv("F2P_TRACE_MUX");
+      return e && e[0] == '1';
+    }();
+    if (traceEnabled) {
+      struct TraceInst : public mlir::PassInstrumentation {
+        void runAfterPass(Pass *pass, Operation *op) override {
+          auto fn = llvm::dyn_cast<mlir::func::FuncOp>(op);
+          auto module = llvm::dyn_cast<mlir::ModuleOp>(op);
+          if (!fn && !module)
+            return;
+          if (!fn && module) {
+            for (auto &f : module->getRegion(0).getOps()) {
+              auto cand = llvm::dyn_cast<mlir::func::FuncOp>(f);
+              if (cand && cand.getSymName() == targetFn) {
+                fn = cand;
+                break;
+              }
+            }
+            if (!fn) {
+              llvm::errs() << "[F2P_TRACE_MUX] after " << pass->getName()
+                           << ": <Rocket gone>\n";
+              return;
+            }
+          } else if (fn && fn.getSymName() != targetFn) {
+            return;
+          }
+          unsigned mux = 0, reg = 0;
+          fn.walk([&](Operation *o) {
+            if (o->getName().getStringRef() == "pyc.mux")
+              ++mux;
+            if (o->getName().getStringRef() == "pyc.reg")
+              ++reg;
+          });
+          llvm::errs() << "[F2P_TRACE_MUX] after " << pass->getName()
+                       << ": mux=" << mux << " reg=" << reg << "\n";
+        }
+      };
+      pm.addInstrumentation(std::make_unique<TraceInst>());
+    }
+  }
   pm.addPass(pyc::createInlineFunctionsPass());
   if (wantFlatten)
     pm.addPass(pyc::createFlattenInstancesPass());
