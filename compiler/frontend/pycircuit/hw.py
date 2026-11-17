@@ -825,6 +825,10 @@ class Reg(Generic[DT]):
 
         - `r.set(v)` is equivalent to `m.assign(r.next, v)`
         - `r.set(v, when=cond)` drives `cond ? v : r` (hold otherwise)
+
+        Multiple `set(v, when=c)` calls fold into a single priority mux
+        (later calls take priority, matching FIRRTL when-block semantics),
+        preventing multi-driver pyc.assign conflicts (issue #44).
         """
         m = self.q.m
         if not isinstance(m, Circuit):
@@ -839,9 +843,31 @@ class Reg(Generic[DT]):
         cond = Wire.as_wire(when, m=m, width=1)
         if cond.width != 1:
             raise TypeError("when width must be 1")
-        when_w = Wire.as_wire(when, m=m)
 
-        m.assign(self.next, when_w._select_internal(value, self.q))
+        # Accumulate conditional drivers and fold into one priority mux
+        # (issue #44: multiple set(v, when=c) must not produce multiple
+        # unconditional pyc.assign to the same backedge wire)
+        if not hasattr(self, '_when_drivers'):
+            object.__setattr__(self, '_when_drivers', [])
+        self._when_drivers.append((cond, next_w))
+        self._flush_when_drivers(m)
+
+    def _flush_when_drivers(self, m) -> None:
+        """Fold accumulated (cond, value) pairs into a single priority mux
+        and (re)assign self.next from the combined expression."""
+        if not self._when_drivers:
+            return
+        # Build priority chain: later drivers take priority (FIRRTL when
+        # semantics: later connects override earlier ones)
+        expr = self.q  # default: hold current value
+        for cond_w, val_w in self._when_drivers:
+            expr = cond_w._select_internal(val_w, expr)
+        # Remove any previous assign to self.next from module lines to
+        # prevent multi-driver conflicts
+        target = f"pyc.assign {self.next.ref},"
+        m._lines = [l for l in m._lines if target not in l]
+        # Emit single combined assign
+        m.assign(self.next, expr)
 
 class Circuit(Module):
     """High-level wrapper over `Module` that returns `Wire`/`Reg` objects."""
