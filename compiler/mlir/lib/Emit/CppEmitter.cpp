@@ -238,6 +238,19 @@ static std::size_t packedWireWordCount(Type ty) {
   return 0;
 }
 
+// Number of scalar RegLoop lanes a state value lowers into: scalar regs
+// have one lane; vector regs lower each element into its own lane (all
+// leaves share one element type, so bitWidth() gives the lane width).
+static unsigned stateLaneCount(Type ty) {
+  if (auto vt = dyn_cast<VectorType>(ty)) {
+    unsigned n = 1;
+    for (int64_t extent : vt.getShape())
+      n *= static_cast<unsigned>(extent);
+    return n;
+  }
+  return 1;
+}
+
 // Emit ProbeRegistry registration for a (possibly vector) wire-kind value.
 // Scalars register directly via addWire; vectors lower to nested pyc::cpp::Vec
 // and use ProbeRegistry::addVec, which recurses to per-lane Wire<W>* leaves
@@ -1575,15 +1588,20 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   llvm::DenseMap<int64_t, unsigned> regLoopWidth;
   llvm::DenseSet<int64_t> fusedRegLoops; // loops whose lanes are all fused
   llvm::DenseMap<int64_t, llvm::SmallVector<pyc::RegOp>> regLoopRegs;
+  llvm::DenseMap<Operation *, unsigned> regLanes;
   llvm::SmallVector<pyc::RegOp> unloopedRegs;
   for (pyc::RegOp r : regs) {
     auto idAttr = r->getAttrOfType<IntegerAttr>("pyc.loop_id");
-    if (isa<VectorType>(r.getQ().getType()) || !idAttr) {
+    unsigned w = bitWidth(r.getQ().getType());
+    // Vector regs lower element-per-lane into the loops as well (their
+    // leaves share the element width); only regs without a partition id
+    // or with a non-integer leaf keep the per-reg expansion.
+    if (!idAttr || w == 0) {
       unloopedRegs.push_back(r);
       continue;
     }
+    regLanes[r.getOperation()] = stateLaneCount(r.getQ().getType());
     const int64_t id = idAttr.getValue().getSExtValue();
-    unsigned w = bitWidth(r.getQ().getType());
     // Regs rewritten by earlier passes (retiming/packing) may carry a width
     // different from the partition-time majority; split into a per-width
     // sub-loop keyed (id, width) so RegLoop<W>'s single template width holds.
@@ -1673,20 +1691,25 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // for `&...pending` and `&...qNext`.
   auto probePendingNext = [&](pyc::RegOp r) -> std::pair<std::string, std::string> {
     if (auto idAttr = r->getAttrOfType<IntegerAttr>("pyc.loop_id")) {
-      if (!isa<VectorType>(r.getQ().getType())) {
+      if (!regLanes.empty() &&
+          regLanes.find(r.getOperation()) != regLanes.end()) {
         const int64_t id = idAttr.getValue().getSExtValue();
-        // Lane index within the loop = position in regLoopRegs[id].
+        // Lane index within the loop = sum of the lane counts of the regs
+        // before this one (vector regs contribute one lane per element).
         long lane = 0;
         if (auto it = regLoopRegs.find(id); it != regLoopRegs.end()) {
           for (pyc::RegOp cand : it->second) {
             if (cand == r)
               break;
-            ++lane;
+            lane += regLanes.lookup(cand.getOperation());
           }
         }
         std::string loop = regLoopName(id);
         // lane_pending/lane_qnext return pointers; keep the '&' at the call
         // site out of this string (callers concatenate it verbatim after &).
+        // A vector reg binds its first element's lane: write-intent is
+        // debug-only metadata (trace-bin), so per-element granularity
+        // loss is acceptable.
         return {loop + ".lane_pending(" + std::to_string(lane) + "u)",
                 loop + ".lane_qnext(" + std::to_string(lane) + "u)"};
       }
@@ -2767,12 +2790,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "    " << regLoopName(loopId) << ".add_lanes({";
     bool firstLane = true;
     for (pyc::RegOp r : regLoopRegs[loopId]) {
-      if (!firstLane)
-        os << ", ";
-      firstLane = false;
-      os << "{&" << nt.get(r.getQ()) << ", &" << nt.get(r.getNext()) << ", &"
-         << nt.get(r.getRst()) << ", &" << nt.get(r.getEn()) << ", &"
-         << nt.get(r.getInit()) << "}";
+      // Vector regs contribute one lane per element; q/next/init index
+      // their element arrays while rst/en stay shared scalars.
+      const unsigned n = regLanes.lookup(r.getOperation());
+      for (unsigned i = 0; i < n; ++i) {
+        if (!firstLane)
+          os << ", ";
+        firstLane = false;
+        if (n == 1)
+          os << "{&" << nt.get(r.getQ()) << ", &" << nt.get(r.getNext())
+             << ", &" << nt.get(r.getRst()) << ", &" << nt.get(r.getEn())
+             << ", &" << nt.get(r.getInit()) << "}";
+        else
+          os << "{&" << nt.get(r.getQ()) << "[" << i << "u], &"
+             << nt.get(r.getNext()) << "[" << i << "u], &"
+             << nt.get(r.getRst()) << ", &" << nt.get(r.getEn()) << ", &"
+             << nt.get(r.getInit()) << "[" << i << "u]}";
+      }
     }
     os << "});\n";
   }
@@ -4313,8 +4347,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       llvm::SmallVector<unsigned> wakeOffsets;
       llvm::SmallVector<std::pair<unsigned, uint64_t>> wakeEntries;
       for (pyc::RegOp r : regLoopRegs[loopId]) {
-        wakeOffsets.push_back(wakeEntries.size());
-        collectFanoutWordMasks(r.getQ(), *schedule, combIndex, wakeEntries);
+        // Every element lane of a vector reg shares the whole value's
+        // fanout: any element change wakes all readers of the vector,
+        // matching the per-reg wake granularity.
+        const unsigned n = regLanes.lookup(r.getOperation());
+        llvm::SmallVector<std::pair<unsigned, uint64_t>> regEntries;
+        collectFanoutWordMasks(r.getQ(), *schedule, combIndex, regEntries);
+        for (unsigned i = 0; i < n; ++i) {
+          wakeOffsets.push_back(wakeEntries.size());
+          wakeEntries.append(regEntries.begin(), regEntries.end());
+        }
       }
       wakeOffsets.push_back(wakeEntries.size());
       std::string wake = "_pyc_fused_wake_" + loop;
@@ -4415,24 +4457,57 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "    const auto &_pyc_loop_dirty_" << regLoopId(loopId) << " = " << loop
        << ".commit();\n";
     unsigned lane = 0;
+    bool laneWordOpen = false;
+    auto closeLaneWord = [&]() {
+      if (laneWordOpen) {
+        os << "    }\n";
+        laneWordOpen = false;
+      }
+    };
+    auto openWord = [&](unsigned l, const std::string &cond) {
+      if (l & 63)
+        return;
+      closeLaneWord();
+      os << "    if (" << cond << ") {\n";
+      laneWordOpen = true;
+    };
     for (pyc::RegOp r : regLoopRegs[loopId]) {
       // Named per-lane commit-changed alias keeps the comb-dirty smoke
       // assertions meaningful under the loop lowering (same pattern as the
       // per-reg path); the condition is unchanged.
       std::string changed =
           "_pyc_commit_changed_" + nt.get(r.getQ()) + "_inst";
-      const std::string word = "_pyc_loop_dirty_" + regLoopId(loopId) +
-                               "[" + std::to_string(lane >> 6) + "u]";
-      openLaneWord(lane, word);
-      os << "      const bool " << changed << " = ((" << word << " >> "
-         << (lane & 63) << "u) & 1u);\n";
+      const unsigned n = regLanes.lookup(r.getOperation());
+      if (n == 1) {
+        const std::string word = "_pyc_loop_dirty_" + regLoopId(loopId) +
+                                 "[" + std::to_string(lane >> 6) + "u]";
+        openWord(lane, word);
+        os << "      const bool " << changed << " = ((" << word << " >> "
+           << (lane & 63) << "u) & 1u);\n";
+      } else {
+        // A vector reg spans n lanes; any set bit means the whole vector
+        // value changed (same wake granularity as the per-reg path). The
+        // OR reads its words directly so it cannot sit inside a word block.
+        closeLaneWord();
+        os << "      const bool " << changed << " = ";
+        for (unsigned i = 0; i < n; ++i) {
+          const std::string word =
+              "_pyc_loop_dirty_" + regLoopId(loopId) +
+              "[" + std::to_string((lane + i) >> 6) + "u]";
+          if (i)
+            os << " || ((" << word << " >> " << ((lane + i) & 63)
+               << "u) & 1u)";
+          else
+            os << "((" << word << " >> " << ((lane + i) & 63) << "u) & 1u)";
+        }
+        os << ";\n";
+      }
       os << "      if (" << changed << ") {\n";
       emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt, "        ");
       os << "      }\n";
-      ++lane;
+      lane += n;
     }
-    if (lane)
-      os << "    }\n";
+    closeLaneWord();
   }
   for (auto r : regs) {
     std::string key = nt.get(r.getQ()) + "_inst";
