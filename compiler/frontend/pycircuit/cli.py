@@ -2565,19 +2565,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
                 *trace_codegen_args,
                 f"--logic-depth={logic_depth}",
             ]
-                    # External-module user sources: discover extmod.toml manifests
-        ext_roots = [out_dir]
-        tb_arg = getattr(args, "python_file", None)
-        if tb_arg:
-            ext_roots.append(Path(str(tb_arg)).resolve().parent)
-        ext_cpp_sources, ext_header_dirs = _collect_ext_module_cpp_sources_multi(ext_roots)
-        if ext_cpp_sources:
-            build_manifest["ext_sources"] = [str(p) for p in ext_cpp_sources]
-        for d in ext_header_dirs:
-            sd = str(d)
-            if sd not in include_dirs:
-                include_dirs.append(sd)
-if args.cpp_pch:
+            if args.cpp_pch:
                 cpp_args.append("--cpp-pch")
             pycc_jobs.append(
                 (
@@ -2708,6 +2696,20 @@ if args.cpp_pch:
             "cxx_standard": "c++17",
             "profile": str(args.profile),
         }
+        # External-module user sources (docs/external-modules.md): discover
+        # extmod.toml manifests registered with the design and append the
+        # [backends.cpp] source files to the simulator link.
+        ext_roots = [out_dir]
+        tb_arg = getattr(args, "python_file", None)
+        if tb_arg:
+            ext_roots.append(Path(str(tb_arg)).resolve().parent)
+        ext_cpp_sources, ext_header_dirs = _collect_ext_module_cpp_sources_multi(ext_roots)
+        if ext_cpp_sources:
+            build_manifest["ext_sources"] = [str(p) for p in ext_cpp_sources]
+        for d in ext_header_dirs:
+            sd = str(d)
+            if sd not in include_dirs:
+                include_dirs.append(sd)
         if args.cpp_pch:
             # Collect device hpp headers flagged for PCH across all module manifests.
             seen: set[str] = set()
