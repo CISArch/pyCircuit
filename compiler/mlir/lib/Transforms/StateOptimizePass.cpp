@@ -26,8 +26,10 @@ static LogicalResult canonicalizeAndCSE(func::FuncOp function) {
     dialect->getCanonicalizationPatterns(patterns);
   for (RegisteredOperationName op : context->getRegisteredOperations())
     op.getCanonicalizationPatterns(patterns, context);
+  GreedyRewriteConfig cfg;
+  cfg.maxIterations = 100;
   if (failed(applyPatternsAndFoldGreedily(function, std::move(patterns),
-                                          GreedyRewriteConfig())))
+                                          std::move(cfg))))
     return failure();
   IRRewriter rewriter(context);
   DominanceInfo domInfo(function);

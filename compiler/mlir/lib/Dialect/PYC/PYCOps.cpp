@@ -46,7 +46,14 @@ ParseResult ConstantOp::parse(OpAsmParser &parser, OperationState &result) {
 }
 
 void ConstantOp::print(OpAsmPrinter &p) {
-  p << " " << getValueAttr().getValue().getZExtValue() << " : " << getType();
+  auto v = getValueAttr().getValue();
+  if (v.getBitWidth() <= 64) {
+    p << " " << v.getZExtValue() << " : " << getType();
+  } else {
+    llvm::SmallString<64> buf;
+    v.toString(buf, 10, /*signed=*/false);
+    p << " " << buf << " : " << getType();
+  }
 }
 
 OpFoldResult ConstantOp::fold(FoldAdaptor) { return getValueAttr(); }

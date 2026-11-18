@@ -622,8 +622,8 @@ struct CombCanonicalizePass : public PassWrapper<CombCanonicalizePass, Operation
                  VReduceSingleLaneDim<pyc::VAndReduceOp>,
                  VReduceSingleLaneDim<pyc::VAddReduceOp>>(f.getContext());
 
-    GreedyRewriteConfig cfg;
-    if (failed(applyPatternsAndFoldGreedily(f, std::move(patterns), cfg)))
+        GreedyRewriteConfig cfg;
+    cfg.maxIterations = 100; if (failed(applyPatternsAndFoldGreedily(f, std::move(patterns), cfg)))
       signalPassFailure();
   }
 };
