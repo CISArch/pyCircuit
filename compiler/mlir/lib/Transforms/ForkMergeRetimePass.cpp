@@ -100,14 +100,16 @@ static Value resolve(Value value) {
   return value;
 }
 
-// Textual identity of a value: SSA id for real values, literal for constants.
+// Textual identity of a value: constants by literal, everything else by
+// pointer identity. Never print the value itself: `os << value` drives the
+// generic AsmPrinter, which crashes on large functions.
 static void appendValueKey(llvm::raw_ostream &os, Value value) {
   Value resolved = resolve(value);
   if (auto constant = constantValue(resolved)) {
     os << "c" << constant->getBitWidth() << "x" << *constant;
     return;
   }
-  os << resolved;
+  os << resolved.getAsOpaquePointer();
 }
 
 static bool isStateBoundary(Operation *def) {
@@ -266,7 +268,8 @@ private:
     llvm::raw_string_ostream os(key);
     os << scalarWidth(reg.getQ().getType()).value_or(0) << ':';
     appendValueKey(os, reg.getNext());
-    os << '|' << reg.getClk() << '|' << reg.getRst() << '|';
+    os << '|' << reg.getClk().getAsOpaquePointer() << '|'
+       << reg.getRst().getAsOpaquePointer() << '|';
     appendValueKey(os, reg.getEn());
     if (init)
       os << '|' << init->getBitWidth() << 'x' << *init;

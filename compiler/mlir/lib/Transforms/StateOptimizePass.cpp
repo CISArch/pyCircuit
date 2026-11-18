@@ -31,8 +31,12 @@ static LogicalResult canonicalizeAndCSE(func::FuncOp function) {
     dialect->getCanonicalizationPatterns(patterns);
   for (RegisteredOperationName op : context->getRegisteredOperations())
     op.getCanonicalizationPatterns(patterns, context);
-  if (failed(applyPatternsAndFoldGreedily(function, std::move(patterns),
-                                          GreedyRewriteConfig())))
+  GreedyRewriteConfig cfg;
+  // Default maxIterations=10 gives a silent fixpoint failure on large
+  // fir2pyc-emitted functions (same failure mode as slp-pack-wires); allow
+  // more rounds to converge.
+  cfg.maxIterations = 100;
+  if (failed(applyPatternsAndFoldGreedily(function, std::move(patterns), cfg)))
     return failure();
   IRRewriter rewriter(context);
   DominanceInfo domInfo(function);

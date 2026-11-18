@@ -260,3 +260,5 @@ docs/gates
 .local-bin/
 cpp-ab/
 
+# Generated simulation build files
+designs/Boom-pyc/sim/build/

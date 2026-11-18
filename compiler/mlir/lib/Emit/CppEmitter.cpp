@@ -339,12 +339,38 @@ struct NameTable {
   llvm::StringMap<unsigned> used;
   int next = 0;
 
+  NameTable() {
+    // Method names emitted later by CppEmitter must not collide with signal
+    // names minted here (e.g. a FIRRTL wire named `tick` vs `void tick()`).
+    for (const char *reserved : {"tick", "tick_compute", "eval", "reset",
+                                 "pyc_register_probes"})
+      used[reserved] = 1;
+  }
+
+  // Reserve a name so the next `unique(n)` call mints `n_2` instead. Used to
+  // keep signal/member names clear of sibling struct type names.
+  void reserve(llvm::StringRef n) {
+    if (!n.empty())
+      used.try_emplace(n, 1);
+  }
+
   std::string unique(std::string base) {
     unsigned &n = used[base];
-    n++;
-    if (n == 1)
+    unsigned candidate = ++n;
+    if (candidate == 1)
       return base;
-    return base + "_" + std::to_string(n);
+    // Suffixed candidates can collide with names already taken under a
+    // different key (e.g. FIRRTL siblings `Queue_X` and `Queue_X_2`: the
+    // second candidate for `Queue_X` is exactly `Queue_X_2`). Keep counting
+    // and register the minted name so no other base can reuse it.
+    while (true) {
+      std::string cand = base + "_" + std::to_string(candidate);
+      if (!used.contains(cand)) {
+        used[cand] = 1;
+        return cand;
+      }
+      candidate = ++n;
+    }
   }
 
   std::string get(Value v) {
@@ -1486,6 +1512,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                               const CppEmitterOptions &opts,
                               const ObservationPlans &probePlans) {
   NameTable nt;
+  // Every function in the module becomes a sibling `struct` with the same
+  // name; reserve them all so instance members never shadow a type name
+  // (e.g. a member `Queue4_BundleMap` of type `Queue4_BundleMap`).
+  if (ModuleOp mod = f->getParentOfType<ModuleOp>())
+    for (func::FuncOp sibling : mod.getOps<func::FuncOp>())
+      nt.reserve(sanitizeId(sibling.getSymName()));
 
   if (!f.isDeclaration() && !getFuncPlacementSummary(f))
       return f.emitError(
@@ -2519,7 +2551,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	    os << "      if (child) child->pyc_register_probes(reg, p);\n";
 	    os << "    };\n";
 	    for (const auto &ii : instInfos)
-	      os << "    reg_child(" << ii.member << ", \"" << ii.seg << "\");\n";
+	      // `this->` matters: a member named `reg` would otherwise be shadowed
+	      // by the `ProbeRegistry &reg` parameter of pyc_register_probes.
+	      os << "    reg_child(this->" << ii.member << ", \"" << ii.seg << "\");\n";
 	  }
       auto probeAliases = probeAliasesForTop(probePlans, f.getSymName());
       if (!probeAliases.empty()) {

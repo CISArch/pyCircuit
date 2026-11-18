@@ -2479,6 +2479,13 @@ int main(int argc, char **argv) {
   mlir::func::registerInlinerExtension(registry);
 
   MLIRContext ctx(registry);
+  // The parallel pass adaptor races on large fir2pyc-emitted IR (ops with
+  // malformed types reach the verifier, which then crashes while printing the
+  // diagnostic). Allow a single-threaded escape hatch until the race is
+  // root-caused.
+  if (const char *single = getenv("PYC_DISABLE_THREADS"))
+    if (llvm::StringRef(single) != "0")
+      ctx.disableMultithreading();
 #ifdef _WIN32
   // MSYS2/MinGW builds can hit non-deterministic crashes when running nested
   // pass pipelines with multithreading enabled. Bring-up prefers robustness.
