@@ -129,6 +129,7 @@ struct SLPPackWiresPass : public PassWrapper<SLPPackWiresPass, OperationPass<fun
     RewritePatternSet patterns(f.getContext());
     patterns.add<PackVCreateElementwise>(f.getContext());
     GreedyRewriteConfig cfg;
+    cfg.maxIterations = 100;  // default 10 too low for large functions
     if (failed(applyPatternsAndFoldGreedily(f, std::move(patterns), cfg)))
       signalPassFailure();
   }

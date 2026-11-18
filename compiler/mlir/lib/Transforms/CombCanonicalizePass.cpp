@@ -623,6 +623,7 @@ struct CombCanonicalizePass : public PassWrapper<CombCanonicalizePass, Operation
                  VReduceSingleLaneDim<pyc::VAddReduceOp>>(f.getContext());
 
     GreedyRewriteConfig cfg;
+    cfg.maxIterations = 100;  // default 10 too low for large functions
     if (failed(applyPatternsAndFoldGreedily(f, std::move(patterns), cfg)))
       signalPassFailure();
   }
