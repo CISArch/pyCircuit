@@ -1,0 +1,28 @@
+# External black-box module manifest (docs/external-modules.md).
+# lane_u = sum(byte[x] * (u+1)) truncated to 16 bits; out packs lanes 0..3.
+[module]
+name = "ext_dct8"
+
+[[ports]]
+name = "in"
+dir = "in"
+width = 64
+
+[[ports]]
+name = "valid"
+dir = "in"
+width = 1
+
+[[ports]]
+name = "out"
+dir = "out"
+width = 64
+
+[backends.verilog]
+files = ["dct8.v"]
+top = "dct8"
+
+[backends.cpp]
+type = "source"
+files = ["dct8.cpp"]
+header = "ext_dct8.hpp"

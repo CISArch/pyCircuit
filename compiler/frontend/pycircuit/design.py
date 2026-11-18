@@ -394,6 +394,13 @@ class Design:
         for cm in self._mods.values():
             parts.append(cm.mod.emit_func_mlir())
             parts.append("\n")
+        # External black-box module declarations (docs/external-modules.md).
+        ext_decls = getattr(self, "_ext_module_decls", None)
+        if ext_decls:
+            from .ext import ext_module_mlir
+
+            for decl in ext_decls:
+                parts.append(ext_module_mlir(decl))
         parts.append("}\n")
         return "".join(parts)
 
@@ -407,10 +414,20 @@ class Design:
             dep_decls: list[str] = []
             for dep_sym in deps:
                 dep_decls.append(self._emit_dep_decl_mlir(self._mods[dep_sym]))
+            # External black-box declarations reachable from this module are
+            # appended so the per-module .pyc parses standalone
+            # (docs/external-modules.md).
+            ext_decls = getattr(self, "_ext_module_decls", None)
+            ext_text = ""
+            if ext_decls:
+                from .ext import ext_module_mlir
+
+                ext_text = "".join(ext_module_mlir(d) for d in ext_decls)
             out[sym] = (
                 f'module attributes {{pyc.top = @{sym}, pyc.frontend.contract = "{FRONTEND_CONTRACT}"}} {{\n'
                 + "".join(dep_decls)
                 + body
+                + ext_text
                 + "\n}\n"
             )
         return out

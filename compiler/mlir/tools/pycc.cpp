@@ -950,8 +950,11 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
       if (!calleeAttr)
         return inst.emitError("missing required FlatSymbolRefAttr `callee`");
       auto callee = module.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
-      if (!callee)
-        return inst.emitError("callee symbol not found: ") << calleeAttr.getValue();
+      if (!callee) {
+        // External black-box callees (docs/external-modules.md) carry no body;
+        // skip them in the TB payload probe walk.
+        continue;
+      }
       std::string seg = nameAttr.getValue().str();
       if (auto shortAttr = inst->getAttrOfType<StringAttr>("short_name"))
         seg = shortAttr.getValue().str();
@@ -2785,6 +2788,7 @@ int main(int argc, char **argv) {
         os << "#include <cpp/pyc_sim.hpp>\n";
         os << "#include <cpp/pyc_state_loop.hpp>\n";
         os << "#include <cpp/pyc_change_scheduler.hpp>\n";
+        os << "#include <cpp/pyc_ext.hpp>\n";
       };
 
       auto writeSourcePreamble = [&](llvm::raw_ostream &os, llvm::StringRef headerName) {
