@@ -41,6 +41,13 @@ def main() -> int:
     data = _load(manifest_path)
 
     srcs = [Path(s).resolve() for s in data.get("sources", []) if isinstance(s, str) and s]
+    # External-module user sources (docs/external-modules.md): linked into the
+    # simulator alongside the generated model.
+    srcs.extend(
+        Path(s).resolve()
+        for s in data.get("ext_sources", [])
+        if isinstance(s, str) and s
+    )
     tb_cpp = Path(str(data.get("tb_cpp", ""))).resolve()
     incs = [Path(s).resolve() for s in data.get("include_dirs", []) if isinstance(s, str) and s]
     runtime_srcs = [Path(s).resolve() for s in data.get("runtime_sources", []) if isinstance(s, str) and s]

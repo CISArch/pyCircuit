@@ -1,0 +1,92 @@
+# External black-box write-back cache manifest (docs/external-modules.md).
+# Scaled-down flavor of DavinciBaseLine v5_l1d_cache: 2 sets x 2 ways,
+# 16-byte lines (data port is exactly 128b), write-back with an internal
+# backing store standing in for the next-level memory.
+#
+# Cycle contract (same-phase eval view / tick_commit state update):
+#   - resp_valid/hit are combinational on the CURRENT request (eval view).
+#   - Reads:  hit  -> data this cycle; miss -> data after refill_latency cycles.
+#   - Writes: accepted this cycle, line becomes visible after tick_commit.
+#   - flush: all lines invalidated; dirty lines dropped (backing store keeps
+#     them, mirroring write-back to the next level).
+
+[module]
+name = "ext_cache"
+
+# Clocked module: clk/rst are manifest ports so both backends connect them
+# (Verilog wires the top-level nets; C++ assigns the Wire members each tick).
+# The class gates its state update on the clk posedge inside tick_commit().
+
+[[ports]]
+name = "clk"
+dir = "clock"
+width = 1
+
+[[ports]]
+name = "rst"
+dir = "reset"
+width = 1
+
+[[ports]]
+name = "addr"
+dir = "in"
+width = 32
+
+[[ports]]
+name = "req_valid"
+dir = "in"
+width = 1
+
+[[ports]]
+name = "wr"
+dir = "in"
+width = 1
+
+[[ports]]
+name = "wdata"
+dir = "in"
+width = 128
+
+[[ports]]
+name = "wmask"
+dir = "in"
+width = 16
+
+[[ports]]
+name = "resp_ready"
+dir = "in"
+width = 1
+
+[[ports]]
+name = "flush"
+dir = "in"
+width = 1
+
+[[ports]]
+name = "rdata"
+dir = "out"
+width = 128
+
+[[ports]]
+name = "hit"
+dir = "out"
+width = 1
+
+[[ports]]
+name = "resp_valid"
+dir = "out"
+width = 1
+
+[[ports]]
+name = "dirty_evict"
+dir = "out"
+width = 1
+
+[backends.verilog]
+files = ["cache.v"]
+top = "ext_cache"
+
+[backends.cpp]
+type = "source"
+files = ["cache.cpp"]
+header = "ext_cache.hpp"
