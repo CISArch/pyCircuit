@@ -1902,6 +1902,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       // make_unique<Type>() when the member name shadows the type)
       if (member == sanitizeId(calleeAttr.getValue()))
         member = nt.unique(base + "_inst");
+      // Prevent member name == generated method name (C++ shadowing
+      // breaks method calls like tick() when a Wire member is named tick)
+      static const llvm::StringRef reservedMethods[] = {
+        "tick", "commit", "eval", "comb", "tick_compute", "tick_commit",
+        "eval_comb_pass", "pyc_register_probes", "pyc_trace_vcd"
+      };
+      for (auto rm : reservedMethods) {
+        if (member == rm) {
+          member = nt.unique(base + "_inst");
+          break;
+        }
+      }
 
       std::vector<char> clockOnlyIn(inst.getNumOperands(), 0);
       if (callee) {
