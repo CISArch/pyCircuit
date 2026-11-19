@@ -56,6 +56,15 @@ run_schedule() {
 run_schedule "${OUT}/first"
 run_schedule "${OUT}/second"
 
+# The comb reads %w before its assign, so a block-order pass would consume the
+# wake before %w updates; it must keep polling.
+"${PYCC}" "${ROOT}/compiler/mlir/test/Inputs/change_schedule_late_wire.mlir" \
+  --emit=none -o /dev/null --dump-pass-ir="${OUT}/late_wire" \
+  --dump-pass-ir-phase=after \
+  --dump-pass-ir-filter='change-driven-schedule' >/dev/null
+grep -q 'pyc.comb(%[0-9]*) {.*pyc.change_schedule.polled_inputs = \[0\]' \
+  "${OUT}/late_wire"/*_after_*change-driven-schedule*.mlir
+
 first_dump=("${OUT}/first"/*_after_*change-driven-schedule*.mlir)
 second_dump=("${OUT}/second"/*_after_*change-driven-schedule*.mlir)
 if [[ ${#first_dump[@]} -ne 1 || ${#second_dump[@]} -ne 1 ]]; then
@@ -98,6 +107,11 @@ for expected in (
 node_attrs = re.findall(r"pyc\.change_schedule\.node = \[[^\]]+\]", text)
 if len(node_attrs) != 4:
     raise SystemExit(f"fail: expected 4 scheduled nodes, got {len(node_attrs)}")
+# Only the two combs reading the %in port poll; the instance consumer is woken
+# by fanout.
+polled = re.findall(r"pyc\.change_schedule\.polled_inputs = \[[^\]]*\]", text)
+if polled != ["pyc.change_schedule.polled_inputs = [0]"] * 2:
+    raise SystemExit(f"fail: unexpected polled inputs {polled}")
 print("ok: canonical schedule metadata is stable and verified")
 PY
 

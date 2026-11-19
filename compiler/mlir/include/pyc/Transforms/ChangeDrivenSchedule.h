@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -22,6 +23,10 @@ inline constexpr llvm::StringLiteral kChangeScheduleSlotAttr =
     "pyc.change_schedule.slot";
 inline constexpr llvm::StringLiteral kChangeScheduleFanoutAttr =
     "pyc.change_schedule.fanout";
+/// Comb input indices whose value can change without any scheduled producer
+/// waking the comb (e.g. module ports); only these need polled snapshots.
+inline constexpr llvm::StringLiteral kChangeSchedulePolledInputsAttr =
+    "pyc.change_schedule.polled_inputs";
 
 struct ChangeScheduleNode {
   mlir::Operation *operation = nullptr;
@@ -34,6 +39,7 @@ struct ChangeScheduleNode {
 
 struct ChangeSchedulePlan {
   llvm::SmallVector<ChangeScheduleNode> nodes;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<uint64_t>> polledInputs;
   uint64_t edgeCount = 0;
   uint64_t rankCount = 0;
 };
