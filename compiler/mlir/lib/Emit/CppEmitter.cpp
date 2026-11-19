@@ -274,7 +274,7 @@ static void emitWireProbes(llvm::raw_ostream &os, Type ty, unsigned w,
     os << "    reg.addVec(reg_path(" << cppStringLiteral(fieldPath) << "), &" << cppExpr << ");\n";
     return;
   }
-  os << "    reg.addWire<" << w << ">(reg_path(" << cppStringLiteral(fieldPath) << "), &" << cppExpr << ");\n";
+  os << "    probeReg.addWire<" << w << ">(reg_path(" << cppStringLiteral(fieldPath) << "), &" << cppExpr << ");\n";
 }
 
 struct NameTable {
@@ -1898,6 +1898,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       if (auto shortAttr = inst->getAttrOfType<StringAttr>("short_name"))
         seg = sanitizeId(shortAttr.getValue());
       std::string member = nt.unique(base);
+      // Prevent member name == type name (C++ shadowing breaks
+      // make_unique<Type>() when the member name shadows the type)
+      if (member == sanitizeId(calleeAttr.getValue()))
+        member = nt.unique(base + "_inst");
 
       std::vector<char> clockOnlyIn(inst.getNumOperands(), 0);
       if (callee) {
@@ -2132,7 +2136,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	  os << "  }\n\n";
 
 	  // ProbeRegistry registration (Decisions 0004, 0018-0021).
-	  os << "  void pyc_register_probes(pyc::cpp::ProbeRegistry &reg, const std::string &prefix) {\n";
+	  os << "  void pyc_register_probes(pyc::cpp::ProbeRegistry &probeReg, const std::string &prefix) {\n";
 	  os << "    std::string inst = pyc::cpp::shortenInstancePath(prefix);\n";
 	  os << "    auto reg_path = [&](const char *leaf) {\n";
 	  os << "      std::string p = inst;\n";
@@ -2196,13 +2200,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		      refP = looped ? pendNext.first : "&" + pendNext.first;
 		      refN = looped ? pendNext.second : "&" + pendNext.second;
 		      if (source.lsb != 0 || storageWidth != w) {
-			        os << "    reg.addRegSlice<" << w << ", " << storageWidth
+			        os << "    probeReg.addRegSlice<" << w << ", " << storageWidth
 			           << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &"
 			           << outNames[i] << ", " << refP << ", "
                        << refN
                        << ", " << source.lsb << "u);\n";
 			      } else {
-			        os << "    reg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
+			        os << "    probeReg.addReg<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i]
 			           << ", " << refP << ", "
                        << refN
                        << ");\n";
@@ -2217,7 +2221,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                        named.cppRegInst.rfind("delay_loop_", 0) == 0;
           if (named.stateLsb != 0 ||
               named.stateStorageWidth != named.width) {
-            os << "    reg.addRegSlice<" << named.width << ", "
+            os << "    probeReg.addRegSlice<" << named.width << ", "
                << named.stateStorageWidth << ">(reg_path("
                << cppStringLiteral(named.fieldPath) << "), &"
                << named.cppValue << ", "
@@ -2225,7 +2229,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                << ", " << named.cppRegNext << ", "
                << named.stateLsb << "u);\n";
           } else {
-            os << "    reg.addReg<" << named.width << ">(reg_path("
+            os << "    probeReg.addReg<" << named.width << ">(reg_path("
                << cppStringLiteral(named.fieldPath) << "), &"
                << named.cppValue << ", "
                << (loopedN ? named.cppRegInst : "&" + named.cppRegInst)
@@ -2368,7 +2372,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                    << (loopPend.empty() ? ("&" + inst + "->pending") : loopPend)
                    << ", " << tapWriteNext << ");\n";
               else
-                os << "    reg.addRegLazyTap<" << width << ">(reg_path("
+                os << "    probeReg.addRegLazyTap<" << width << ">(reg_path("
                    << cppStringLiteral(field) << "), " << tapViewRef << ", "
                    << tapDepth << "u, "
                    << (loopPend.empty() ? ("&" + inst + "->pending") : loopPend)
@@ -2382,7 +2386,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                    << (loopPend.empty() ? ("&" + inst + "->pending") : loopPend)
                    << ", " << tapWriteNext << ");\n";
               else
-                os << "    reg.addRegLazyTapSlice<" << width << ", "
+                os << "    probeReg.addRegLazyTapSlice<" << width << ", "
                    << storageWidth << ">(reg_path(" << cppStringLiteral(field)
                    << "), " << tapViewRef << ", " << tapDepth << "u, " << lsb
                    << "u, "
@@ -2392,12 +2396,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             continue;
           }
           if (lsb == 0 && width == storageWidth) {
-            os << "    reg.addReg<" << width << ">(reg_path("
+            os << "    probeReg.addReg<" << width << ">(reg_path("
                << cppStringLiteral(field) << "), " << qText << ", "
                << pendText << ", " << nextText << ");\n";
             continue;
           }
-          os << "    reg.addRegLazySlice<" << width << ", " << storageWidth
+          os << "    probeReg.addRegLazySlice<" << width << ", " << storageWidth
              << ">(reg_path(" << cppStringLiteral(field) << "), " << qText
              << ", " << lsb << "u, " << pendText << ", " << nextText
              << ");\n";
@@ -2454,7 +2458,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             lazyWireFailed = true;
             return;
           }
-          os << "    reg.addWire<" << width << ">(reg_path("
+          os << "    probeReg.addWire<" << width << ">(reg_path("
              << cppStringLiteral(field) << "), &"
              << nt.get(op->getResult(resultIndex)) << ");\n";
         }
@@ -2465,7 +2469,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		    std::string instName = nt.get(mem.getRdata()) + "_inst";
 		    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
 	      instName = sanitizeId(nameAttr.getValue());
-	    os << "    reg.addMem(reg_path(\"" << instName << "\"), &" << instName << ", &" << instName
+	    os << "    probeReg.addMem(reg_path(\"" << instName << "\"), &" << instName << ", &" << instName
 	       << ".pendingWrite, &" << instName << ".latchedAddr, &" << instName << ".latchedData, &" << instName
 	       << ".latchedStrb);\n";
 	  }
@@ -2473,7 +2477,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	    std::string instName = nt.get(mem.getRdata()) + "_inst";
 	    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
 	      instName = sanitizeId(nameAttr.getValue());
-	    os << "    if (" << instName << ") reg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
+	    os << "    if (" << instName << ") probeReg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
 	       << "->pendingWrite, &" << instName << "->latchedWaddr, &" << instName << "->latchedWdata, &" << instName
 	       << "->latchedWstrb);\n";
 	  }
@@ -2481,7 +2485,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	    std::string instName = nt.get(mem.getRdata0()) + "_inst";
 	    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
 	      instName = sanitizeId(nameAttr.getValue());
-	    os << "    if (" << instName << ") reg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
+	    os << "    if (" << instName << ") probeReg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
 	       << "->pendingWrite, &" << instName << "->latchedWaddr, &" << instName << "->latchedWdata, &" << instName
 	       << "->latchedWstrb);\n";
 	  }
@@ -2490,7 +2494,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	    os << "      std::string p = prefix;\n";
 	    os << "      p += \".\";\n";
 	    os << "      p += seg;\n";
-	    os << "      if (child) child->pyc_register_probes(reg, p);\n";
+	    os << "      if (child) child->pyc_register_probes(probeReg, p);\n";
 	    os << "    };\n";
 	    for (const auto &ii : instInfos)
 	      os << "    reg_child(" << ii.member << ", \"" << ii.seg << "\");\n";
