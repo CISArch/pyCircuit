@@ -1919,6 +1919,25 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                                    std::move(clockOnlyIn), std::move(childTypeName)});
     }
 
+    // Cross-shadowing fix: member names must not shadow ANY child type name.
+    // When a member name (from instance name) matches a type name used by
+    // ANOTHER instance's unique_ptr declaration, the type is shadowed.
+    // Fix: collect all child type names, then rename any member that matches.
+    {
+      llvm::DenseSet<llvm::StringRef> allTypeNames;
+      for (auto &ii : instInfos)
+        allTypeNames.insert(ii.childTypeName);
+      for (auto &ii : instInfos) {
+        if (allTypeNames.contains(ii.member) && ii.member != ii.childTypeName) {
+          // Member shadows another instance's type — rename with suffix
+          std::string orig = ii.member;
+          ii.member = orig + "_inst";
+          // Also update nt so subsequent uses get the renamed version
+          // (nt.unique would give a different name, but we bypass it)
+        }
+      }
+    }
+
     llvm::DenseMap<Operation *, SeqStateKind> seqMemo{};
     instHasSequentialCallee.reserve(instInfos.size());
     for (const auto &ii : instInfos) {
