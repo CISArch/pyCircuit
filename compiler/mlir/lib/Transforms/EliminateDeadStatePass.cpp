@@ -3,6 +3,7 @@
 
 #include "pyc/Dialect/PYC/PYCOps.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
@@ -69,18 +70,24 @@ void runEliminateDeadState(func::FuncOp function) {
         return;
       }
       if (auto mem = dyn_cast<pyc::ByteMemOp>(op)) {
-        if (mem.getRdata().use_empty())
-          toErase.push_back(op);
+        // Memory ops have MemWrite side effects (state persists across
+        // cycles). Never eliminate even if read output is unused —
+        // the write side-channel keeps state that may be read later
+        // or observed via probes. Only eliminate if wvalid is a
+        // constant false (provably never written).
+        if (auto wvalidDef = mem.getWvalid().getDefiningOp())
+          if (auto c = dyn_cast<arith::ConstantOp>(wvalidDef))
+            if (auto bv = dyn_cast<IntegerAttr>(c.getValue()))
+              if (bv.getValue().isZero())
+                toErase.push_back(op);
         return;
       }
       if (auto mem = dyn_cast<pyc::SyncMemOp>(op)) {
-        if (mem.getRdata().use_empty())
-          toErase.push_back(op);
+        // Same as ByteMemOp: MemWrite side effect, keep unless provably dead
         return;
       }
       if (auto mem = dyn_cast<pyc::SyncMemDPOp>(op)) {
-        if (mem.getRdata0().use_empty() && mem.getRdata1().use_empty())
-          toErase.push_back(op);
+        // Same: keep (side effects)
         return;
       }
       if (auto fifo = dyn_cast<pyc::AsyncFifoOp>(op)) {
