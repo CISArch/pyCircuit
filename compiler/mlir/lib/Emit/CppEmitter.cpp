@@ -1464,24 +1464,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << "\n";
 
-  // Internal wires for op results (including inside pyc.comb regions).
-  struct Decl {
-    std::string name;
-    Type ty;
-  };
-  std::vector<Decl> decls;
-  decls.reserve(256);
-  f.walk([&](Operation *op) {
-    for (Value r : op->getResults()) {
-      if (getValueCppStorage(r) != CppStorageKind::Struct)
-        continue;
-      decls.push_back(Decl{nt.get(r), r.getType()});
-    }
-  });
-  std::sort(decls.begin(), decls.end(), [](const Decl &a, const Decl &b) { return a.name < b.name; });
-  for (const Decl &d : decls)
-    os << "  " << cppType(d.ty) << " " << d.name << "{};\n";
-  os << "\n";
+  // Internal wires for op results (including inside pyc.comb regions) are
+  // declared further below, after RegLoop grouping: scalar looped regs have
+  // no standalone member — their q lives in the RegLoop's contiguous
+  // qWords_ arena and the name table is remapped onto qRef(lane), so every
+  // later reference (comb bodies, wake tables, probes, trace) reads the
+  // store directly.
 
   // Sequential primitive instances.
   llvm::SmallVector<pyc::RegOp> regs;
@@ -1646,6 +1634,44 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   regs.clear();
   for (pyc::RegOp r : unloopedRegs)
     regs.push_back(r);
+
+  // Scalar looped regs keep their committed value in the RegLoop's
+  // contiguous qWords_ arena: remap the name table onto qRef(lane) so every
+  // later reference reads the store directly, and skip their standalone
+  // member declaration. Vector looped regs keep their member q — their
+  // lanes are addressed through the member's first-leaf expression and
+  // bit-select emitters apply subscripts to the q name.
+  llvm::DenseSet<Value> loopStoredQ;
+  for (auto &kv : regLoopRegs)
+    for (auto [lane, r] : llvm::enumerate(kv.second)) {
+      if (isa<VectorType>(r.getQ().getType()))
+        continue;
+      loopStoredQ.insert(r.getQ());
+      nt.names[r.getQ()] =
+          "(*" + regLoopName(kv.first) + ".qRef<" +
+          std::to_string(bitWidth(r.getQ().getType())) + ">(" +
+          std::to_string(lane) + "u))";
+    }
+  // Internal wires for op results (including inside pyc.comb regions).
+  struct Decl {
+    std::string name;
+    Type ty;
+  };
+  std::vector<Decl> decls;
+  decls.reserve(256);
+  f.walk([&](Operation *op) {
+    for (Value r : op->getResults()) {
+      if (getValueCppStorage(r) != CppStorageKind::Struct)
+        continue;
+      if (loopStoredQ.contains(r))
+        continue;
+      decls.push_back(Decl{nt.get(r), r.getType()});
+    }
+  });
+  std::sort(decls.begin(), decls.end(), [](const Decl &a, const Decl &b) { return a.name < b.name; });
+  for (const Decl &d : decls)
+    os << "  " << cppType(d.ty) << " " << d.name << "{};\n";
+  os << "\n";
 
   // DelayLoop buckets: key = (loop_id, depth); width is per-lane now, and
   // vector delays stay per-object.
@@ -2804,6 +2830,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
        << nt.get(s.getIn()) << ", " << nt.get(s.getOut()) << ")";
   }
   os << " {\n";
+  // Pre-pay the RegLoop arenas before add_lanes and before any probe
+  // registration takes qRef/lane_qnext_raw addresses: with capacity paid up
+  // front the storage never moves, so those pointers stay valid.
+  for (int64_t loopId : regLoopIds) {
+    std::size_t words = 0;
+    for (pyc::RegOp r : regLoopRegs[loopId])
+      words += planeWords(r.getQ().getType());
+    os << "    " << regLoopName(loopId) << ".reserve("
+       << regLoopRegs[loopId].size() << "u, " << words << "u);\n";
+  }
   if (!combs.empty()) {
     // The only guarantee that every comb runs on its first eval.
     os << "    for (unsigned _pyc_id = 0; _pyc_id < " << combs.size()
@@ -2830,7 +2866,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         os << ", ";
       firstLane = false;
       const Type qTy = r.getQ().getType();
-      os << "{" << firstLeafData(qTy, nt.get(r.getQ())) << ", "
+      // Scalar lanes pass nullptr: the loop owns their committed value in
+      // qWords_ (see qRef). Vector lanes keep their member's first leaf.
+      os << "{" << (isa<VectorType>(qTy)
+                        ? firstLeafData(qTy, nt.get(r.getQ()))
+                        : std::string("nullptr"))
+         << ", "
          << firstLeafData(r.getNext().getType(), nt.get(r.getNext()))
          << ", &" << nt.get(r.getRst()) << ", &" << nt.get(r.getEn())
          << ", " << firstLeafData(r.getInit().getType(), nt.get(r.getInit()))

@@ -50,6 +50,26 @@ public:
   // interleaved lane struct. rst/en are a single value per loop: the emitter
   // groups lanes by (clk, rst, en), so every lane of one loop shares the
   // same control wires by construction.
+  //
+  // Scalar lanes pass q == nullptr: the loop owns their committed value in
+  // the contiguous qWords_ arena (qRef(i)), so commit streams q linearly
+  // next to qNext instead of scattering stores through external pointers.
+  // Vector lanes keep their member q (leaves are addressed by the member).
+  //
+  // Generated constructors call reserve() first so the arenas never move
+  // after probe registration takes their addresses.
+  void reserve(std::size_t lanes, std::size_t words) {
+    q_.reserve(lanes);
+    d_.reserve(lanes);
+    init_.reserve(lanes);
+    words_.reserve(lanes);
+    laneOff_.reserve(lanes);
+    qOff_.reserve(lanes);
+    pending_.reserve(lanes);
+    qStore_.reserve(words);
+    qWords_.reserve(words);
+  }
+
   void add_lanes(std::initializer_list<Lane> lanes) {
     for (const Lane &lane : lanes) {
       if (q_.empty()) {
@@ -65,6 +85,9 @@ public:
       words_.push_back(lane.words);
       laneOff_.push_back(qStore_.size());
       qStore_.resize(qStore_.size() + lane.words, 0);
+      qOff_.push_back(qWords_.size());
+      if (lane.q == nullptr)
+        qWords_.resize(qWords_.size() + lane.words, 0);
       pending_.push_back(0);
     }
     dirty_.assign(loop_word_count(q_.size()), 0);
@@ -111,7 +134,7 @@ public:
     const std::size_t n = q_.size();
     for (std::size_t i = 0; i < n; ++i) {
       if (__builtin_expect(pending_[i] != 0, 0)) {
-        std::uint64_t *q = q_[i];
+        std::uint64_t *q = q_[i] ? q_[i] : qWords_.data() + qOff_[i];
         const std::uint64_t *next = qStore_.data() + laneOff_[i];
         bool changed = false;
         for (unsigned w = 0; w < words_[i]; ++w) {
@@ -140,7 +163,7 @@ public:
         pending_[i] = 1;
         const std::uint64_t *src = r ? init_[i] : d_[i];
         std::uint64_t *next = qStore_.data() + laneOff_[i];
-        std::uint64_t *q = q_[i];
+        std::uint64_t *q = q_[i] ? q_[i] : qWords_.data() + qOff_[i];
         bool changed = false;
         for (unsigned w = 0; w < words_[i]; ++w) {
           changed |= q[w] != src[w];
@@ -175,6 +198,14 @@ public:
   void *lane_qnext_raw(std::size_t i) {
     return qStore_.data() + laneOff_[i];
   }
+  // The lane's committed value (arena-owned lanes only: q_[i] == nullptr).
+  // The emitter remaps every scalar looped reg's q onto this accessor and
+  // reinterprets it as Wire<W> — same standard-layout assumption as
+  // lane_qnext_raw.
+  template <unsigned Width>
+  Wire<Width> *qRef(std::size_t i) {
+    return reinterpret_cast<Wire<Width> *>(qWords_.data() + qOff_[i]);
+  }
 
 private:
   void clear_pending() { pending_.assign(q_.size(), 0); }
@@ -185,8 +216,10 @@ private:
   Wire<1> *en_ = nullptr;
   std::vector<const std::uint64_t *> init_;
   std::vector<unsigned> words_;
-  std::vector<std::uint64_t> qStore_;
-  std::vector<std::size_t> laneOff_;
+  std::vector<std::uint64_t> qStore_;  // qNext arena (write-intent probes)
+  std::vector<std::uint64_t> qWords_;  // committed q of arena-owned lanes
+  std::vector<std::size_t> laneOff_;   // lane segment offset in qStore_
+  std::vector<std::size_t> qOff_;      // lane segment offset in qWords_
   std::vector<char> pending_;
   std::vector<std::uint64_t> dirty_;
   bool clkPrev_ = false;

@@ -34,18 +34,21 @@ int main() {
   std::mt19937_64 rng(12345);
   Wire<1> clk{0}, rst{0}, en{1};
 
-  std::vector<Wire<8>> rd(kRegLanes), rinit(kRegLanes), rqRef(kRegLanes),
-      rqLoop(kRegLanes), rqFused(kRegLanes);
+  std::vector<Wire<8>> rd(kRegLanes), rinit(kRegLanes), rqRef(kRegLanes);
   std::vector<pyc_reg<8>> regRef;
   regRef.reserve(kRegLanes);
   RegLoop regLoop, fusedLoop;  // fusedLoop: tick-fuse single-phase lanes
+  // Arena-owned lanes: q lives in the loop (qRef), so lane.q is nullptr.
+  // Capacity is pre-paid like generated constructors do.
+  regLoop.reserve(kRegLanes, kRegLanes);
+  fusedLoop.reserve(kRegLanes, kRegLanes);
   for (unsigned i = 0; i < kRegLanes; ++i) {
     rd[i] = Wire<8>{i * 7 + 3};
     rinit[i] = Wire<8>{i + 1};
     regRef.emplace_back(clk, rst, en, rd[i], rinit[i], rqRef[i]);
-    regLoop.add_lanes({{rqLoop[i].data(), rd[i].data(), &rst, &en,
+    regLoop.add_lanes({{nullptr, rd[i].data(), &rst, &en,
                           rinit[i].data(), 1u}});
-    fusedLoop.add_lanes({{rqFused[i].data(), rd[i].data(), &rst, &en,
+    fusedLoop.add_lanes({{nullptr, rd[i].data(), &rst, &en,
                            rinit[i].data(), 1u}});
   }
 
@@ -120,12 +123,12 @@ int main() {
         return 1;
       }
       if (bit(fusedDirty, i) != changed ||
-          rqFused[i].value() != rqRef[i].value()) {
+          fusedLoop.qRef<8>(i)->value() != rqRef[i].value()) {
         std::fprintf(stderr, "FUSED MISMATCH cycle %u lane %u\n", c, i);
         return 1;
       }
       ref.mix(rqRef[i].value() + i);
-      loop.mix(rqLoop[i].value() + i);
+      loop.mix(regLoop.qRef<8>(i)->value() + i);
     }
     for (unsigned i = 0; i < kDelayLanes; ++i) {
       const bool pending = delayRef[i].has_pending();
