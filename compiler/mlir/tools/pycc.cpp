@@ -127,6 +127,11 @@ static llvm::cl::opt<bool> cppPch(
     llvm::cl::desc("Record device module hpp for CMake precompiled headers (requires --cpp-split=module)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> cppEvalFastExit(
+    "cpp-eval-fast-exit",
+    llvm::cl::desc("Emit the settle fast-path prologue for topological eval()"),
+    llvm::cl::init(true));
+
 static llvm::cl::opt<bool> cppCompileBudget(
     "cpp-compile-budget",
     llvm::cl::desc("Enforce predicted C++ compile cost budgets (PYC991-993)"),
@@ -2731,6 +2736,7 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
+      cppEmitOpts.evalFastExit = cppEvalFastExit;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -3091,6 +3097,7 @@ int main(int argc, char **argv) {
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
+    cppEmitOpts.evalFastExit = cppEvalFastExit;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))
