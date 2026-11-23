@@ -135,7 +135,7 @@ static llvm::cl::opt<bool> cppLaneMarkWalk(
     "cpp-lane-mark-walk",
     llvm::cl::desc("EXPERIMENTAL (L28): sample only lanes whose producer comb ran "
                    "this cycle instead of every fused lane"),
-    llvm::cl::init(false),
+    llvm::cl::init(true),
     llvm::cl::Hidden);
 
 static llvm::cl::opt<bool> cppCompileBudget(
