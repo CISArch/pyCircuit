@@ -3313,6 +3313,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
   }
 
+  // --cpp-parallel-fuse-tick: run compute+commit in one fork. The two local
+  // halves must stay in their original order, so they are emitted as separate
+  // members (tick_local_compute/tick_local_commit) and called from tick().
+  const bool fuseTick =
+      parallelInstances && opts.parallelFuseTick && !instInfos.empty();
+
   llvm::SmallVector<std::string> instanceEvalHelperNames;
   instanceEvalHelperNames.reserve(instInfos.size());
   for (unsigned idx = 0; idx < instInfos.size(); ++idx) {
@@ -4400,8 +4406,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
   }
 
-  os << "  void tick_compute() {\n";
-  if (!instInfos.empty()) {
+  os << (fuseTick ? "  void tick_local_compute() {\n"
+                  : "  void tick_compute() {\n");
+  if (!instInfos.empty() && !fuseTick) {
     if (parallelInstances) {
       os << "    // Sub-modules: independent next-state sampling, forked.\n";
       os << "    pyc::cpp::ForkJoinPool<" << parallelThreads << ">::instance().run("
@@ -4616,10 +4623,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << "  }\n\n";
 
-  os << "  void tick_commit() {\n";
+  os << (fuseTick ? "  void tick_local_commit() {\n"
+                  : "  void tick_commit() {\n");
   if (fastEdge)
     os << "    _pyc_seq_armed = false;\n";
-  if (!instInfos.empty()) {
+  if (!instInfos.empty() && !fuseTick) {
     if (parallelInstances) {
       os << "    // Sub-modules: independent commits, forked.\n";
       os << "    pyc::cpp::ForkJoinPool<" << parallelThreads << ">::instance().run("
@@ -4831,11 +4839,59 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
 	  os << "  }\n\n";
 
+	  if (fuseTick) {
+	    auto emitInstanceFork = [&](const char *computeMethod,
+	                               const char *commitMethod) {
+	      os << "    pyc::cpp::ForkJoinPool<" << parallelThreads
+	         << ">::instance().run(" << instInfos.size()
+	         << ", [&](unsigned _pyc_worker) {\n";
+	      os << "      switch (_pyc_worker) {\n";
+	      for (unsigned i = 0; i < instInfos.size(); ++i) {
+	        os << "        case " << i << "u: ";
+	        if (computeMethod)
+	          os << computeMethod << "_" << i << "(); ";
+	        if (commitMethod)
+	          os << commitMethod << "_" << i << "(); ";
+	        os << "return;\n";
+	      }
+	      os << "      }\n";
+	      os << "    });\n";
+	    };
+	    os << "  void tick_compute() {\n";
+	    emitInstanceFork("tick_compute_inst", nullptr);
+	    os << "    tick_local_compute();\n";
+	    os << "  }\n\n";
+	    os << "  void tick_commit() {\n";
+	    emitInstanceFork(nullptr, "tick_commit_inst");
+	    os << "    tick_local_commit();\n";
+	    os << "  }\n\n";
+	  }
+
 	  // Decision 0027: provide explicit comb/tick/commit APIs + high-level step().
 	  // Decision 0001: expose transfer() as an alias of commit().
 	  os << "  void comb() { eval(); }\n";
-	  os << "  void tick() { tick_compute(); }\n";
-	  os << "  void commit() { tick_commit(); }\n";
+	  if (fuseTick) {
+	    // One fork per edge: compute+commit per instance, then the two local
+	    // halves in their original order. commit() is folded into tick().
+	    os << "  void tick() {\n";
+	    os << "    pyc::cpp::ForkJoinPool<" << parallelThreads
+	       << ">::instance().run(" << instInfos.size()
+	       << ", [&](unsigned _pyc_worker) {\n";
+	    os << "      switch (_pyc_worker) {\n";
+	    for (unsigned i = 0; i < instInfos.size(); ++i)
+	      os << "        case " << i << "u: tick_compute_inst_" << i
+	         << "(); tick_commit_inst_" << i << "(); return;\n";
+	    os << "      }\n";
+	    os << "    });\n";
+	    os << "    tick_local_compute();\n";
+	    os << "    tick_local_commit();\n";
+	    os << "  }\n";
+	    os << "  // Folded into tick(); kept so the public API stays the same.\n";
+	    os << "  void commit() {}\n";
+	  } else {
+	    os << "  void tick() { tick_compute(); }\n";
+	    os << "  void commit() { tick_commit(); }\n";
+	  }
 	  os << "  void transfer() { tick_commit(); }\n";
 	  os << "  void step() {\n";
 	  os << "    comb();\n";

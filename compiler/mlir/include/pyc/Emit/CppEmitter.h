@@ -82,6 +82,8 @@ struct CppEmitterOptions {
   // instances of one stage onto an N-way persistent pool). 0 keeps the emitted
   // code byte-identical to the serial emitter.
   unsigned parallelInstances = 0;
+  // Fuse the tick_compute and tick_commit forks into one (parallel mode only).
+  bool parallelFuseTick = false;
   std::string probePlanPath{};
 };
 

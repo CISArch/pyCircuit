@@ -5,3 +5,4 @@
 - 活性第一：每轮 fork 在自己的调用栈上拥有 Job（tasks/next/done），worker 只认领手里 Job 的任务，`done == tasks` 即终结；退役前清 `job_` 并等 `inside_ == 0`，worker 复核指针后退出。
 - 退化：亲和掩码 <2 CPU、`PYC_PARALLEL_DISABLE=1`、或交接连续过慢 ⇒ 直接串行。
 - 测试：`tests/runtime/run_parallel_pool.sh`。
+- `--cpp-parallel-fuse-tick`（需 N≥2）：把一次边沿的两次 fork 合成一次（每个实例先算后提交，再跑两段本地序列）；`commit()` 因此变空壳，但 `transfer()` 仍走完整 `tick_commit()`。

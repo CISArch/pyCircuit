@@ -154,6 +154,12 @@ static llvm::cl::opt<unsigned> cppParallelInstances(
                    "costs a bounded wait, so only enable it when the run has spare CPUs)"),
     llvm::cl::init(0));
 
+static llvm::cl::opt<bool> cppParallelFuseTick(
+    "cpp-parallel-fuse-tick",
+    llvm::cl::desc("With --cpp-parallel-instances>=2, fuse the tick_compute and "
+                   "tick_commit forks into one; commit() becomes a no-op"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<std::string> cppManifestPath(
     "cpp-manifest",
     llvm::cl::desc("C++ compile manifest path (default: <out-dir>/cpp_compile_manifest.json)"),
@@ -2739,6 +2745,7 @@ int main(int argc, char **argv) {
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
       cppEmitOpts.parallelInstances = cppParallelInstances;
+      cppEmitOpts.parallelFuseTick = cppParallelFuseTick;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -3102,6 +3109,7 @@ int main(int argc, char **argv) {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
     cppEmitOpts.parallelInstances = cppParallelInstances;
+      cppEmitOpts.parallelFuseTick = cppParallelFuseTick;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))
