@@ -152,13 +152,13 @@ static llvm::cl::opt<unsigned> cppParallelInstances(
     llvm::cl::desc("Fork independent sibling instances of one schedule stage onto a persistent N-way pool "
                    "(0 = serial and byte-identical to the serial emitter; N>=2 opts in, and a stage fork "
                    "costs a bounded wait, so only enable it when the run has spare CPUs)"),
-    llvm::cl::init(0));
+    llvm::cl::init(2)); // measurement-only default; not for merge
 
 static llvm::cl::opt<bool> cppParallelFuseTick(
     "cpp-parallel-fuse-tick",
     llvm::cl::desc("With --cpp-parallel-instances>=2, fuse the tick_compute and "
                    "tick_commit forks into one; commit() becomes a no-op"),
-    llvm::cl::init(false));
+    llvm::cl::init(true)); // measurement-only default; not for merge
 
 static llvm::cl::opt<std::string> cppManifestPath(
     "cpp-manifest",
