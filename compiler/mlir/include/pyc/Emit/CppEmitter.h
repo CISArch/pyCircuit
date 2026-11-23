@@ -79,6 +79,9 @@ struct CppEmitterOptions {
   // downstream C++ TU cost even after file sharding.
   unsigned combChunkNodes = kDefaultCombChunkNodes;
   std::string probePlanPath{};
+  // Settle fast-path: skip the topological eval walk when the comb dirty set
+  // is empty and the unconditional prologue woke nothing.
+  bool evalFastExit = true;
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,
