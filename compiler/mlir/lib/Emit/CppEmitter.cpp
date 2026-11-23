@@ -4040,7 +4040,56 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
   }
 
+  // Settle fast-path: when the comb dirty set is empty every guarded comb below
+  // would test false, so one pass can only run the unconditional parts of the
+  // walk (polled-boundary combs and plain wire assigns). Emit exactly those in
+  // topological order as a cheap prologue; if they wake nothing, the pass is
+  // done. If they do, fall through to the complete walk (the re-run of the
+  // prologue's nodes is idempotent: polled combs see consumed dirty bits and
+  // matching snapshots, plain assigns re-copy equal values).
+  bool evalFastExit = opts.evalFastExit && hasFullTopo && !combs.empty();
+  if (evalFastExit) {
+    for (Operation *op : fullOrdered)
+      if (isa<pyc::InstanceOp, pyc::FifoOp, pyc::AsyncFifoOp, pyc::ByteMemOp,
+              pyc::SyncMemNMOp, pyc::CdcSyncOp, pyc::AssertOp>(*op)) {
+        // Stateful primitives poll inputs and refresh eval caches every pass;
+        // they are not functions of the comb dirty set.
+        evalFastExit = false;
+        break;
+      }
+  }
+
+  // Connect return values to output ports.
+  auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
+  if (!ret)
+    return f.emitError("missing return");
+  auto emitOutputPortRefresh = [&](llvm::StringRef indent) {
+    for (auto [i, v] : llvm::enumerate(ret.getOperands()))
+      os << indent << "if (" << outNames[i] << " != " << nt.get(v) << ") "
+         << outNames[i] << " = " << nt.get(v) << ";\n";
+  };
+
   os << "  void eval() {\n";
+  if (evalFastExit) {
+    os << "    if (_pyc_comb_dirty.empty()) {\n";
+    for (Operation *op : fullOrdered) {
+      if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
+        if (!hasDirtyPolledBoundaryInput(comb))
+          continue;
+        os << "      eval_comb_" << combIndex.lookup(op) << "();\n";
+        continue;
+      }
+      if (isa<func::ReturnOp, pyc::WireOp, arith::ConstantOp, pyc::ConstantOp>(*op))
+        continue;
+      if (failed(emitEvalNode(op, "      ")))
+        return failure();
+    }
+    os << "      if (_pyc_comb_dirty.empty()) {\n";
+    emitOutputPortRefresh("        ");
+    os << "        return;\n";
+    os << "      }\n";
+    os << "    }\n";
+  }
   if (hasFullTopo) {
     if (!topoEvalMethods.empty()) {
       for (const std::string &methodName : topoEvalMethods)
@@ -4071,13 +4120,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
   }
 
-  // Connect return values to output ports.
-  auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
-  if (!ret)
-    return f.emitError("missing return");
-  for (auto [i, v] : llvm::enumerate(ret.getOperands()))
-    os << "    if (" << outNames[i] << " != " << nt.get(v) << ") "
-       << outNames[i] << " = " << nt.get(v) << ";\n";
+  emitOutputPortRefresh("    ");
 
   os << "  }\n\n";
 
