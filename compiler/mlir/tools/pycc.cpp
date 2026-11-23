@@ -134,13 +134,6 @@ static llvm::cl::opt<bool> cppLaneMarkWalk(
     llvm::cl::init(false),
     llvm::cl::Hidden);
 
-static llvm::cl::opt<bool> cppVerifyLaneMarks(
-    "cpp-verify-lane-marks",
-    llvm::cl::desc("TEST ONLY (L28): after each marked walk assert that every "
-                   "unmarked lane already held its next value"),
-    llvm::cl::init(false),
-    llvm::cl::Hidden);
-
 static llvm::cl::opt<bool> cppCompileBudget(
     "cpp-compile-budget",
     llvm::cl::desc("Enforce predicted C++ compile cost budgets (PYC991-993)"),
@@ -2746,7 +2739,6 @@ int main(int argc, char **argv) {
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
       cppEmitOpts.laneMarkWalk = cppLaneMarkWalk;
-      cppEmitOpts.verifyLaneMarks = cppVerifyLaneMarks;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -3108,7 +3100,6 @@ int main(int argc, char **argv) {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
     cppEmitOpts.laneMarkWalk = cppLaneMarkWalk;
-    cppEmitOpts.verifyLaneMarks = cppVerifyLaneMarks;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))
