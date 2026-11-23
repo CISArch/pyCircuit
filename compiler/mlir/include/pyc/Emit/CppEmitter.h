@@ -97,7 +97,6 @@ struct CppEmitterOptions {
   // after each marked walk, that every unmarked lane already had q == next
   // (i.e. the mark set is a superset of the changed set); test-only.
   bool laneMarkWalk = false;
-  bool verifyLaneMarks = false;
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,
