@@ -131,6 +131,19 @@ static llvm::cl::opt<bool> cppEvalFastExit(
     "cpp-eval-fast-exit",
     llvm::cl::desc("Emit the settle fast-path prologue for topological eval()"),
     llvm::cl::init(true));
+static llvm::cl::opt<bool> cppLaneMarkWalk(
+    "cpp-lane-mark-walk",
+    llvm::cl::desc("EXPERIMENTAL (L28): sample only lanes whose producer comb ran "
+                   "this cycle instead of every fused lane"),
+    llvm::cl::init(false),
+    llvm::cl::Hidden);
+
+static llvm::cl::opt<bool> cppVerifyLaneMarks(
+    "cpp-verify-lane-marks",
+    llvm::cl::desc("TEST ONLY (L28): after each marked walk assert that every "
+                   "unmarked lane already held its next value"),
+    llvm::cl::init(false),
+    llvm::cl::Hidden);
 
 static llvm::cl::opt<bool> cppCompileBudget(
     "cpp-compile-budget",
@@ -2761,6 +2774,8 @@ int main(int argc, char **argv) {
       cppEmitOpts.evalFastExit = cppEvalFastExit;
       if (!applyNegedgeTrimOpt(cppEmitOpts))
         return 1;
+      cppEmitOpts.laneMarkWalk = cppLaneMarkWalk;
+      cppEmitOpts.verifyLaneMarks = cppVerifyLaneMarks;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -3124,6 +3139,8 @@ int main(int argc, char **argv) {
     cppEmitOpts.evalFastExit = cppEvalFastExit;
     if (!applyNegedgeTrimOpt(cppEmitOpts))
       return 1;
+    cppEmitOpts.laneMarkWalk = cppLaneMarkWalk;
+    cppEmitOpts.verifyLaneMarks = cppVerifyLaneMarks;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))
