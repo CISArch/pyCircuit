@@ -185,7 +185,7 @@ static llvm::cl::opt<unsigned> cppParallelInstances(
     llvm::cl::desc("Fork independent sibling instances of one schedule stage onto a persistent N-way pool "
                    "(0 = serial and byte-identical to the serial emitter; N>=2 opts in, and a stage fork "
                    "costs a bounded wait, so only enable it when the run has spare CPUs)"),
-    llvm::cl::init(0));
+    llvm::cl::init(2)); // measurement-only default; not for merge
 
 static llvm::cl::opt<std::string> cppManifestPath(
     "cpp-manifest",
