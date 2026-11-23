@@ -603,6 +603,158 @@ static bool functionHasSequentialState(func::FuncOp f,
   return hasSeq;
 }
 
+// ---------------------------------------------------------------------------
+// Falling-edge trim gate (--cpp-negedge-trim)
+//
+// The falling edge samples no next state, so its sampling work is dead: the
+// fall branch of tick_compute() only recomputes delay taps (already committed
+// by the previous edge) and recurses into sub-modules, and a fall tick_commit()
+// only walks sub-modules whose own sampling is already committed. Skipping that
+// walk is valid only when every clock-edge latch reachable through instances is
+// driven by the same clock signal: a sub-module clocked by another signal could
+// still sample state while the parent's clock falls. The helpers below prove
+// that property from the IR; when they fail the emitter keeps the serial code.
+//
+// Aliases are C++ name aliases of the same signal, so clock identity is
+// resolved through pyc.alias chains.
+// ---------------------------------------------------------------------------
+
+static Value resolveAliasValue(Value value) {
+  for (unsigned depth = 0; depth < 64; ++depth) {
+    Operation *def = value.getDefiningOp();
+    auto alias = def ? dyn_cast<pyc::AliasOp>(def) : nullptr;
+    if (!alias)
+      break;
+    value = alias.getIn();
+  }
+  return value;
+}
+
+static void appendClockOperands(Operation *op, llvm::SmallVectorImpl<Value> &out) {
+  if (auto r = dyn_cast<pyc::RegOp>(op))
+    out.push_back(r.getClk());
+  else if (auto d = dyn_cast<pyc::DelayLineOp>(op))
+    out.push_back(d.getClk());
+  else if (auto m = dyn_cast<pyc::SyncMemNMOp>(op))
+    out.push_back(m.getClk());
+  else if (auto m = dyn_cast<pyc::ByteMemOp>(op))
+    out.push_back(m.getClk());
+  else if (auto f = dyn_cast<pyc::FifoOp>(op))
+    out.push_back(f.getClk());
+  else if (auto f = dyn_cast<pyc::AsyncFifoOp>(op)) {
+    out.push_back(f.getInClk());
+    out.push_back(f.getOutClk());
+  } else if (auto c = dyn_cast<pyc::CdcSyncOp>(op))
+    out.push_back(c.getClk());
+}
+
+// True when `func`'s argument `argIdx` feeds a clock operand of a sequential
+// primitive, through aliases and instance ports. argumentIsClockOnly() proves
+// the stronger "clock only"; this predicate also finds clock ports that are
+// observed as data, which must still be wired to the same clock signal.
+static bool argumentFeedsClock(
+    func::FuncOp func, unsigned argIdx, ModuleOp module,
+    llvm::DenseMap<std::pair<Operation *, unsigned>, bool> &memo) {
+  auto key = std::make_pair(func.getOperation(), argIdx);
+  if (auto it = memo.find(key); it != memo.end())
+    return it->second;
+  // Assume no clock use while recursing so a port cycle cannot spin.
+  memo[key] = false;
+  if (!func || func.isDeclaration() || func.getBody().empty() ||
+      argIdx >= func.getNumArguments())
+    return false;
+  bool found = false;
+  llvm::SmallVector<Value> work{func.getArgument(argIdx)};
+  llvm::DenseSet<Value> seen;
+  while (!work.empty() && !found) {
+    Value value = work.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      if (isSequentialClockUse(use)) {
+        found = true;
+        break;
+      }
+      if (auto alias = dyn_cast<pyc::AliasOp>(user)) {
+        work.push_back(alias.getResult());
+        continue;
+      }
+      if (auto inst = dyn_cast<pyc::InstanceOp>(user)) {
+        auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
+        auto callee = calleeAttr
+                          ? module.lookupSymbol<func::FuncOp>(calleeAttr.getValue())
+                          : func::FuncOp();
+        if (callee &&
+            argumentFeedsClock(callee, use.getOperandNumber(), module, memo)) {
+          found = true;
+          break;
+        }
+      }
+    }
+  }
+  memo[key] = found;
+  return found;
+}
+
+// True when every clock operand of `func` and of its whole instance subtree is
+// `func`'s argument `clkArg` (through aliases).
+static bool subtreeIsSingleClock(
+    func::FuncOp func, unsigned clkArg, ModuleOp module,
+    llvm::DenseMap<std::pair<Operation *, unsigned>, bool> &memo) {
+  auto key = std::make_pair(func.getOperation(), clkArg);
+  if (auto it = memo.find(key); it != memo.end())
+    return it->second;
+  // Assume unsafe while recursing so an instance cycle cannot pass the gate.
+  memo[key] = false;
+  if (!func || func.isDeclaration() || clkArg >= func.getNumArguments())
+    return false;
+  Value clk = func.getArgument(clkArg);
+
+  llvm::SmallVector<std::pair<func::FuncOp, unsigned>, 8> subClocks;
+  llvm::DenseMap<std::pair<Operation *, unsigned>, bool> clockFeedsMemo;
+  llvm::DenseMap<Operation *, SeqStateKind> seqMemo;
+  WalkResult walkResult = func.walk([&](Operation *op) -> WalkResult {
+    llvm::SmallVector<Value, 2> clocks;
+    appendClockOperands(op, clocks);
+    for (Value c : clocks) {
+      if (resolveAliasValue(c) != clk)
+        return WalkResult::interrupt();
+    }
+    if (auto inst = dyn_cast<pyc::InstanceOp>(op)) {
+      auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
+      auto callee = calleeAttr
+                        ? module.lookupSymbol<func::FuncOp>(calleeAttr.getValue())
+                        : func::FuncOp();
+      if (!callee)
+        return WalkResult::interrupt();
+      bool hasClockPort = false;
+      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        if (!argumentFeedsClock(callee, i, module, clockFeedsMemo))
+          continue;
+        hasClockPort = true;
+        if (resolveAliasValue(inst.getOperand(i)) != clk)
+          return WalkResult::interrupt();
+        subClocks.emplace_back(callee, i);
+      }
+      // Stateful sub-module whose clock arrives through no tracked port: the
+      // edge domain cannot be proven here, so keep the serial code.
+      if (!hasClockPort && functionHasSequentialState(callee, module, seqMemo))
+        return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  bool ok = !walkResult.wasInterrupted();
+  for (auto &sub : subClocks) {
+    if (!subtreeIsSingleClock(sub.first, sub.second, module, memo)) {
+      ok = false;
+      break;
+    }
+  }
+  memo[key] = ok;
+  return ok;
+}
+
 static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &nt,
                        llvm::function_ref<void(llvm::raw_ostream &)> buildExpr,
                        CppEmitterPlacementState *ps) {
@@ -2479,13 +2631,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  pyc::cpp::DelayLoop delay_loop_" << dbk << ";\n";
   }
   std::string fastClkName;
+  Value fastClkValue;
   bool fastClkUnique = true;
   auto noteFastClk = [&](Value clk) {
     std::string name = nt.get(clk);
-    if (fastClkName.empty())
+    if (!fastClkUnique)
+      return;
+    if (fastClkName.empty()) {
       fastClkName = std::move(name);
-    else if (fastClkName != name)
+      fastClkValue = clk;
+    } else if (fastClkName != name) {
       fastClkUnique = false;
+    }
   };
   for (auto r : regs)
     noteFastClk(r.getClk());
@@ -2497,6 +2654,27 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   const bool fastEdge = fastClkUnique && !fastClkName.empty();
   if (!fastEdge && !fusedRegLoopIds.empty())
     return f.emitError("tick-fuse loops require a single-clock fast edge");
+
+  // Falling-edge trim (see subtreeIsSingleClock): the dead falling-edge walk may
+  // be skipped only when the whole instance subtree is clocked by this module's
+  // single register clock, and that clock must be a module argument.
+  bool negedgeTrim = false;
+  const bool negedgeTrimEnabled =
+      opts.negedgeTrim == CppEmitterOptions::NegedgeTrim::On;
+  if (negedgeTrimEnabled) {
+    unsigned clkArg = static_cast<unsigned>(f.getNumArguments());
+    if (fastEdge && fastClkValue) {
+      for (auto [i, arg] : llvm::enumerate(f.getArguments()))
+        if (arg == fastClkValue) {
+          clkArg = static_cast<unsigned>(i);
+          break;
+        }
+    }
+    if (clkArg != static_cast<unsigned>(f.getNumArguments())) {
+      llvm::DenseMap<std::pair<Operation *, unsigned>, bool> singleClkMemo;
+      negedgeTrim = subtreeIsSingleClock(f, clkArg, mod, singleClkMemo);
+    }
+  }
   if (fastEdge) {
     os << "  bool _pyc_clk_prev = false;\n";
     os << "  bool _pyc_seq_armed = false;\n";
@@ -4187,7 +4365,45 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       emitTickCommitPart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), commitParts++);
   }
 
+  if (negedgeTrimEnabled) {
+    // Emitted for every module so a verified parent can always call into it.
+    os << "  // Falling-edge bookkeeping: reset this module's clock-edge latch and its\n";
+    os << "  // instance subtree's, and reopen the sub-module tick gates, without\n";
+    os << "  // recomputing delay taps or sampling next state.\n";
+    os << "  void tick_negedge() {\n";
+    if (fastEdge)
+      os << "    _pyc_clk_prev = false;\n";
+    for (const auto &ii : instInfos)
+      os << "    " << ii.member << "->tick_negedge();\n";
+    for (const auto &ii : instInfos)
+      os << "    " << ii.member << "_tick_inputs_valid = false;\n";
+    auto emitStorageNegedge = [&](const std::string &key, bool pointer) {
+      os << "    " << key << "_tick_inputs_valid = false;\n";
+      os << "    " << key << (pointer ? "->tick_compute();\n" : ".tick_compute();\n");
+    };
+    for (auto fifo : fifos)
+      emitStorageNegedge(nt.get(fifo.getInReady()) + "_inst", false);
+    for (auto mem : byteMems)
+      emitStorageNegedge(byteMemInstName.lookup(mem.getOperation()), false);
+    for (auto mem : syncMemNMs)
+      emitStorageNegedge(syncMemNMInstName.lookup(mem.getOperation()), true);
+    for (auto fifo : asyncFifos)
+      emitStorageNegedge(nt.get(fifo.getInReady()) + "_inst", false);
+    for (auto sync : cdcSyncs)
+      emitStorageNegedge(nt.get(sync.getOut()) + "_inst", false);
+    os << "  }\n\n";
+  }
+
   os << "  void tick_compute() {\n";
+  if (negedgeTrim) {
+    os << "    // Falling edge after a committed rising edge: only the edge latch\n";
+    os << "    // moves; taps and sub-module sampling are constant until the next rise.\n";
+    os << "    if (!_pyc_seq_armed && _pyc_clk_prev && !" << fastClkName
+       << ".toBool()) {\n";
+    os << "      tick_negedge();\n";
+    os << "      return;\n";
+    os << "    }\n";
+  }
   if (!instInfos.empty()) {
     os << "    // Sub-modules.\n";
     for (unsigned i = 0; i < subParts; ++i)
@@ -4395,12 +4611,19 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   os << "  void tick_commit() {\n";
   if (fastEdge)
     os << "    _pyc_seq_armed = false;\n";
-  if (!instInfos.empty()) {
+  auto emitInstanceCommits = [&]() {
+    if (instInfos.empty())
+      return;
     os << "    // Sub-modules.\n";
     unsigned commitParts = (static_cast<unsigned>(instInfos.size()) + kTickChunk - 1) / kTickChunk;
     for (unsigned i = 0; i < commitParts; ++i)
       os << "    tick_commit_part_" << i << "();\n";
-  }
+  };
+  // Without the falling-edge trim the recursion stays outside the
+  // _pyc_commit_needed gate; with it, a falling edge reaches only sub-modules
+  // whose sampling was already committed, so the walk is dead there.
+  if (!negedgeTrim)
+    emitInstanceCommits();
   os << "    // Local sequential primitives.\n";
   auto emitCommitWake = [&](llvm::StringRef condition, Value output,
                             llvm::StringRef indent = "    ") {
@@ -4414,6 +4637,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "    if (_pyc_commit_needed) {\n";
     os << "      _pyc_commit_needed = false;\n";
   }
+  if (negedgeTrim)
+    emitInstanceCommits();
   // A clean 64-lane dirty word skips all of its per-lane wake checks.
   auto openLaneWord = [&](unsigned lane, const std::string &cond) {
     if (lane & 63)
