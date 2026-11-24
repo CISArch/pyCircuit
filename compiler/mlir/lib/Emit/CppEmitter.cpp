@@ -115,6 +115,11 @@ static bool argumentIsClockOnly(
 // placement attribute readers (used internally by the emitter)
 // ---------------------------------------------------------------------------
 
+// Above this many sibling instances the per-instance switch body of the fork
+// group costs more I-cache than the fork saves, so the serial chunked emission
+// is kept instead.
+static constexpr unsigned kMaxParallelInstances = 32;
+
 static CppEmitterOptions effectiveEmitOpts(ModuleOp module, const CppEmitterOptions &opts) {
   CppEmitterOptions out = opts;
   if (auto chunk = getModuleCombChunkNodes(module)) {
@@ -601,193 +606,6 @@ static bool functionHasSequentialState(func::FuncOp f,
 
   memo[f.getOperation()] = hasSeq ? SeqStateKind::HasSequential : SeqStateKind::NoSequential;
   return hasSeq;
-}
-
-// ---------------------------------------------------------------------------
-// Falling-edge trim gate (--cpp-negedge-trim)
-//
-// The falling edge samples no next state, so its sampling work is dead: the
-// fall branch of tick_compute() only recomputes delay taps (already committed
-// by the previous edge) and recurses into sub-modules, and a fall tick_commit()
-// only walks sub-modules whose own sampling is already committed. Skipping that
-// walk is valid only when every clock-edge latch reachable through instances is
-// driven by the same clock signal: a sub-module clocked by another signal could
-// still sample state while the parent's clock falls. The helpers below prove
-// that property from the IR; when they fail the emitter keeps the serial code.
-//
-// Aliases are C++ name aliases of the same signal, so clock identity is
-// resolved through pyc.alias chains.
-// ---------------------------------------------------------------------------
-
-static Value resolveAliasValue(Value value) {
-  for (unsigned depth = 0; depth < 64; ++depth) {
-    Operation *def = value.getDefiningOp();
-    auto alias = def ? dyn_cast<pyc::AliasOp>(def) : nullptr;
-    if (!alias)
-      break;
-    value = alias.getIn();
-  }
-  return value;
-}
-
-static void appendClockOperands(Operation *op, llvm::SmallVectorImpl<Value> &out) {
-  if (auto r = dyn_cast<pyc::RegOp>(op))
-    out.push_back(r.getClk());
-  else if (auto d = dyn_cast<pyc::DelayLineOp>(op))
-    out.push_back(d.getClk());
-  else if (auto m = dyn_cast<pyc::SyncMemNMOp>(op))
-    out.push_back(m.getClk());
-  else if (auto m = dyn_cast<pyc::ByteMemOp>(op))
-    out.push_back(m.getClk());
-  else if (auto f = dyn_cast<pyc::FifoOp>(op))
-    out.push_back(f.getClk());
-  else if (auto f = dyn_cast<pyc::AsyncFifoOp>(op)) {
-    out.push_back(f.getInClk());
-    out.push_back(f.getOutClk());
-  } else if (auto c = dyn_cast<pyc::CdcSyncOp>(op))
-    out.push_back(c.getClk());
-}
-
-// True when `func`'s argument `argIdx` feeds a clock operand of a sequential
-// primitive, through aliases and instance ports. argumentIsClockOnly() proves
-// the stronger "clock only"; this predicate also finds clock ports that are
-// observed as data, which must still be wired to the same clock signal.
-static bool argumentFeedsClock(
-    func::FuncOp func, unsigned argIdx, ModuleOp module,
-    llvm::DenseMap<std::pair<Operation *, unsigned>, bool> &memo) {
-  auto key = std::make_pair(func.getOperation(), argIdx);
-  if (auto it = memo.find(key); it != memo.end())
-    return it->second;
-  // Assume no clock use while recursing so a port cycle cannot spin.
-  memo[key] = false;
-  if (!func || func.isDeclaration() || func.getBody().empty() ||
-      argIdx >= func.getNumArguments())
-    return false;
-  bool found = false;
-  llvm::SmallVector<Value> work{func.getArgument(argIdx)};
-  llvm::DenseSet<Value> seen;
-  while (!work.empty() && !found) {
-    Value value = work.pop_back_val();
-    if (!seen.insert(value).second)
-      continue;
-    for (OpOperand &use : value.getUses()) {
-      Operation *user = use.getOwner();
-      if (isSequentialClockUse(use)) {
-        found = true;
-        break;
-      }
-      if (auto alias = dyn_cast<pyc::AliasOp>(user)) {
-        work.push_back(alias.getResult());
-        continue;
-      }
-      if (auto inst = dyn_cast<pyc::InstanceOp>(user)) {
-        auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
-        auto callee = calleeAttr
-                          ? module.lookupSymbol<func::FuncOp>(calleeAttr.getValue())
-                          : func::FuncOp();
-        if (callee &&
-            argumentFeedsClock(callee, use.getOperandNumber(), module, memo)) {
-          found = true;
-          break;
-        }
-      }
-    }
-  }
-  memo[key] = found;
-  return found;
-}
-
-// True when `func` survives a skipped falling edge without losing its own edge
-// bookkeeping.  Modules with no edge-latched storage are safe: their
-// tick_negedge() still recurses into instances and re-samples the storage
-// primitives.  Modules that own registers or per-object delay lines are safe
-// only when those watch one clock value (the fastEdge latch that tick_negedge()
-// drops).  A module whose only state is loopified delay lines is NOT safe: it
-// runs them through the generic compute_generic(clk) path, which lowers their
-// own clkPrev on the falling edge, so skipping that call would stall them.
-static bool moduleIsFallSafe(func::FuncOp func) {
-  bool hasLatchState = false;
-  bool hasLoopState = false;
-  llvm::SmallVector<Value, 4> clocks;
-  func.walk([&](Operation *op) {
-    if (auto r = dyn_cast<pyc::RegOp>(op)) {
-      hasLatchState = true;
-      clocks.push_back(r.getClk());
-    } else if (auto d = dyn_cast<pyc::DelayLineOp>(op)) {
-      if (d->hasAttr("pyc.loop_id")) {
-        hasLoopState = true;
-      } else {
-        hasLatchState = true;
-        clocks.push_back(d.getClk());
-      }
-    }
-  });
-  if (!hasLatchState)
-    return !hasLoopState;
-  for (Value c : clocks)
-    if (c != clocks.front())
-      return false;
-  return true;
-}
-
-// True when every clock operand of `func` and of its whole instance subtree is
-// `func`'s argument `clkArg` (through aliases).
-static bool subtreeIsSingleClock(
-    func::FuncOp func, unsigned clkArg, ModuleOp module,
-    llvm::DenseMap<std::pair<Operation *, unsigned>, bool> &memo) {
-  auto key = std::make_pair(func.getOperation(), clkArg);
-  if (auto it = memo.find(key); it != memo.end())
-    return it->second;
-  // Assume unsafe while recursing so an instance cycle cannot pass the gate.
-  memo[key] = false;
-  if (!func || func.isDeclaration() || clkArg >= func.getNumArguments())
-    return false;
-  if (!moduleIsFallSafe(func))
-    return false;
-  Value clk = func.getArgument(clkArg);
-
-  llvm::SmallVector<std::pair<func::FuncOp, unsigned>, 8> subClocks;
-  llvm::DenseMap<std::pair<Operation *, unsigned>, bool> clockFeedsMemo;
-  llvm::DenseMap<Operation *, SeqStateKind> seqMemo;
-  WalkResult walkResult = func.walk([&](Operation *op) -> WalkResult {
-    llvm::SmallVector<Value, 2> clocks;
-    appendClockOperands(op, clocks);
-    for (Value c : clocks) {
-      if (resolveAliasValue(c) != clk)
-        return WalkResult::interrupt();
-    }
-    if (auto inst = dyn_cast<pyc::InstanceOp>(op)) {
-      auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
-      auto callee = calleeAttr
-                        ? module.lookupSymbol<func::FuncOp>(calleeAttr.getValue())
-                        : func::FuncOp();
-      if (!callee)
-        return WalkResult::interrupt();
-      bool hasClockPort = false;
-      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
-        if (!argumentFeedsClock(callee, i, module, clockFeedsMemo))
-          continue;
-        hasClockPort = true;
-        if (resolveAliasValue(inst.getOperand(i)) != clk)
-          return WalkResult::interrupt();
-        subClocks.emplace_back(callee, i);
-      }
-      // Stateful sub-module whose clock arrives through no tracked port: the
-      // edge domain cannot be proven here, so keep the serial code.
-      if (!hasClockPort && functionHasSequentialState(callee, module, seqMemo))
-        return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  bool ok = !walkResult.wasInterrupted();
-  for (auto &sub : subClocks) {
-    if (!subtreeIsSingleClock(sub.first, sub.second, module, memo)) {
-      ok = false;
-      break;
-    }
-  }
-  memo[key] = ok;
-  return ok;
 }
 
 static void assignExpr(Value result, Type ty, llvm::raw_ostream &os, NameTable &nt,
@@ -1428,7 +1246,7 @@ static void collectFanoutWordMasks(
 static void emitMetadataCombFanout(
     Value value, llvm::raw_ostream &os, const EmissionSchedule &schedule,
     const llvm::DenseMap<Operation *, unsigned> &combIndices, NameTable &nt,
-    llvm::StringRef indent = "      ") {
+    llvm::StringRef indent = "      ", bool deferredWake = false) {
   llvm::SmallVector<std::pair<unsigned, uint64_t>> wordMasks;
   collectFanoutWordMasks(value, schedule, combIndices, wordMasks);
   if (wordMasks.empty())
@@ -1441,7 +1259,10 @@ static void emitMetadataCombFanout(
   });
   os << "}};\n";
   os << indent << "for (const auto &[_pyc_w, _pyc_m] : " << fanoutName << ")\n";
-  os << indent << "  _pyc_comb_dirty.markWordUnchecked(_pyc_w, _pyc_m);\n";
+  if (deferredWake)
+    os << indent << "  _pyc_wake[_pyc_w] |= _pyc_m;\n";
+  else
+    os << indent << "  _pyc_comb_dirty.markWordUnchecked(_pyc_w, _pyc_m);\n";
 }
 
 static bool isDirtyDrivenInput(Value input) {
@@ -1491,25 +1312,6 @@ static void emitCombResultPublish(
   os << "    }\n";
 }
 
-// L28 lane marks: per fused loop, the lanes whose next-state value is produced
-// by a given comb block. Emitted inside that comb's method body, so a lane is
-// marked exactly when its producer comb actually runs. A lane whose next value
-// has no comb producer (constant, delay tap, instance output, memory read) is
-// permanently marked instead.
-using LaneMarkTable =
-    llvm::DenseMap<unsigned, llvm::SmallVector<std::pair<unsigned, std::uint64_t>>>;
-
-static void emitLaneMark(const LaneMarkTable &marks, unsigned combIdx,
-                         llvm::raw_ostream &os, llvm::StringRef indent,
-                         llvm::StringRef arrayName) {
-  auto it = marks.find(combIdx);
-  if (it == marks.end())
-    return;
-  for (const auto &wm : it->second)
-    os << indent << arrayName << "[" << wm.first << "u] |= 0x"
-       << llvm::utohexstr(wm.second) << "ull;\n";
-}
-
 static LogicalResult emitCombMethod(pyc::CombOp comb,
                                     llvm::raw_ostream &os,
                                     NameTable &nt,
@@ -1519,9 +1321,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
                                     const llvm::DenseMap<Operation *, unsigned>
                                         &combIndices,
                                     const llvm::DenseMap<int64_t, llvm::SmallVector<pyc::DelayLineOp>>
-                                        *delayLoopLines = nullptr,
-                                    const LaneMarkTable *laneMarks = nullptr,
-                                    llvm::StringRef laneMarkArray = "_pyc_lane_marks") {
+                                        *delayLoopLines = nullptr) {
   if (comb.getBody().empty())
     return comb.emitError("pyc.comb must have a non-empty region");
 
@@ -1583,8 +1383,6 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
     for (auto [i, v] : llvm::enumerate(y.getOperands()))
       emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
                             schedule, combIndices);
-    if (laneMarks)
-      emitLaneMark(*laneMarks, idx, os, "    ", laneMarkArray);
     os << "  }\n\n";
     return success();
   }
@@ -1607,8 +1405,6 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   for (auto [i, v] : llvm::enumerate(y.getOperands()))
     emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
                           schedule, combIndices);
-  if (laneMarks)
-    emitLaneMark(*laneMarks, idx, os, "    ", laneMarkArray);
   os << "  }\n\n";
   return success();
 }
@@ -2691,18 +2487,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  pyc::cpp::DelayLoop delay_loop_" << dbk << ";\n";
   }
   std::string fastClkName;
-  Value fastClkValue;
   bool fastClkUnique = true;
   auto noteFastClk = [&](Value clk) {
     std::string name = nt.get(clk);
-    if (!fastClkUnique)
-      return;
-    if (fastClkName.empty()) {
+    if (fastClkName.empty())
       fastClkName = std::move(name);
-      fastClkValue = clk;
-    } else if (fastClkName != name) {
+    else if (fastClkName != name)
       fastClkUnique = false;
-    }
   };
   for (auto r : regs)
     noteFastClk(r.getClk());
@@ -2714,27 +2505,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   const bool fastEdge = fastClkUnique && !fastClkName.empty();
   if (!fastEdge && !fusedRegLoopIds.empty())
     return f.emitError("tick-fuse loops require a single-clock fast edge");
-
-  // Falling-edge trim (see subtreeIsSingleClock): the dead falling-edge walk may
-  // be skipped only when the whole instance subtree is clocked by this module's
-  // single register clock, and that clock must be a module argument.
-  bool negedgeTrim = false;
-  const bool negedgeTrimEnabled =
-      opts.negedgeTrim == CppEmitterOptions::NegedgeTrim::On;
-  if (negedgeTrimEnabled) {
-    unsigned clkArg = static_cast<unsigned>(f.getNumArguments());
-    if (fastEdge && fastClkValue) {
-      for (auto [i, arg] : llvm::enumerate(f.getArguments()))
-        if (arg == fastClkValue) {
-          clkArg = static_cast<unsigned>(i);
-          break;
-        }
-    }
-    if (clkArg != static_cast<unsigned>(f.getNumArguments())) {
-      llvm::DenseMap<std::pair<Operation *, unsigned>, bool> singleClkMemo;
-      negedgeTrim = subtreeIsSingleClock(f, clkArg, mod, singleClkMemo);
-    }
-  }
   if (fastEdge) {
     os << "  bool _pyc_clk_prev = false;\n";
     os << "  bool _pyc_seq_armed = false;\n";
@@ -3100,77 +2870,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   os << "    #endif\n";
   os << "  }\n\n";
 
-  // L28: build the lane -> producer-comb table for fused loops, plus the
-  // always-marked lanes (next value has no comb producer). Every fused lane must
-  // be classified; an unknown producer is a hard error, never a silent skip.
-  LaneMarkTable laneMarkTable;
-  llvm::SmallVector<std::pair<unsigned, std::uint64_t>, 16> laneAlwaysMarks;
-  std::size_t laneMarkWords = 0;
-  if (opts.laneMarkWalk) {
-    // Attribute a lane to the comb that produces its next value by matching the
-    // emitted symbol: names are minted from the original producer, so a lane
-    // whose next value is a forwarding pyc.wire still carries the comb's name.
-    // (Classifying by getDefiningOp() misses exactly those lanes.)
-    llvm::StringMap<unsigned> resultNameToComb;
-    for (auto [i, comb] : llvm::enumerate(combs)) {
-      for (Value res : comb.getResults())
-        resultNameToComb[nt.get(res)] = static_cast<unsigned>(i);
-    }
-    for (int64_t loopId : fusedRegLoopIds) {
-      unsigned lane = 0;
-      for (pyc::RegOp r : regLoopRegs[loopId]) {
-        Operation *def = r.getNext().getDefiningOp();
-        unsigned ownerComb = 0;
-        bool hasOwner = false;
-        {
-          auto nameIt = resultNameToComb.find(nt.get(r.getNext()));
-          if (nameIt != resultNameToComb.end()) {
-            ownerComb = nameIt->second;
-            hasOwner = true;
-          }
-        }
-        Operation *owner = hasOwner ? static_cast<Operation *>(combs[ownerComb])
-                                    : nullptr;
-        const unsigned word = lane / 64u;
-        const std::uint64_t mask = std::uint64_t{1} << (lane % 64u);
-        auto pushMark = [&](auto &into) {
-          if (!into.empty() && into.back().first == word)
-            into.back().second |= mask;
-          else
-            into.push_back({word, mask});
-        };
-        if (owner != nullptr) {
-          pushMark(laneMarkTable[ownerComb]);
-        } else if (def == nullptr || isa<pyc::ConstantOp>(def) ||
-                   isa<pyc::DelayTapOp>(def) || isa<pyc::InstanceOp>(def) ||
-                   isa<pyc::SyncMemNMOp>(def) || isa<pyc::ByteMemOp>(def) ||
-                   isa<pyc::WireOp>(def)) {
-          if (!laneAlwaysMarks.empty() &&
-              laneAlwaysMarks.back().first == word)
-            laneAlwaysMarks.back().second |= mask;
-          else
-            laneAlwaysMarks.push_back({word, mask});
-        } else {
-          return def->emitError(
-              "L28: fused lane next-value has no comb producer and is not a "
-              "known always-marked producer (constant/delay tap/instance/memory/"
-              "wire); refusing to generate a marked walk that would miss it");
-        }
-        ++lane;
-      }
-      laneMarkWords = std::max<std::size_t>(laneMarkWords, (lane + 63u) / 64u);
-    }
-    if (laneMarkWords == 0)
-      return f.emitError("L28: lane-mark walk requested but there are no fused lanes");
-    os << "  std::array<std::uint64_t, " << laneMarkWords << "> _pyc_lane_marks{};\n";
-    os << "  bool _pyc_lane_mark_stale = true;\n";
-  }
-
   // Emit fused comb helpers. Indices match body order (same as placement).
   for (auto [i, comb] : llvm::enumerate(combs)) {
     if (failed(emitCombMethod(comb, os, nt, static_cast<unsigned>(i), opts,
-                              *schedule, combIndex, &delayLoopLines,
-                              opts.laneMarkWalk ? &laneMarkTable : nullptr)))
+                              *schedule, combIndex, &delayLoopLines)))
       return failure();
   }
 
@@ -3482,6 +3185,134 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   llvm::SmallVector<Operation *> fullOrdered;
   bool hasFullTopo = topoOrder(/*includePrims=*/true, fullOrdered);
 
+  // Coarse-grained instance parallelism (--cpp-parallel-instances=N).
+  //
+  // Nothing here changes semantics: the stages are derived from the very same
+  // dependency edges topoOrder used, so ordering ops by stage is still a valid
+  // topological order and two ops sharing a stage are mutually independent.
+  // Instances of one stage may therefore be evaluated on separate threads; the
+  // only cross-thread state they touch (the fused-comb dirty words reached by
+  // their result fanout) is deferred into a per-instance word buffer and merged
+  // by the forking thread after the join, so no atomic and no lost wakeup.
+  //
+  // With parallelInstances == 0 every emission below is the untouched serial
+  // path, which keeps `--cpp-parallel-instances=0` byte-identical to the base
+  // emitter.
+  const bool parallelInstances = opts.parallelInstances >= 2 && hasFullTopo &&
+                                 instInfos.size() >= 2 &&
+                                 instInfos.size() <= kMaxParallelInstances;
+  const unsigned parallelThreads =
+      parallelInstances ? static_cast<unsigned>(opts.parallelInstances) : 0u;
+  const unsigned wakeWords =
+      std::max(1u, static_cast<unsigned>((combs.size() + 63) / 64));
+  // stage(op) is a valid topological position: ops that share a stage are
+  // mutually independent, so the instances of one stage can be forked.
+  //
+  // Levelization alone is not enough to group instances: two independent
+  // instances can sit at different levels only because their *input* comb
+  // cones have different depths (in the motivating design one subsystem's
+  // ports go through one extra top-level select stage). Sibling instances
+  // therefore group by the layer
+  // of instance-to-instance same-tick dependencies (all zero for two PE
+  // clusters), take the deepest member's level as their fork point, and the
+  // remaining ops are re-staged on top of that with the usual
+  // "one past the deepest dependency" rule, which keeps the order valid.
+  llvm::DenseMap<Operation *, unsigned> opStage;
+  unsigned parallelStageCount = 0;
+  if (parallelInstances) {
+    // producer mirrors topoOrder's valueProducer: results first, then the
+    // single driver of each wire (a late pyc.assign overrides, as there).
+    llvm::DenseMap<Value, unsigned> producer;
+    for (unsigned i = 0; i < fullOrdered.size(); ++i) {
+      Operation *op = fullOrdered[i];
+      for (Value r : op->getResults())
+        producer.try_emplace(r, i);
+    }
+    for (unsigned i = 0; i < fullOrdered.size(); ++i)
+      if (auto a = dyn_cast<pyc::AssignOp>(*fullOrdered[i]))
+        producer[a.getDst()] = i;
+
+    auto depValues = [](Operation *op, llvm::SmallVectorImpl<Value> &out) {
+      if (auto a = dyn_cast<pyc::AssignOp>(*op)) {
+        out.push_back(a.getSrc());
+        return;
+      }
+      for (Value v : op->getOperands())
+        out.push_back(v);
+    };
+
+    llvm::SmallVector<unsigned> level(fullOrdered.size(), 0);
+    llvm::SmallVector<Value, 16> deps;
+    for (unsigned i = 0; i < fullOrdered.size(); ++i) {
+      deps.clear();
+      depValues(fullOrdered[i], deps);
+      for (Value v : deps) {
+        auto it = producer.find(v);
+        if (it == producer.end() || it->second >= i)
+          continue;
+        level[i] = std::max(level[i], level[it->second] + 1);
+      }
+    }
+
+    // Instance layer: 1 + deepest instance reachable through same-tick comb
+    // logic. The walk stops at instance results, so a pure comb path between
+    // two instances counts as a dependency while shared input cone does not.
+    llvm::DenseMap<Operation *, unsigned> instLayer;
+    llvm::DenseMap<unsigned, unsigned> groupLevel;
+    for (unsigned i = 0; i < fullOrdered.size(); ++i) {
+      Operation *op = fullOrdered[i];
+      if (!isa<pyc::InstanceOp>(*op))
+        continue;
+      llvm::SmallDenseSet<Operation *, 16> visited;
+      llvm::SmallVector<Operation *, 8> instDeps;
+      llvm::SmallVector<Value, 32> work;
+      depValues(op, work);
+      while (!work.empty()) {
+        Value v = work.pop_back_val();
+        auto it = producer.find(v);
+        if (it == producer.end())
+          continue;
+        Operation *p = fullOrdered[it->second];
+        if (p == op)
+          continue;
+        if (isa<pyc::InstanceOp>(*p)) {
+          instDeps.push_back(p);
+          continue;
+        }
+        if (!visited.insert(p).second)
+          continue;
+        depValues(p, work);
+      }
+      unsigned layer = 0;
+      for (Operation *dep : instDeps) {
+        auto it = instLayer.find(dep);
+        layer = std::max(layer, it == instLayer.end() ? 0u : it->second + 1);
+      }
+      instLayer[op] = layer;
+      unsigned &deepest = groupLevel[layer];
+      deepest = std::max(deepest, level[i]);
+    }
+
+    llvm::SmallVector<unsigned> stage(fullOrdered.size(), 0);
+    for (unsigned i = 0; i < fullOrdered.size(); ++i) {
+      Operation *op = fullOrdered[i];
+      unsigned base = level[i];
+      if (auto inst = dyn_cast<pyc::InstanceOp>(*op))
+        base = std::max(base, groupLevel.lookup(instLayer.lookup(op)));
+      deps.clear();
+      depValues(op, deps);
+      for (Value v : deps) {
+        auto it = producer.find(v);
+        if (it == producer.end() || it->second >= i)
+          continue;
+        base = std::max(base, stage[it->second] + 1);
+      }
+      stage[i] = base;
+      opStage[op] = base;
+      parallelStageCount = std::max(parallelStageCount, base + 1);
+    }
+  }
+
   llvm::SmallVector<std::string> instanceEvalHelperNames;
   instanceEvalHelperNames.reserve(instInfos.size());
   for (unsigned idx = 0; idx < instInfos.size(); ++idx) {
@@ -3492,7 +3323,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   auto emitInstanceEvalHelperDefinition = [&](const InstInfo &ii, llvm::StringRef helperName) {
     auto inst = ii.op;
     bool usePackedCache = usePackedInstanceEvalCache(ii);
-    os << "  inline bool " << helperName << "() {\n";
+    os << "  inline bool " << helperName << "(";
+    if (parallelInstances)
+      os << "std::uint64_t *_pyc_wake";
+    os << ") {\n";
     os << "    bool _pyc_inst_changed = false;\n";
     os << "    #ifdef PYC_DISABLE_INSTANCE_EVAL_CACHE\n";
     for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
@@ -3627,7 +3461,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       os << "    if (" << resultName << " != " << childOutput << ") {\n";
       os << "      " << resultName << " = " << childOutput << ";\n";
       os << "      _pyc_inst_output_changed = true;\n";
-      emitMetadataCombFanout(result, os, *schedule, combIndex, nt);
+      emitMetadataCombFanout(result, os, *schedule, combIndex, nt, "      ",
+                             parallelInstances);
       os << "    }\n";
     }
     // The fixed-point fallback converges on semantic output changes.
@@ -3645,7 +3480,21 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (it == instIndex.end())
       return;
     llvm::StringRef helperName = instanceEvalHelperNames[it->second];
-    if (!changedAnyVar.empty()) {
+    if (parallelInstances) {
+      // Sequential call site of a wake-deferring helper: buffer the fanout
+      // words, then merge them into the shared dirty set in order.
+      os << indent << "{\n";
+      os << indent << "  std::uint64_t _pyc_wake[" << wakeWords << "] = {};\n";
+      if (!changedAnyVar.empty())
+        os << indent << "  if (" << helperName << "(_pyc_wake)) " << changedAnyVar << " = true;\n";
+      else
+        os << indent << "  " << helperName << "(_pyc_wake);\n";
+      if (!combs.empty()) {
+        os << indent << "  for (unsigned _pyc_w = 0; _pyc_w < " << wakeWords << "u; ++_pyc_w)\n";
+        os << indent << "    if (_pyc_wake[_pyc_w]) _pyc_comb_dirty.markWordUnchecked(_pyc_w, _pyc_wake[_pyc_w]);\n";
+      }
+      os << indent << "}\n";
+    } else if (!changedAnyVar.empty()) {
       os << indent << "if (" << helperName << "()) " << changedAnyVar << " = true;\n";
     } else {
       os << indent << helperName << "();\n";
@@ -4325,7 +4174,46 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
 
   std::vector<std::string> topoEvalMethods;
-  if (hasFullTopo && !fullOrdered.empty()) {
+  std::vector<std::vector<std::string>> stageEvalMethods;
+  std::vector<std::vector<unsigned>> stageInstIndices;
+  if (parallelInstances) {
+    stageEvalMethods.resize(parallelStageCount);
+    stageInstIndices.resize(parallelStageCount);
+    std::vector<std::vector<Operation *>> stageOps(parallelStageCount);
+    for (Operation *op : fullOrdered) {
+      unsigned stage = opStage.lookup(op);
+      if (auto inst = dyn_cast<pyc::InstanceOp>(*op)) {
+        auto it = instIndex.find(inst.getOperation());
+        if (it != instIndex.end()) {
+          stageInstIndices[stage].push_back(it->second);
+          continue;
+        }
+      }
+      stageOps[stage].push_back(op);
+    }
+    unsigned stageChunkNodes = std::max(1u, opts.evalTopoChunkNodes);
+    for (unsigned stage = 0; stage < parallelStageCount; ++stage) {
+      auto &ops = stageOps[stage];
+      for (unsigned begin = 0, part = 0; begin < ops.size();
+           begin += stageChunkNodes, ++part) {
+        unsigned end = std::min<unsigned>(static_cast<unsigned>(ops.size()),
+                                         begin + stageChunkNodes);
+        std::string methodName = "eval_stage_" + std::to_string(stage) +
+                                 "_part_" + std::to_string(part);
+        stageEvalMethods[stage].push_back(methodName);
+        os << "  inline void " << methodName << "() {\n";
+        CombGuardGroupState stageGuard;
+        llvm::DenseMap<Operation *, bool> stageRunMember =
+            buildCombRunMember(ops, begin, end);
+        for (unsigned i = begin; i < end; ++i)
+          if (failed(emitEvalNode(ops[i], "    ", llvm::StringRef(), &stageGuard,
+                                  &stageRunMember)))
+            return failure();
+        closeCombGuardGroup(stageGuard, "    ");
+        os << "  }\n\n";
+      }
+    }
+  } else if (hasFullTopo && !fullOrdered.empty()) {
     unsigned evalTopoChunkNodes = std::max(1u, opts.evalTopoChunkNodes);
     if (fullOrdered.size() > evalTopoChunkNodes) {
       topoEvalMethods.reserve((fullOrdered.size() + evalTopoChunkNodes - 1) / evalTopoChunkNodes);
@@ -4345,57 +4233,45 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
   }
 
-  // Settle fast-path: when the comb dirty set is empty every guarded comb below
-  // would test false, so one pass can only run the unconditional parts of the
-  // walk (polled-boundary combs and plain wire assigns). Emit exactly those in
-  // topological order as a cheap prologue; if they wake nothing, the pass is
-  // done. If they do, fall through to the complete walk (the re-run of the
-  // prologue's nodes is idempotent: polled combs see consumed dirty bits and
-  // matching snapshots, plain assigns re-copy equal values).
-  bool evalFastExit = opts.evalFastExit && hasFullTopo && !combs.empty();
-  if (evalFastExit) {
-    for (Operation *op : fullOrdered)
-      if (isa<pyc::InstanceOp, pyc::FifoOp, pyc::AsyncFifoOp, pyc::ByteMemOp,
-              pyc::SyncMemNMOp, pyc::CdcSyncOp, pyc::AssertOp>(*op)) {
-        // Stateful primitives poll inputs and refresh eval caches every pass;
-        // they are not functions of the comb dirty set.
-        evalFastExit = false;
-        break;
-      }
-  }
-
-  // Connect return values to output ports.
-  auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
-  if (!ret)
-    return f.emitError("missing return");
-  auto emitOutputPortRefresh = [&](llvm::StringRef indent) {
-    for (auto [i, v] : llvm::enumerate(ret.getOperands()))
-      os << indent << "if (" << outNames[i] << " != " << nt.get(v) << ") "
-         << outNames[i] << " = " << nt.get(v) << ";\n";
-  };
-
   os << "  void eval() {\n";
-  if (evalFastExit) {
-    os << "    if (_pyc_comb_dirty.empty()) {\n";
-    for (Operation *op : fullOrdered) {
-      if (auto comb = dyn_cast<pyc::CombOp>(*op)) {
-        if (!hasDirtyPolledBoundaryInput(comb))
-          continue;
-        os << "      eval_comb_" << combIndex.lookup(op) << "();\n";
+  if (parallelInstances) {
+    for (unsigned stage = 0; stage < parallelStageCount; ++stage) {
+      for (const std::string &methodName : stageEvalMethods[stage])
+        os << "    " << methodName << "();\n";
+      const std::vector<unsigned> &insts = stageInstIndices[stage];
+      if (insts.empty())
         continue;
+      // One fork per stage. Each instance publishes its result wires and its
+      // comb dirty words into its own buffer; the forking thread merges the
+      // buffers in instance order, so the shared dirty set never sees two
+      // concurrent writers.
+      os << "    {\n";
+      os << "      std::uint64_t _pyc_wake[" << insts.size() << "]["
+         << wakeWords << "] = {};\n";
+      if (insts.size() == 1) {
+        os << "      eval_instance_cached_" << insts[0] << "(_pyc_wake[0]);\n";
+      } else {
+        os << "      pyc::cpp::ForkJoinPool<" << parallelThreads
+           << ">::instance().run(" << insts.size()
+           << ", [&](unsigned _pyc_worker) {\n";
+        os << "        switch (_pyc_worker) {\n";
+        for (unsigned slot = 0; slot < insts.size(); ++slot)
+          os << "          case " << slot << "u: eval_instance_cached_"
+             << insts[slot] << "(_pyc_wake[" << slot << "]); return;\n";
+        os << "        }\n";
+        os << "      });\n";
       }
-      if (isa<func::ReturnOp, pyc::WireOp, arith::ConstantOp, pyc::ConstantOp>(*op))
-        continue;
-      if (failed(emitEvalNode(op, "      ")))
-        return failure();
+      if (!combs.empty()) {
+        os << "      for (unsigned _pyc_i = 0; _pyc_i < " << insts.size()
+           << "u; ++_pyc_i)\n";
+        os << "        for (unsigned _pyc_w = 0; _pyc_w < " << wakeWords
+           << "u; ++_pyc_w)\n";
+        os << "          if (_pyc_wake[_pyc_i][_pyc_w])\n";
+        os << "            _pyc_comb_dirty.markWordUnchecked(_pyc_w, _pyc_wake[_pyc_i][_pyc_w]);\n";
+      }
+      os << "    }\n";
     }
-    os << "      if (_pyc_comb_dirty.empty()) {\n";
-    emitOutputPortRefresh("        ");
-    os << "        return;\n";
-    os << "      }\n";
-    os << "    }\n";
-  }
-  if (hasFullTopo) {
+  } else if (hasFullTopo) {
     if (!topoEvalMethods.empty()) {
       for (const std::string &methodName : topoEvalMethods)
         os << "    " << methodName << "();\n";
@@ -4425,7 +4301,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
   }
 
-  emitOutputPortRefresh("    ");
+  // Connect return values to output ports.
+  auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
+  if (!ret)
+    return f.emitError("missing return");
+  for (auto [i, v] : llvm::enumerate(ret.getOperands()))
+    os << "    if (" << outNames[i] << " != " << nt.get(v) << ") "
+       << outNames[i] << " = " << nt.get(v) << ";\n";
 
   os << "  }\n\n";
 
@@ -4482,59 +4364,58 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  }\n\n";
   };
 
+  // Parallel path: one tiny method per instance, so the fork body stays a flat
+  // switch and tick_compute/tick_commit can fork every submodule in one group
+  // (next-state sampling and commit are independent per instance: each reads
+  // only its own ports and its own inputs, and writes only its own state).
+  auto emitTickInstanceMethods = [&](unsigned idx) {
+    const auto &ii = instInfos[idx];
+    auto inst = ii.op;
+    os << "  inline void tick_compute_inst_" << idx << "() {\n";
+    emitStateTickCompute(
+        ii.member, inst->getOperands(), "    ", [&](llvm::StringRef indent) {
+          for (unsigned j = 0; j < inst.getNumOperands(); ++j)
+            os << indent << ii.member << "->" << ii.inPorts[j] << " = "
+               << nt.get(inst.getOperand(j)) << ";\n";
+          os << indent << ii.member << "->tick_compute();\n";
+        });
+    os << "  }\n\n";
+    os << "  inline void tick_commit_inst_" << idx << "() {\n";
+    os << "    " << ii.member << "->tick_commit();\n";
+    os << "  }\n\n";
+  };
+
   // Emit chunked submodule tick helpers.
   unsigned subParts = 0;
   if (!instInfos.empty()) {
-    for (unsigned b = 0; b < instInfos.size(); b += kTickChunk)
-      emitTickComputePart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), subParts++);
-    unsigned commitParts = 0;
-    for (unsigned b = 0; b < instInfos.size(); b += kTickChunk)
-      emitTickCommitPart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), commitParts++);
-  }
-
-  if (negedgeTrimEnabled) {
-    // Emitted for every module so a verified parent can always call into it.
-    os << "  // Falling-edge bookkeeping: reset this module's clock-edge latch and its\n";
-    os << "  // instance subtree's, and reopen the sub-module tick gates, without\n";
-    os << "  // recomputing delay taps or sampling next state.\n";
-    os << "  void tick_negedge() {\n";
-    if (fastEdge)
-      os << "    _pyc_clk_prev = false;\n";
-    for (const auto &ii : instInfos)
-      os << "    " << ii.member << "->tick_negedge();\n";
-    for (const auto &ii : instInfos)
-      os << "    " << ii.member << "_tick_inputs_valid = false;\n";
-    auto emitStorageNegedge = [&](const std::string &key, bool pointer) {
-      os << "    " << key << "_tick_inputs_valid = false;\n";
-      os << "    " << key << (pointer ? "->tick_compute();\n" : ".tick_compute();\n");
-    };
-    for (auto fifo : fifos)
-      emitStorageNegedge(nt.get(fifo.getInReady()) + "_inst", false);
-    for (auto mem : byteMems)
-      emitStorageNegedge(byteMemInstName.lookup(mem.getOperation()), false);
-    for (auto mem : syncMemNMs)
-      emitStorageNegedge(syncMemNMInstName.lookup(mem.getOperation()), true);
-    for (auto fifo : asyncFifos)
-      emitStorageNegedge(nt.get(fifo.getInReady()) + "_inst", false);
-    for (auto sync : cdcSyncs)
-      emitStorageNegedge(nt.get(sync.getOut()) + "_inst", false);
-    os << "  }\n\n";
+    if (parallelInstances) {
+      for (unsigned i = 0; i < instInfos.size(); ++i)
+        emitTickInstanceMethods(i);
+    } else {
+      for (unsigned b = 0; b < instInfos.size(); b += kTickChunk)
+        emitTickComputePart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), subParts++);
+      unsigned commitParts = 0;
+      for (unsigned b = 0; b < instInfos.size(); b += kTickChunk)
+        emitTickCommitPart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), commitParts++);
+    }
   }
 
   os << "  void tick_compute() {\n";
-  if (negedgeTrim) {
-    os << "    // Falling edge after a committed rising edge: only the edge latch\n";
-    os << "    // moves; taps and sub-module sampling are constant until the next rise.\n";
-    os << "    if (!_pyc_seq_armed && _pyc_clk_prev && !" << fastClkName
-       << ".toBool()) {\n";
-    os << "      tick_negedge();\n";
-    os << "      return;\n";
-    os << "    }\n";
-  }
   if (!instInfos.empty()) {
-    os << "    // Sub-modules.\n";
-    for (unsigned i = 0; i < subParts; ++i)
-      os << "    tick_compute_part_" << i << "();\n";
+    if (parallelInstances) {
+      os << "    // Sub-modules: independent next-state sampling, forked.\n";
+      os << "    pyc::cpp::ForkJoinPool<" << parallelThreads << ">::instance().run("
+         << instInfos.size() << ", [&](unsigned _pyc_worker) {\n";
+      os << "      switch (_pyc_worker) {\n";
+      for (unsigned i = 0; i < instInfos.size(); ++i)
+        os << "        case " << i << "u: tick_compute_inst_" << i << "(); return;\n";
+      os << "      }\n";
+      os << "    });\n";
+    } else {
+      os << "    // Sub-modules.\n";
+      for (unsigned i = 0; i < subParts; ++i)
+        os << "    tick_compute_part_" << i << "();\n";
+    }
   }
   os << "    // Local sequential primitives.\n";
   auto emitEdgeCall = [&](const char *method, llvm::StringRef indent) {
@@ -4728,47 +4609,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
            << "ull}";
       });
       os << "}}};\n";
-      if (!opts.laneMarkWalk) {
-        os << "      " << wake << ".apply(" << loop
-           << ".direct_commit(), _pyc_comb_dirty);\n";
-        continue;
-      }
-      // L28 marked walk: only lanes whose producer comb ran (plus the always
-      // marked ones) are sampled; first rise / reset / en 0->1 fall back to a
-      // full walk. Marks are cleared in place after the walk (consume-in-place).
-      pyc::RegOp lane0 = regLoopRegs[loopId].front();
-      const std::string rstName = nt.get(lane0.getRst());
-      const std::string enName = nt.get(lane0.getEn());
-      os << "      {\n";
-      os << "        const bool _pyc_go = " << rstName << ".toBool() | " << enName
-         << ".toBool();\n";
-      os << "        const bool _pyc_full = _pyc_lane_mark_stale || " << rstName
-         << ".toBool();\n";
-      os << "        if (_pyc_go) {\n";
-      os << "          static constexpr std::array<std::pair<unsigned, "
-            "std::uint64_t>, "
-         << laneAlwaysMarks.size() << "> _pyc_lane_always{{\n";
-      for (const auto &wm : laneAlwaysMarks)
-        os << "              {" << wm.first << "u, 0x" << llvm::utohexstr(wm.second)
-           << "ull},\n";
-      os << "          }};\n";
-      os << "          if (_pyc_full) {\n";
-      os << "            for (auto &_w : _pyc_lane_marks) _w = ~std::uint64_t{0};\n";
-      os << "          } else {\n";
-      os << "            for (const auto &[_w, _m] : _pyc_lane_always) "
-            "_pyc_lane_marks[_w] |= _m;\n";
-      os << "          }\n";
-      os << "          " << wake << ".apply(" << loop
-         << ".direct_commit_marked(_pyc_lane_marks.data(), " << laneMarkWords
-         << "u), _pyc_comb_dirty);\n";
-      os << "        } else {\n";
-      os << "          " << loop << ".direct_commit();\n";
-      os << "        }\n";
-      os << "        for (auto &_w : _pyc_lane_marks) _w = 0;\n";
-      os << "        _pyc_lane_mark_stale = !_pyc_go || " << rstName
-         << ".toBool();\n";
-      os << "      }\n";
-      continue;
+      os << "      " << wake << ".apply(" << loop
+         << ".direct_commit(), _pyc_comb_dirty);\n";
     }
     os << "    }\n";
   }
@@ -4777,19 +4619,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   os << "  void tick_commit() {\n";
   if (fastEdge)
     os << "    _pyc_seq_armed = false;\n";
-  auto emitInstanceCommits = [&]() {
-    if (instInfos.empty())
-      return;
-    os << "    // Sub-modules.\n";
-    unsigned commitParts = (static_cast<unsigned>(instInfos.size()) + kTickChunk - 1) / kTickChunk;
-    for (unsigned i = 0; i < commitParts; ++i)
-      os << "    tick_commit_part_" << i << "();\n";
-  };
-  // Without the falling-edge trim the recursion stays outside the
-  // _pyc_commit_needed gate; with it, a falling edge reaches only sub-modules
-  // whose sampling was already committed, so the walk is dead there.
-  if (!negedgeTrim)
-    emitInstanceCommits();
+  if (!instInfos.empty()) {
+    if (parallelInstances) {
+      os << "    // Sub-modules: independent commits, forked.\n";
+      os << "    pyc::cpp::ForkJoinPool<" << parallelThreads << ">::instance().run("
+         << instInfos.size() << ", [&](unsigned _pyc_worker) {\n";
+      os << "      switch (_pyc_worker) {\n";
+      for (unsigned i = 0; i < instInfos.size(); ++i)
+        os << "        case " << i << "u: tick_commit_inst_" << i << "(); return;\n";
+      os << "      }\n";
+      os << "    });\n";
+    } else {
+      os << "    // Sub-modules.\n";
+      unsigned commitParts = (static_cast<unsigned>(instInfos.size()) + kTickChunk - 1) / kTickChunk;
+      for (unsigned i = 0; i < commitParts; ++i)
+        os << "    tick_commit_part_" << i << "();\n";
+    }
+  }
   os << "    // Local sequential primitives.\n";
   auto emitCommitWake = [&](llvm::StringRef condition, Value output,
                             llvm::StringRef indent = "    ") {
@@ -4803,8 +4649,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "    if (_pyc_commit_needed) {\n";
     os << "      _pyc_commit_needed = false;\n";
   }
-  if (negedgeTrim)
-    emitInstanceCommits();
   // A clean 64-lane dirty word skips all of its per-lane wake checks.
   auto openLaneWord = [&](unsigned lane, const std::string &cond) {
     if (lane & 63)
@@ -5127,7 +4971,10 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   os << "#include <utility>\n";
   os << "#include <cpp/pyc_sim.hpp>\n";
   os << "#include <cpp/pyc_state_loop.hpp>\n";
-  os << "#include <cpp/pyc_change_scheduler.hpp>\n\n";
+  os << "#include <cpp/pyc_change_scheduler.hpp>\n";
+  if (opts.parallelInstances >= 2)
+    os << "#include <cpp/pyc_parallel.hpp>\n";
+  os << "\n";
   os << "namespace pyc::gen {\n\n";
 
   // Emit structs in dependency order so submodule types are defined before use.
