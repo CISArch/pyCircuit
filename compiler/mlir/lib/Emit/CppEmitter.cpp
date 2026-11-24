@@ -1648,16 +1648,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   };
 
   // Medium fanout glue modules still explode into large TUs if they keep the
-  // per-port versioned cache form. Prefer the exact packed-word cache once an
-  // instance reaches moderate input width/count.
-  constexpr unsigned kPackedInstanceCacheOperandThreshold = 12;
-  constexpr unsigned kPackedInstanceCacheWordThreshold = 16;
-  auto usePackedInstanceEvalCache = [&](const InstInfo &ii) -> bool {
+  // per-port versioned cache form. Compare the parent sources against the
+  // child's own ports once an instance reaches moderate input width/count.
+  constexpr unsigned kDirectInstanceInputOperandThreshold = 12;
+  constexpr unsigned kDirectInstanceInputWordThreshold = 16;
+  auto useDirectInstanceInputCheck = [&](const InstInfo &ii) -> bool {
     auto inst = ii.op;
     unsigned packedWords = instancePackedCacheWordCount(ii);
     return packedWords > 0 &&
-           ((inst.getNumOperands() >= kPackedInstanceCacheOperandThreshold) ||
-            (packedWords >= kPackedInstanceCacheWordThreshold));
+           ((inst.getNumOperands() >= kDirectInstanceInputOperandThreshold) ||
+            (packedWords >= kDirectInstanceInputWordThreshold));
   };
 
   llvm::DenseMap<Operation *, std::string> byteMemInstName;
@@ -1677,10 +1677,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     for (const auto &ii : instInfos) {
       auto inst = ii.op;
       os << "  bool " << ii.member << "_eval_cache_valid = false;\n";
-      if (usePackedInstanceEvalCache(ii)) {
-        os << "  std::array<std::uint64_t, " << instancePackedCacheWordCount(ii) << "> " << ii.member
-           << "_eval_cache_words{};\n";
-      } else {
+      if (!useDirectInstanceInputCheck(ii))
         for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
           if (i < ii.clockOnlyIn.size() && ii.clockOnlyIn[i])
             continue;
@@ -1692,7 +1689,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
           if (inW <= 64)
             os << "  std::uint64_t " << ii.member << "_eval_cache_in_fp_" << i << " = 0ull;\n";
         }
-      }
     }
     os << "\n";
   }
@@ -2912,7 +2908,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 
   auto emitInstanceEvalHelperDefinition = [&](const InstInfo &ii, llvm::StringRef helperName) {
     auto inst = ii.op;
-    bool usePackedCache = usePackedInstanceEvalCache(ii);
+    bool useDirectCheck = useDirectInstanceInputCheck(ii);
     os << "  inline bool " << helperName << "() {\n";
     os << "    bool _pyc_inst_changed = false;\n";
     os << "    #ifdef PYC_DISABLE_INSTANCE_EVAL_CACHE\n";
@@ -2936,24 +2932,34 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
            << nt.get(inst.getOperand(i)) << ";\n";
       }
     };
-    if (usePackedCache) {
-      os << "    std::array<std::uint64_t, " << instancePackedCacheWordCount(ii) << "> _pyc_inputs{};\n";
-      os << "    std::size_t _pyc_inputs_off = 0;\n";
+    if (useDirectCheck) {
+      // Compare the parent sources against the child's own input ports: the
+      // child always holds the values copied by the last evaluation, so no
+      // shadow array (and no per-call packing pass) is needed.
+      os << "    if (!" << changedFlag << ") {\n";
+      std::string compare;
+      unsigned terms = 0;
+      bool firstLine = true;
       for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
         if (clockOnlyIn(i))
           continue;
         std::string inValue = nt.get(inst.getOperand(i));
-        os << "    pyc::cpp::appendPackedWireWords(_pyc_inputs, _pyc_inputs_off, " << inValue << ");\n";
+        compare += "(" + inValue + " != " + ii.member + "->" + ii.inPorts[i] + ")";
+        if (++terms % 8 == 0 || i + 1 == inst.getNumOperands()) {
+          os << "      " << changedFlag << (firstLine ? " = " : " |= ") << compare << ";\n";
+          firstLine = false;
+          compare.clear();
+        } else {
+          compare += " | ";
+        }
       }
-      os << "    if (!" << changedFlag << " && (" << ii.member << "_eval_cache_words != _pyc_inputs)) " << changedFlag
-         << " = true;\n";
+      os << "    }\n";
       os << "    if (" << changedFlag << ") {\n";
       for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
         std::string inValue = nt.get(inst.getOperand(i));
         os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
       }
       os << "      " << ii.member << "->eval();\n";
-      os << "      " << ii.member << "_eval_cache_words = _pyc_inputs;\n";
       os << "    } else {\n";
       emitClockOnlyAssigns("      ");
       os << "    }\n";

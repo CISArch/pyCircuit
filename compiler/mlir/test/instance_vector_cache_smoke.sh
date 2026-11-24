@@ -13,18 +13,15 @@ mkdir -p "${OUT}"
   -o "${OUT}/instance_vector_cache.cpp"
 
 python3 - "${OUT}/instance_vector_cache.cpp" <<'PY'
-import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
-matches = re.findall(
-    r"std::array<std::uint64_t,\s*(\d+)>\s+\w+_eval_cache_words",
-    text,
-)
-if matches != ["48"]:
-    raise SystemExit(
-        f"expected one 48-word packed vector cache, got {matches!r}"
-    )
+if "_eval_cache_words" in text:
+    raise SystemExit("wide instance input still materialises a packed shadow array")
+if "_eval_cache_in_" in text:
+    raise SystemExit("wide instance input fell back to the per-port versioned cache")
+if "u_child->in" not in text:
+    raise SystemExit("wide instance input is not compared against the child's own port")
 PY
 
 "${CXX:-c++}" -std=c++17 -O0 \
@@ -32,4 +29,4 @@ PY
   -c "${OUT}/instance_vector_cache.cpp" \
   -o "${OUT}/instance_vector_cache.o"
 
-echo "ok: wide scalar instance cache uses 48 packed words"
+echo "ok: wide instance input is compared against the child port, no packed shadow"
