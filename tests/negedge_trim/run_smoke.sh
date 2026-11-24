@@ -77,3 +77,35 @@ fi
 
 lines="$(wc -l < "${WORK}/off.trace")"
 echo "negedge_trim_smoke: PASS (${lines} compared lines, 40 cycles)"
+
+# Regression: a leaf whose only state is a loopified delay line runs through the
+# generic compute_generic(clk) path and needs its falling edge.  The trim must
+# leave that subtree serial (no tick_negedge in the generated top) and the two
+# models must stay equal.
+DL_FIXTURE="${ROOT}/tests/negedge_trim/delay_only.mlir"
+DL_DRIVER="${ROOT}/tests/negedge_trim/driver_delay_only.cpp"
+mkdir -p "${WORK}/dl_off" "${WORK}/dl_on"
+"${CC}" "${DL_FIXTURE}" --emit=cpp --out-dir "${WORK}/dl_off" --cpp-split=module \
+  --cpp-negedge-trim=off >/dev/null
+"${CC}" "${DL_FIXTURE}" --emit=cpp --out-dir "${WORK}/dl_on" --cpp-split=module \
+  --cpp-negedge-trim=on >/dev/null
+if grep -q "Falling edge after a committed rising edge" "${WORK}/dl_on/dl_top.cpp"; then
+  echo "fail: trim reached a subtree with generic delay loops" >&2
+  exit 1
+fi
+build_dl_model() {
+  local dir="$1"
+  local out="$2"
+  "${CXX}" -std=c++17 -O2 -o "${out}" \
+    -I"${dir}" -I"${RUNTIME_INC}" \
+    "${DL_DRIVER}" "${dir}/dl_top.cpp" "${dir}/dl_leaf.cpp"
+}
+build_dl_model "${WORK}/dl_off" "${WORK}/dl_off.bin"
+build_dl_model "${WORK}/dl_on" "${WORK}/dl_on.bin"
+"${WORK}/dl_off.bin" > "${WORK}/dl_off.trace"
+"${WORK}/dl_on.bin" > "${WORK}/dl_on.trace"
+if ! diff -u "${WORK}/dl_off.trace" "${WORK}/dl_on.trace"; then
+  echo "fail: --cpp-negedge-trim stalled a delay-only sub-module" >&2
+  exit 1
+fi
+echo "negedge_trim_delay_only: PASS ($(wc -l < "${WORK}/dl_off.trace") compared lines, 8 cycles)"

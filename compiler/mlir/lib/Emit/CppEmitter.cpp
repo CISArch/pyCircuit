@@ -697,6 +697,39 @@ static bool argumentFeedsClock(
   return found;
 }
 
+// True when `func` survives a skipped falling edge without losing its own edge
+// bookkeeping.  Modules with no edge-latched storage are safe: their
+// tick_negedge() still recurses into instances and re-samples the storage
+// primitives.  Modules that own registers or per-object delay lines are safe
+// only when those watch one clock value (the fastEdge latch that tick_negedge()
+// drops).  A module whose only state is loopified delay lines is NOT safe: it
+// runs them through the generic compute_generic(clk) path, which lowers their
+// own clkPrev on the falling edge, so skipping that call would stall them.
+static bool moduleIsFallSafe(func::FuncOp func) {
+  bool hasLatchState = false;
+  bool hasLoopState = false;
+  llvm::SmallVector<Value, 4> clocks;
+  func.walk([&](Operation *op) {
+    if (auto r = dyn_cast<pyc::RegOp>(op)) {
+      hasLatchState = true;
+      clocks.push_back(r.getClk());
+    } else if (auto d = dyn_cast<pyc::DelayLineOp>(op)) {
+      if (d->hasAttr("pyc.loop_id")) {
+        hasLoopState = true;
+      } else {
+        hasLatchState = true;
+        clocks.push_back(d.getClk());
+      }
+    }
+  });
+  if (!hasLatchState)
+    return !hasLoopState;
+  for (Value c : clocks)
+    if (c != clocks.front())
+      return false;
+  return true;
+}
+
 // True when every clock operand of `func` and of its whole instance subtree is
 // `func`'s argument `clkArg` (through aliases).
 static bool subtreeIsSingleClock(
@@ -708,6 +741,8 @@ static bool subtreeIsSingleClock(
   // Assume unsafe while recursing so an instance cycle cannot pass the gate.
   memo[key] = false;
   if (!func || func.isDeclaration() || clkArg >= func.getNumArguments())
+    return false;
+  if (!moduleIsFallSafe(func))
     return false;
   Value clk = func.getArgument(clkArg);
 
