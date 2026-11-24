@@ -188,6 +188,61 @@ public:
       pending_[pendingLanes_[k]] = 0;
   }
 
+  // L28 marked walk (experimental): publish only the lanes whose bit is set in
+  // `marks` (word w carries lanes 64w..64w+63). Orthogonal to the on-demand
+  // probe bookkeeping above: the walk filters which lanes are sampled, while the
+  // shadow/pending refresh still covers exactly the bound lanes.
+  std::vector<std::uint64_t> &direct_commit_marked(const std::uint64_t *marks,
+                                                   std::size_t words) {
+    const std::size_t n = q_.size();
+    clkPrev_ = true;
+    const bool r = rst_->toBool();
+    const bool go = r | en_->toBool();
+    if (go) {
+      for (std::size_t w = 0; w < words; ++w) {
+        std::uint64_t bits = marks[w];
+        std::uint64_t mask = 0;
+        while (bits != 0) {
+          const unsigned bit = static_cast<unsigned>(__builtin_ctzll(bits));
+          bits &= bits - 1;
+          const std::size_t i = w * 64u + bit;
+          if (__builtin_expect(i >= n, 0))
+            break;
+          const std::uint64_t *src = r ? init_[i] : d_[i];
+          std::uint64_t *q = q_[i];
+          if (words_[i] == 1) {
+            const std::uint64_t v = src[0];
+            mask |= static_cast<std::uint64_t>(q[0] != v) << bit;
+            q[0] = v;
+          } else {
+            std::uint64_t changed = 0;
+            for (unsigned k = 0; k < words_[i]; ++k) {
+              const std::uint64_t v = src[k];
+              changed |= q[k] != v;
+              q[k] = v;
+            }
+            mask |= changed << bit;
+          }
+        }
+        dirty_[w] |= mask;
+      }
+      for (std::size_t k = 0; k < shadowLanes_.size(); ++k) {
+        const std::size_t i = shadowLanes_[k];
+        const std::uint64_t *src = r ? init_[i] : d_[i];
+        std::uint64_t *next = qStore_.data() + laneOff_[i];
+        for (unsigned w = 0; w < words_[i]; ++w)
+          next[w] = src[w];
+      }
+      for (std::size_t k = 0; k < pendingLanes_.size(); ++k)
+        pending_[pendingLanes_[k]] = 1;
+    } else {
+      for (std::size_t k = 0; k < pendingLanes_.size(); ++k)
+        pending_[pendingLanes_[k]] = 0;
+    }
+    return dirty_;
+  }
+
+
   // Diagnostic/helper reset of the consumed-in-place dirty bitmap; generated
   // code never calls this (the wake walks clear as they consume).
   void clearDirty() { dirty_.assign(loop_word_count(q_.size()), 0); }
