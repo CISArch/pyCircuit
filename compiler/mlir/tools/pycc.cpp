@@ -130,7 +130,7 @@ static llvm::cl::opt<bool> cppPch(
 static llvm::cl::opt<bool> cppEvalFastExit(
     "cpp-eval-fast-exit",
     llvm::cl::desc("Emit the settle fast-path prologue for topological eval()"),
-    llvm::cl::init(false));
+    llvm::cl::init(true));
 
 static llvm::cl::opt<bool> cppCompileBudget(
     "cpp-compile-budget",
