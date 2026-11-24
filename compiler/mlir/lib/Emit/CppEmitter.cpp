@@ -3349,7 +3349,41 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
            << nt.get(inst.getOperand(i)) << ";\n";
       }
     };
-    if (usePackedCache) {
+    if (usePackedCache && opts.instanceCacheDirect) {
+      // Compare the parent sources against the child's own input ports: the
+      // child always holds the values copied by the last evaluation, so no
+      // shadow array (and no per-call packing pass) is needed.
+      os << "    if (!" << changedFlag << ") {\n";
+      std::string compare;
+      unsigned terms = 0;
+      bool firstLine = true;
+      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        if (clockOnlyIn(i))
+          continue;
+        std::string inValue = nt.get(inst.getOperand(i));
+        compare += "(" + inValue + " != " + ii.member + "->" + ii.inPorts[i] + ")";
+        if (++terms % 8 == 0 || i + 1 == inst.getNumOperands()) {
+          os << "      " << changedFlag << (firstLine ? " = " : " |= ") << compare << ";\n";
+          firstLine = false;
+          compare.clear();
+        } else {
+          compare += " | ";
+        }
+      }
+      os << "    }\n";
+      os << "    if (" << changedFlag << ") {\n";
+      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        std::string inValue = nt.get(inst.getOperand(i));
+        os << "      " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
+      }
+      os << "      " << ii.member << "->eval();\n";
+      os << "    } else {\n";
+      emitClockOnlyAssigns("      ");
+      os << "    }\n";
+      os << "    _pyc_inst_changed = " << changedFlag << ";\n";
+      os << "    " << ii.member << "_eval_cache_valid = true;\n";
+      os << "    #endif\n";
+    } else if (usePackedCache) {
       os << "    std::array<std::uint64_t, " << instancePackedCacheWordCount(ii) << "> _pyc_inputs{};\n";
       os << "    std::size_t _pyc_inputs_off = 0;\n";
       for (unsigned i = 0; i < inst.getNumOperands(); ++i) {

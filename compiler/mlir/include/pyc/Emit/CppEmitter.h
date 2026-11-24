@@ -69,6 +69,10 @@ struct CppEmitterOptions {
   /// Default comb/eval chunk size (pycc placement pass and emitter both use this).
   static constexpr unsigned kDefaultCombChunkNodes = 256;
 
+  // How the instance eval cache decides whether the child must be re-evaluated.
+  // Packed keeps the packed word shadow; direct compares the parent sources
+  // against the child's own input ports and drops the shadow entirely.
+  bool instanceCacheDirect = false;
   SplitMode splitMode = SplitMode::None;
   unsigned shardThresholdLines = 120000;
   unsigned shardThresholdBytes = 4 * 1024 * 1024;
