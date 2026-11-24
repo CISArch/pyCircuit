@@ -127,10 +127,37 @@ static llvm::cl::opt<bool> cppPch(
     llvm::cl::desc("Record device module hpp for CMake precompiled headers (requires --cpp-split=module)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> cppEvalFastExit(
+    "cpp-eval-fast-exit",
+    llvm::cl::desc("Emit the settle fast-path prologue for topological eval()"),
+    llvm::cl::init(true));
+
 static llvm::cl::opt<bool> cppCompileBudget(
     "cpp-compile-budget",
     llvm::cl::desc("Enforce predicted C++ compile cost budgets (PYC991-993)"),
     llvm::cl::init(true));
+
+// L7 experiment: falling-edge trim. Default "off" upstream; this branch defaults
+// to "on" so the benchmark matrix measures it with default arguments.
+static llvm::cl::opt<std::string> cppNegedgeTrim(
+    "cpp-negedge-trim",
+    llvm::cl::desc("Falling-edge trim for generated C++: off|on"),
+    llvm::cl::init("on"));
+
+// Translate --cpp-negedge-trim into the emitter option ("off" is byte-identical).
+static bool applyNegedgeTrimOpt(pyc::CppEmitterOptions &opts) {
+  if (cppNegedgeTrim == "on") {
+    opts.negedgeTrim = pyc::CppEmitterOptions::NegedgeTrim::On;
+    return true;
+  }
+  if (cppNegedgeTrim == "off") {
+    opts.negedgeTrim = pyc::CppEmitterOptions::NegedgeTrim::Off;
+    return true;
+  }
+  llvm::errs() << "error: unknown --cpp-negedge-trim mode: " << cppNegedgeTrim
+               << " (expected: off|on)\n";
+  return false;
+}
 
 static llvm::cl::opt<unsigned> cppShardThresholdLines(
     "cpp-shard-threshold-lines",
@@ -2731,6 +2758,9 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
+      cppEmitOpts.evalFastExit = cppEvalFastExit;
+      if (!applyNegedgeTrimOpt(cppEmitOpts))
+        return 1;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -3091,6 +3121,9 @@ int main(int argc, char **argv) {
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
+    cppEmitOpts.evalFastExit = cppEvalFastExit;
+    if (!applyNegedgeTrimOpt(cppEmitOpts))
+      return 1;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))

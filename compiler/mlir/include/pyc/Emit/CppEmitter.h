@@ -79,6 +79,19 @@ struct CppEmitterOptions {
   // downstream C++ TU cost even after file sharding.
   unsigned combChunkNodes = kDefaultCombChunkNodes;
   std::string probePlanPath{};
+  // Settle fast-path: skip the topological eval walk when the comb dirty set
+  // is empty and the unconditional prologue woke nothing.
+  bool evalFastExit = true;
+
+  /// Falling-edge trim: the falling edge samples no next state, so skip its
+  /// delay-tap recompute and its sub-module tick_compute walk, and gate the
+  /// sub-module tick_commit recursion on `_pyc_commit_needed`. Only emitted
+  /// when the emitter can prove the whole instance subtree is single-clocked.
+  enum class NegedgeTrim {
+    Off,
+    On,
+  };
+  NegedgeTrim negedgeTrim = NegedgeTrim::Off;
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,
