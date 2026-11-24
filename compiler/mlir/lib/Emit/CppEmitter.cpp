@@ -2226,7 +2226,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
           if (auto *def = qVal.getDefiningOp())
             if (auto alias = dyn_cast<pyc::AliasOp>(def))
               qVal = alias.getOperand();
-          if (auto *d2 = qVal.getDefiningOp())
+          if (auto *d2 = qVal.getDefiningOp()) {
             if (auto srcReg = dyn_cast<pyc::RegOp>(d2)) {
               auto pn = probePendingNext(srcReg);
               if (pn.first.rfind("reg_loop_", 0) == 0) {
@@ -2234,7 +2234,17 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                 nextText = "&" + nt.get(q);
                 qText = "&" + nt.get(q);
               }
+            } else if (auto srcDelay = dyn_cast<pyc::DelayLineOp>(d2)) {
+              // A fused delay line has no per-object instance to point at, so the
+              // probe binds to the emitted tap wire plus the DelayLoop lane.
+              auto [dinst, dpend, dnext] = delayBinding(srcDelay);
+              if (dinst.empty()) {
+                qText = "&" + nt.get(q);
+                pendText = dpend;
+                nextText = dnext;
+              }
             }
+          }
         }
         for (Attribute item : slices) {
           auto dict = dyn_cast<DictionaryAttr>(item);
