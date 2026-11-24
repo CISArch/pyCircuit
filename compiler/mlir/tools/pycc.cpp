@@ -127,10 +127,43 @@ static llvm::cl::opt<bool> cppPch(
     llvm::cl::desc("Record device module hpp for CMake precompiled headers (requires --cpp-split=module)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> cppEvalFastExit(
+    "cpp-eval-fast-exit",
+    llvm::cl::desc("Emit the settle fast-path prologue for topological eval()"),
+    llvm::cl::init(false));
+static llvm::cl::opt<bool> cppLaneMarkWalk(
+    "cpp-lane-mark-walk",
+    llvm::cl::desc("EXPERIMENTAL (L28): sample only lanes whose producer comb ran "
+                   "this cycle instead of every fused lane"),
+    llvm::cl::init(false),
+    llvm::cl::Hidden);
+
 static llvm::cl::opt<bool> cppCompileBudget(
     "cpp-compile-budget",
     llvm::cl::desc("Enforce predicted C++ compile cost budgets (PYC991-993)"),
     llvm::cl::init(true));
+
+// L7 experiment: falling-edge trim. Default "off" upstream; this branch defaults
+// to "on" so the benchmark matrix measures it with default arguments.
+static llvm::cl::opt<std::string> cppNegedgeTrim(
+    "cpp-negedge-trim",
+    llvm::cl::desc("Falling-edge trim for generated C++: off|on"),
+    llvm::cl::init("on"));
+
+// Translate --cpp-negedge-trim into the emitter option ("off" is byte-identical).
+static bool applyNegedgeTrimOpt(pyc::CppEmitterOptions &opts) {
+  if (cppNegedgeTrim == "on") {
+    opts.negedgeTrim = pyc::CppEmitterOptions::NegedgeTrim::On;
+    return true;
+  }
+  if (cppNegedgeTrim == "off") {
+    opts.negedgeTrim = pyc::CppEmitterOptions::NegedgeTrim::Off;
+    return true;
+  }
+  llvm::errs() << "error: unknown --cpp-negedge-trim mode: " << cppNegedgeTrim
+               << " (expected: off|on)\n";
+  return false;
+}
 
 static llvm::cl::opt<unsigned> cppShardThresholdLines(
     "cpp-shard-threshold-lines",
@@ -147,6 +180,12 @@ static llvm::cl::opt<unsigned> cppShardMaxAstNodes(
     llvm::cl::desc("Chunk large eval topologies into helper methods (node budget per chunk; 0=default policy)"),
     llvm::cl::init(0));
 
+static llvm::cl::opt<unsigned> cppParallelInstances(
+    "cpp-parallel-instances",
+    llvm::cl::desc("Fork independent sibling instances of one schedule stage onto a persistent N-way pool "
+                   "(0 = serial and byte-identical to the serial emitter; N>=2 opts in, and a stage fork "
+                   "costs a bounded wait, so only enable it when the run has spare CPUs)"),
+    llvm::cl::init(0));
 static llvm::cl::opt<std::string> cppInstanceEvalCache(
     "cpp-instance-eval-cache",
     llvm::cl::desc("How generated instance eval caches test for changed inputs: "
@@ -2739,6 +2778,11 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
+      cppEmitOpts.evalFastExit = cppEvalFastExit;
+      if (!applyNegedgeTrimOpt(cppEmitOpts))
+        return 1;
+      cppEmitOpts.laneMarkWalk = cppLaneMarkWalk;
+      cppEmitOpts.parallelInstances = cppParallelInstances;
       if (cppInstanceEvalCache != "packed" && cppInstanceEvalCache != "direct") {
         llvm::errs() << "--cpp-instance-eval-cache must be packed or direct\n";
         return 1;
@@ -2785,6 +2829,8 @@ int main(int argc, char **argv) {
         os << "#include <cpp/pyc_sim.hpp>\n";
         os << "#include <cpp/pyc_state_loop.hpp>\n";
         os << "#include <cpp/pyc_change_scheduler.hpp>\n";
+        if (cppParallelInstances >= 2)
+          os << "#include <cpp/pyc_parallel.hpp>\n";
       };
 
       auto writeSourcePreamble = [&](llvm::raw_ostream &os, llvm::StringRef headerName) {
@@ -3104,6 +3150,11 @@ int main(int argc, char **argv) {
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
+    cppEmitOpts.evalFastExit = cppEvalFastExit;
+    if (!applyNegedgeTrimOpt(cppEmitOpts))
+      return 1;
+    cppEmitOpts.laneMarkWalk = cppLaneMarkWalk;
+    cppEmitOpts.parallelInstances = cppParallelInstances;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))

@@ -87,8 +87,23 @@ struct CppEmitterOptions {
   // code byte-identical to the serial emitter.
   unsigned parallelInstances = 0;
   std::string probePlanPath{};
-  // Experimental, off by default: walk only the lanes whose producing comb ran
-  // this cycle instead of every fused lane.
+  // Settle fast-path: skip the topological eval walk when the comb dirty set
+  // is empty and the unconditional prologue woke nothing.
+  bool evalFastExit = true;
+
+  /// Falling-edge trim: the falling edge samples no next state, so skip its
+  /// delay-tap recompute and its sub-module tick_compute walk, and gate the
+  /// sub-module tick_commit recursion on `_pyc_commit_needed`. Only emitted
+  /// when the emitter can prove the whole instance subtree is single-clocked.
+  enum class NegedgeTrim {
+    Off,
+    On,
+  };
+  NegedgeTrim negedgeTrim = NegedgeTrim::Off;
+  // L28 (experimental, default off): walk only the lanes whose producer comb ran
+  // this cycle instead of every fused lane. verifyLaneMarks additionally checks,
+  // after each marked walk, that every unmarked lane already had q == next
+  // (i.e. the mark set is a superset of the changed set); test-only.
   bool laneMarkWalk = false;
 };
 
