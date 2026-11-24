@@ -147,6 +147,14 @@ static llvm::cl::opt<unsigned> cppShardMaxAstNodes(
     llvm::cl::desc("Chunk large eval topologies into helper methods (node budget per chunk; 0=default policy)"),
     llvm::cl::init(0));
 
+static llvm::cl::opt<std::string> cppInstanceEvalCache(
+    "cpp-instance-eval-cache",
+    llvm::cl::desc("How generated instance eval caches test for changed inputs: "
+                   "packed (default) packs inputs into words and compares the whole array; "
+                   "direct compares the parent sources against the child's own input ports "
+                   "and drops the shadow array"),
+    llvm::cl::init("packed"));
+
 static llvm::cl::opt<std::string> cppManifestPath(
     "cpp-manifest",
     llvm::cl::desc("C++ compile manifest path (default: <out-dir>/cpp_compile_manifest.json)"),
@@ -2731,6 +2739,11 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
+      if (cppInstanceEvalCache != "packed" && cppInstanceEvalCache != "direct") {
+        llvm::errs() << "--cpp-instance-eval-cache must be packed or direct\n";
+        return 1;
+      }
+      cppEmitOpts.instanceCacheDirect = cppInstanceEvalCache == "direct";
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
