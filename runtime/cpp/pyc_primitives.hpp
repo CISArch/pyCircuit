@@ -78,14 +78,33 @@ class RegBase : public ClockedElement<RegBase<ValT>> {
   using change_mask_t = typename Base::change_mask_t;
 
 public:
-  RegBase(Wire<1> &clk, Wire<1> &rst, Wire<1> &en, ValT &d, ValT &init, ValT &q)
-      : Base(clk), rst(rst), en(en), d(d), init(init), q(q) {}
+  RegBase() = default;
+  RegBase(Wire<1> &clk, Wire<1> &rst, Wire<1> &en, ValT &d, ValT &init, ValT &q) {
+    bind(clk, rst, en, d, init, q);
+  }
+
+  // One-shot wiring: the generated module declares this as a value member and
+  // binds every port (clock included) in its constructor body.
+  void bind(Wire<1> &clk, Wire<1> &rst, Wire<1> &en, ValT &d, ValT &init, ValT &q) {
+    this->bind_clock(clk);
+    this->rst.set(rst);
+    this->en.set(en);
+    this->d.set(d);
+    this->init.set(init);
+    this->q.set(q);
+  }
+
+  bool bound() const {
+    return this->clk.bound() && rst.bound() && en.bound() && d.bound() &&
+           init.bound() && q.bound();
+  }
 
   // Applies a pending edge and reports whether the visible output changed.
   inline change_mask_t tick_commit() {
     if (__builtin_expect(!this->pending, 1))
       return 0;
     this->pending = false;
+    ValT &q = this->q.get();
     const bool changed = q != qNext;
     if (changed)
       q = qNext;
@@ -93,20 +112,20 @@ public:
   }
 
   bool sample() {
-    const bool r = rst.toBool();
-    const bool e = en.toBool();
+    const bool r = this->rst.get().toBool();
+    const bool e = this->en.get().toBool();
     if (r)
-      qNext = init;
+      qNext = this->init.get();
     else
-      qNext = d;
+      qNext = this->d.get();
     return r | e;
   }
 
-  Wire<1> &rst;
-  Wire<1> &en;
-  ValT &d;
-  ValT &init;
-  ValT &q;
+  Ref<Wire<1>> rst;
+  Ref<Wire<1>> en;
+  Ref<ValT> d;
+  Ref<ValT> init;
+  Ref<ValT> q;
 
   ValT qNext{};
 };
@@ -138,9 +157,26 @@ class DelayBase : public ClockedElement<DelayBase<ValT, Depth>> {
   static_assert(Depth > 1, "DelayBase requires Depth > 1");
 
 public:
+  DelayBase() = default;
   DelayBase(Wire<1> &clk, Wire<1> &rst, Wire<1> &en, ValT &d, ValT &init,
-            ValT &q)
-      : Base(clk), rst(rst), en(en), d(d), init(init), q(q) {}
+            ValT &q) {
+    bind(clk, rst, en, d, init, q);
+  }
+
+  // One-shot wiring (see RegBase::bind).
+  void bind(Wire<1> &clk, Wire<1> &rst, Wire<1> &en, ValT &d, ValT &init, ValT &q) {
+    this->bind_clock(clk);
+    this->rst.set(rst);
+    this->en.set(en);
+    this->d.set(d);
+    this->init.set(init);
+    this->q.set(q);
+  }
+
+  bool bound() const {
+    return this->clk.bound() && rst.bound() && en.bound() && d.bound() &&
+           init.bound() && q.bound();
+  }
 
   // True while an enabled edge is waiting for tick_commit. Tap consumers must
   // wake on this (every enabled edge shifts every tap).
@@ -151,9 +187,10 @@ public:
   inline change_mask_t tick_commit() {
     if (__builtin_expect(!this->pending, 1))
       return 0;
+    ValT &q = this->q.get();
     const bool changed = q != qNext;
     if (pendingReset) {
-      stages.fill(init);
+      stages.fill(this->init.get());
       head = 0;
     } else {
       stages[head] = sampledInput;
@@ -170,31 +207,31 @@ public:
 
   inline ValT tap_next(unsigned depth) const {
     if (pendingReset)
-      return init;
+      return this->init.get();
     if (!this->pending)
       return tap(depth);
     return depth == 1 ? sampledInput : tap(depth - 1);
   }
 
   bool sample() {
-    pendingReset = rst.toBool();
-    const bool enabled = en.toBool();
+    pendingReset = this->rst.get().toBool();
+    const bool enabled = this->en.get().toBool();
     if (pendingReset) {
-      qNext = init;
+      qNext = this->init.get();
       return true;
     }
     if (enabled) {
-      sampledInput = d;
+      sampledInput = this->d.get();
       qNext = stages[nextIndex(head)];
     }
     return enabled;
   }
 
-  Wire<1> &rst;
-  Wire<1> &en;
-  ValT &d;
-  ValT &init;
-  ValT &q;
+  Ref<Wire<1>> rst;
+  Ref<Wire<1>> en;
+  Ref<ValT> d;
+  Ref<ValT> init;
+  Ref<ValT> q;
   bool pendingReset = false;
   ValT qNext{};
   ValT sampledInput{};
@@ -233,6 +270,7 @@ public:
   static constexpr change_mask_t kOutValidChanged = BaseElement::change_bit(1);
   static constexpr change_mask_t kOutDataChanged = BaseElement::change_bit(2);
 
+  pycFifo() = default;
   pycFifo(Wire<1> &clk,
            Wire<1> &rst,
            Wire<1> &in_valid,
@@ -240,10 +278,29 @@ public:
            Wire<Width> &in_data,
            Wire<1> &out_valid,
            Wire<1> &out_ready,
-           Wire<Width> &out_data)
-      : ClockedElement<pycFifo<Width, Depth>>(clk), rst(rst), in_valid(in_valid), in_ready(in_ready), in_data(in_data), out_valid(out_valid),
-        out_ready(out_ready), out_data(out_data) {
+           Wire<Width> &out_data) {
+    bind(clk, rst, in_valid, in_ready, in_data, out_valid, out_ready, out_data);
+  }
+
+  // One-shot wiring (see RegBase::bind): resets the storage and publishes the
+  // initial combinational ready/valid state, as the eager constructor did.
+  void bind(Wire<1> &clk,
+            Wire<1> &rst,
+            Wire<1> &in_valid,
+            Wire<1> &in_ready,
+            Wire<Width> &in_data,
+            Wire<1> &out_valid,
+            Wire<1> &out_ready,
+            Wire<Width> &out_data) {
     static_assert(Depth > 0, "pycFifo Depth must be > 0");
+    this->bind_clock(clk);
+    this->rst.set(rst);
+    this->in_valid.set(in_valid);
+    this->in_ready.set(in_ready);
+    this->in_data.set(in_data);
+    this->out_valid.set(out_valid);
+    this->out_ready.set(out_ready);
+    this->out_data.set(out_data);
     resetState();
     eval();
   }
@@ -255,7 +312,10 @@ public:
 
   // Combinational ready/valid generation.
   void eval() {
-    const bool outReadyNow = out_ready.toBool();
+    Wire<1> &in_ready = this->in_ready.get();
+    Wire<1> &out_valid = this->out_valid.get();
+    Wire<Width> &out_data = this->out_data.get();
+    const bool outReadyNow = this->out_ready.get().toBool();
     Wire<Width> out_data_int = (count_ != 0) ? storage_[rd_] : Wire<Width>(0);
     if (evalValid_ && lastEvalCount_ == count_ && lastEvalRd_ == rd_ && lastEvalOutReady_ == outReadyNow &&
         lastEvalOutData_ == out_data_int)
@@ -276,6 +336,10 @@ public:
   }
 
   void tick_sample() {
+    Wire<1> &rst = this->rst.get();
+    Wire<1> &in_valid = this->in_valid.get();
+    Wire<Width> &in_data = this->in_data.get();
+    const bool out_ready_now = this->out_ready.get().toBool();
     pending = true;
     if (rst.toBool()) {
       rdNext_ = 0;
@@ -294,8 +358,8 @@ public:
       storageNext_[i] = storage_[i];
 
     bool out_valid_int = (count_ != 0);
-    bool in_ready_int = (count_ < Depth) || (out_valid_int && out_ready.toBool());
-    bool do_pop = out_valid_int && out_ready.toBool();
+    bool in_ready_int = (count_ < Depth) || (out_valid_int && out_ready_now);
+    bool do_pop = out_valid_int && out_ready_now;
     bool do_push = in_valid.toBool() && in_ready_int;
 
     if (do_pop) {
@@ -315,8 +379,9 @@ public:
     if (!pending)
       return 0;
 
+    const bool out_ready_now = this->out_ready.get().toBool();
     const bool oldOutValid = count_ != 0;
-    const bool oldInReady = (count_ < Depth) || (oldOutValid && out_ready.toBool());
+    const bool oldInReady = (count_ < Depth) || (oldOutValid && out_ready_now);
     const Wire<Width> oldOutData = oldOutValid ? storage_[rd_] : Wire<Width>(0);
 
     rd_ = rdNext_;
@@ -327,7 +392,7 @@ public:
     pending = false;
 
     const bool newOutValid = count_ != 0;
-    const bool newInReady = (count_ < Depth) || (newOutValid && out_ready.toBool());
+    const bool newInReady = (count_ < Depth) || (newOutValid && out_ready_now);
     const Wire<Width> newOutData = newOutValid ? storage_[rd_] : Wire<Width>(0);
     change_mask_t changed = 0;
     if (oldInReady != newInReady)
@@ -351,15 +416,15 @@ private:
   }
 
 public:
-  Wire<1> &rst;
+  Ref<Wire<1>> rst;
 
-  Wire<1> &in_valid;
-  Wire<1> &in_ready;
-  Wire<Width> &in_data;
+  Ref<Wire<1>> in_valid;
+  Ref<Wire<1>> in_ready;
+  Ref<Wire<Width>> in_data;
 
-  Wire<1> &out_valid;
-  Wire<1> &out_ready;
-  Wire<Width> &out_data;
+  Ref<Wire<1>> out_valid;
+  Ref<Wire<1>> out_ready;
+  Ref<Wire<Width>> out_data;
 
   bool pending = false;
   bool evalValid_ = false;
