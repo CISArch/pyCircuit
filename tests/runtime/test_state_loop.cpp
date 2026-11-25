@@ -85,18 +85,18 @@ int main() {
     if (rise) {
       for (auto &r : regRef) r.tick_sample();
       for (auto &r : delayRef) r.tick_sample();
-      regLoop.compute_rise();
-      delayLoop.compute_rise();
+      regLoop.compute(now);
+      delayLoop.compute(now);
     } else if (fall) {
       for (auto &r : regRef) r.tick_sample();
       for (auto &r : delayRef) r.tick_sample();
-      regLoop.negedge();
-      delayLoop.negedge();
+      regLoop.compute(now);
+      delayLoop.compute(now);
     } else {
       for (auto &r : regRef) r.tick_sample();
       for (auto &r : delayRef) r.tick_sample();
-      regLoop.compute_generic(now);
-      delayLoop.compute_generic(now);
+      regLoop.compute(now);
+      delayLoop.compute(now);
     }
 
     // Tick-fuse: direct_commit after a rising edge == two-phase compute+commit.
