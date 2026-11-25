@@ -16,9 +16,10 @@ namespace pyc::cpp {
 // VCD paths need no adaptation.
 //
 // Semantics contract (matches the per-object pycReg / pycDelayLine):
-//   compute_rise()    == tick_compute(true)  for every lane (known rising edge)
-//   compute_generic() == tick_compute(clkNow) for every lane
-//   negedge()         == tick_compute(false) for every lane
+//   compute(clkNow)   == tick_compute(clkNow) for every lane: one entry that
+//     detects the edge from the level stored on the previous tick (rising
+//     samples, falling drops the uncommitted sample, unchanged keeps the
+//     no-sample path), so callers pass the level instead of picking a verb.
 //   commit()          == tick_commit() for every lane; returns per-lane dirty
 //     bitmaps (one bit per lane, 64 lanes per word) so the change-driven
 //     fanout wake stays exactly as precise as the per-object path.
@@ -74,8 +75,15 @@ public:
 
   std::size_t size() const { return q_.size(); }
 
-  void compute_rise() {
-    clkPrev_ = true;
+  // Called on every tick, so the stored level never goes stale even when a
+  // falling tick has no uncommitted sample to drop.
+  void compute(bool clkNow) {
+    const bool posedge = (!clkPrev_) & clkNow;
+    clkPrev_ = clkNow;
+    if (__builtin_expect(!posedge, 1)) {
+      clear_pending();
+      return;
+    }
     const std::size_t n = q_.size();
     // One control read per loop (not per lane): qNext stays written for
     // every lane, matching the per-object pycReg sampling order.
@@ -90,18 +98,6 @@ public:
         next[w] = src[w];
     }
   }
-
-  void compute_generic(bool clkNow) {
-    const bool posedge = (!clkPrev_) & clkNow;
-    clkPrev_ = clkNow;
-    if (__builtin_expect(!posedge, 1)) {
-      clear_pending();
-      return;
-    }
-    compute_rise();
-  }
-
-  void negedge() { clkPrev_ = false; clear_pending(); }
 
   // Applies pending updates, writes back through the lane's q pointer, and
   // returns the per-lane dirty bitmap (bit i set == lane i's q changed).
@@ -269,8 +265,15 @@ public:
 
   std::size_t size() const { return lanes_.size(); }
 
-  void compute_rise() {
-    clkPrev_ = true;
+  // Same single verb as RegLoop: the level decides the edge, so a tick that
+  // reports the falling level keeps the stored level honest for the next one.
+  void compute(bool clkNow) {
+    const bool posedge = (!clkPrev_) & clkNow;
+    clkPrev_ = clkNow;
+    if (__builtin_expect(!posedge, 1)) {
+      clear_pending();
+      return;
+    }
     const std::size_t n = lanes_.size();
     if (sharedCtrl_) {
       // Uniform rst/en: one read replaces two dependent loads per lane.
@@ -314,18 +317,6 @@ public:
       }
     }
   }
-
-  void compute_generic(bool clkNow) {
-    const bool posedge = (!clkPrev_) & clkNow;
-    clkPrev_ = clkNow;
-    if (__builtin_expect(!posedge, 1)) {
-      clear_pending();
-      return;
-    }
-    compute_rise();
-  }
-
-  void negedge() { clkPrev_ = false; clear_pending(); }
 
   struct CommitResult {
     const std::vector<std::uint64_t> &tailDirty;

@@ -4216,22 +4216,25 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (!fusedRegLoopIds.empty())
       os << "        _pyc_fused_rise = true;\n";
     for (int64_t loopId : phasedRegLoopIds) {
-      os << "        " << regLoopName(loopId) << ".compute_rise();\n";
+      os << "        " << regLoopName(loopId) << ".compute(_pyc_now);\n";
     }
     for (int64_t dbk : delayLoopIds)
-      os << "        delay_loop_" << dbk << ".compute_rise();\n";
+      os << "        delay_loop_" << dbk << ".compute(_pyc_now);\n";
     emitEdgeCall("tick_sample", "        ");
     if (failed(emitTapUpdates("        ")))
       return failure();
     os << "        _pyc_seq_armed = true;\n";
     os << "        _pyc_commit_needed = true;\n";
     os << "      } else if (_pyc_fall) {\n";
-    os << "        if (_pyc_seq_armed) {\n";
+    // The loop verb detects the edge itself, so the falling tick has to reach
+    // it even when the armed gate below finds nothing staged to drop: this call
+    // is what keeps each loop's stored level in sync for the next rise.
     for (int64_t loopId : phasedRegLoopIds) {
-      os << "          " << regLoopName(loopId) << ".negedge();\n";
+      os << "        " << regLoopName(loopId) << ".compute(_pyc_now);\n";
     }
     for (int64_t dbk : delayLoopIds)
-      os << "          delay_loop_" << dbk << ".negedge();\n";
+      os << "        delay_loop_" << dbk << ".compute(_pyc_now);\n";
+    os << "        if (_pyc_seq_armed) {\n";
     os << "          _pyc_seq_armed = false;\n";
     os << "        }\n";
     // tick_sample() detects the edge itself, so it keeps the stored level in
@@ -4241,10 +4244,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       return failure();
     os << "      } else {\n";
     for (int64_t loopId : phasedRegLoopIds) {
-      os << "        " << regLoopName(loopId) << ".compute_generic(_pyc_now);\n";
+      os << "        " << regLoopName(loopId) << ".compute(_pyc_now);\n";
     }
     for (int64_t dbk : delayLoopIds)
-      os << "        delay_loop_" << dbk << ".compute_generic(_pyc_now);\n";
+      os << "        delay_loop_" << dbk << ".compute(_pyc_now);\n";
     emitEdgeCall("tick_sample", "        ");
     if (failed(emitTapUpdates("        ")))
       return failure();
@@ -4271,7 +4274,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
           fastClkName.empty()
               ? nt.get(delayLoopLines[dbk].front().getClk())
               : llvm::StringRef(fastClkName);
-      os << "    delay_loop_" << dbk << ".compute_generic(" << clkName
+      os << "    delay_loop_" << dbk << ".compute(" << clkName
          << ".toBool());\n";
     }
     if (failed(emitTapUpdates("    ")))
