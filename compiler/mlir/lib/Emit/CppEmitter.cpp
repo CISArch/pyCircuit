@@ -627,9 +627,9 @@ static std::string delayTapReadExpr(
     if (!isa<VectorType>(delay.getQ().getType())) {
       const int64_t raw = idAttr.getValue().getSExtValue();
       const unsigned dw = bitWidth(delay.getQ().getType());
-      if (auto da = delay->getAttrOfType<IntegerAttr>("depth")) {
+      if (auto da = delay.getDepth()) {
         const int64_t key = raw * 256 +
-                            da.getValue().getZExtValue();
+                            *da;
         auto it = delayLoopLines.find(key);
         if (it != delayLoopLines.end()) {
           long lane = 0;
@@ -927,13 +927,13 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
   }
   if (auto tap = dyn_cast<pyc::DelayTapOp>(op)) {
     auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
-    auto depth = tap->getAttrOfType<IntegerAttr>("depth");
+    auto depth = tap.getDepth();
     if (!delay || !depth)
       return tap.emitError("invalid delay tap source or depth");
     assignExpr(tap.getTap(), tap.getTap().getType(), os, nt,
                [&](llvm::raw_ostream &e) {
                  e << delayTapReadExpr(delay,
-                                       static_cast<unsigned>(depth.getInt()),
+                                       static_cast<unsigned>(*depth),
                                        nt,
                                        delayLoopLines ? *delayLoopLines
                                                    : kEmptyDelayLoops);
@@ -1649,7 +1649,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       delayCtrlGroups;
   for (pyc::DelayLineOp dl : delayLines) {
     auto idAttr = dl->getAttrOfType<IntegerAttr>("pyc.loop_id");
-    auto depthAttr = dl->getAttrOfType<IntegerAttr>("depth");
+    auto depthAttr = dl.getDepth();
     if (isa<VectorType>(dl.getQ().getType()) || !idAttr || !depthAttr) {
       unloopedDelays.push_back(dl);
       continue;
@@ -1663,7 +1663,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                 IntegerAttr::get(IntegerType::get(dl->getContext(), 64),
                                  git->second));
     const int64_t key =
-        git->second * 256 + depthAttr.getValue().getZExtValue();
+        git->second * 256 + *depthAttr;
     delayLoopLines[key].push_back(dl);
   }
   llvm::SmallVector<int64_t> delayLoopIds;
@@ -1684,9 +1684,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       if (!isa<VectorType>(delay.getQ().getType())) {
         const int64_t raw = idAttr.getValue().getSExtValue();
         const unsigned dw = bitWidth(delay.getQ().getType());
-        if (auto da = delay->getAttrOfType<IntegerAttr>("depth")) {
+        if (auto da = delay.getDepth()) {
           const int64_t key = raw * 256 +
-                              da.getValue().getZExtValue();
+                              *da;
           auto it = delayLoopLines.find(key);
           if (it != delayLoopLines.end()) {
             long lane = 0;
@@ -1742,14 +1742,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   auto delayTapKey = [&](pyc::DelayTapOp tap) { return nt.get(tap.getTap()); };
   auto fifoKey = [&](pyc::FifoOp f) { return nt.get(f.getInReady()); };
   auto memKey = [&](pyc::ByteMemOp m) -> std::string {
-    if (auto nameAttr = m->getAttrOfType<StringAttr>("name"))
-      return sanitizeId(nameAttr.getValue());
+    if (auto nameAttr = m.getName())
+      return sanitizeId(*nameAttr);
     return nt.get(m.getRdata());
   };
   llvm::DenseMap<Operation *, std::string> syncMemNMInstName;  // NM names, filled post-sort
   auto syncMemNMKey = [&](pyc::SyncMemNMOp m) -> std::string {
-    if (auto nameAttr = m->getAttrOfType<StringAttr>("name"))
-      return sanitizeId(nameAttr.getValue());
+    if (auto nameAttr = m.getName())
+      return sanitizeId(*nameAttr);
     return m.getRdatas().empty() ? "" : nt.get(*m.getRdatas().begin());
   };
   auto cdcKey = [&](pyc::CdcSyncOp s) { return nt.get(s.getOut()); };
@@ -1768,8 +1768,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     unsigned nmSeq = 0;
     for (auto mem : syncMemNMs) {
       std::string instName = "m" + std::to_string(nmSeq++) + "_inst";
-      if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-        instName = sanitizeId(nameAttr.getValue());
+      if (auto nameAttr = mem.getName())
+        instName = sanitizeId(*nameAttr);
       syncMemNMInstName.try_emplace(mem.getOperation(), instName);
     }
   }
@@ -1869,8 +1869,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                << " (" << callee.getSymName() << ")";
 
       std::string base = "inst";
-      if (auto nameAttr = inst->getAttrOfType<StringAttr>("name"))
-        base = sanitizeId(nameAttr.getValue());
+      if (auto nameAttr = inst.getName())
+        base = sanitizeId(*nameAttr);
       else
         base = sanitizeId(callee.getSymName()) + std::string("_inst");
       std::string seg = base;
@@ -2262,8 +2262,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             for (auto tap : delayTaps) {
               if (tap.getLine() != q)
                 continue;
-              auto d = tap->getAttrOfType<IntegerAttr>("depth");
-              if (d && d.getInt() == tapDepth) {
+              auto d = tap.getDepth();
+              if (d && static_cast<int64_t>(*d) == tapDepth) {
                 matchingTap = tap;
                 break;
               }
@@ -2287,9 +2287,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                             "pyc.loop_id")) {
                       const int64_t raw = idAttr.getValue().getSExtValue();
                       const unsigned dw = bitWidth(srcDelay.getQ().getType());
-                      if (auto da = srcDelay->getAttrOfType<IntegerAttr>("depth")) {
+                      if (auto da = srcDelay.getDepth()) {
                         const int64_t key = raw * 256 +
-                                            da.getValue().getZExtValue();
+                                            *da;
                         if (auto it = delayLoopLines.find(key);
                             it != delayLoopLines.end()) {
                           long lane = 0;
@@ -2432,8 +2432,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         return failure();
 		  for (auto mem : byteMems) {
 		    std::string instName = nt.get(mem.getRdata()) + "_inst";
-		    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-	      instName = sanitizeId(nameAttr.getValue());
+		    if (auto nameAttr = mem.getName())
+	      instName = sanitizeId(*nameAttr);
 	    os << "    reg.addMem(reg_path(\"" << instName << "\"), &" << instName << ", &" << instName
 	       << ".pendingWrite, &" << instName << ".latchedAddr, &" << instName << ".latchedData, &" << instName
 	       << ".latchedStrb);\n";
@@ -2506,27 +2506,25 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     unsigned w = bitWidth(delay.getQ().getType());
     if (w == 0)
       return delay.emitError("invalid delay_line width");
-    auto depthAttr = delay->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
+    auto depth = delay.getDepth();
+    if (!depth)
       return delay.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
     if (isa<VectorType>(delay.getQ().getType()))
-      os << "  pyc::cpp::pycVecDelayLine<" << cppType(delay.getQ().getType()) << ", " << depth << "> *"
+      os << "  pyc::cpp::pycVecDelayLine<" << cppType(delay.getQ().getType()) << ", " << *depth << "> *"
          << nt.get(delay.getQ()) << "_inst = nullptr;\n";
     else
-      os << "  pyc::cpp::pycDelayLine<" << w << ", " << depth << "> *" << nt.get(delay.getQ())
+      os << "  pyc::cpp::pycDelayLine<" << w << ", " << *depth << "> *" << nt.get(delay.getQ())
          << "_inst = nullptr;\n";
   }
   for (auto fifo : fifos) {
     unsigned w = bitWidth(fifo.getOutData().getType());
     if (w == 0)
       return fifo.emitError("invalid fifo width");
-    auto depthAttr = fifo->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
+    auto depth = fifo.getDepth();
+    if (!depth)
       return fifo.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
     std::string instName = nt.get(fifo.getInReady()) + "_inst";
-    os << "  pyc::cpp::pycFifo<" << w << ", " << depth << "> " << instName << ";\n";
+    os << "  pyc::cpp::pycFifo<" << w << ", " << *depth << "> " << instName << ";\n";
     os << "  bool " << instName << "_eval_cache_valid = false;\n";
     os << "  " << cppType(fifo.getInValid().getType()) << " " << instName << "_eval_cache_in_valid{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_valid_ver = 1ull;\n";
@@ -2554,17 +2552,16 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (dataW == 0)
       return mem.emitError("invalid byte_mem data width");
 
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
+    auto depth = mem.getDepth();
+    if (!depth)
       return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
 
     std::string instName = nt.get(mem.getRdata()) + "_inst";
-    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-      instName = sanitizeId(nameAttr.getValue());
+    if (auto nameAttr = mem.getName())
+      instName = sanitizeId(*nameAttr);
     byteMemInstName.try_emplace(mem.getOperation(), instName);
 
-    os << "  pyc::cpp::pycByteMem<" << addrW << ", " << dataW << ", " << depth << "> " << instName << ";\n";
+    os << "  pyc::cpp::pycByteMem<" << addrW << ", " << dataW << ", " << *depth << "> " << instName << ";\n";
     os << "  bool " << instName << "_eval_cache_valid = false;\n";
       os << "  " << cppType(mem.getRaddr().getType()) << " " << instName << "_eval_cache_raddr{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_raddr_ver = 1ull;\n";
@@ -2602,15 +2599,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (dataW == 0)
       return mem.emitError("invalid sync_mem_nm data width");
 
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
+    auto depth = mem.getDepth();
+    if (!depth)
       return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
     unsigned rp = mem.getRens().size();
     unsigned wp = mem.getWvalids().size();
 
     std::string instName = syncMemNMInstName.lookup(mem.getOperation());
-    os << "  pyc::cpp::pycSyncMemNM<" << addrW << ", " << dataW << ", " << depth << ", " << rp
+    os << "  pyc::cpp::pycSyncMemNM<" << addrW << ", " << dataW << ", " << *depth << ", " << rp
        << ", " << wp << ", "
        << (mem.getReadMode() == "old" ? "true" : "false")
        << "> *" << instName << " = nullptr;\n";
@@ -2619,12 +2615,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     unsigned w = bitWidth(fifo.getOutData().getType());
     if (w == 0 || w > 64)
       return fifo.emitError("C++ emitter only supports async_fifo widths 1..64 in the prototype");
-    auto depthAttr = fifo->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
+    auto depth = fifo.getDepth();
+    if (!depth)
       return fifo.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
     std::string instName = nt.get(fifo.getInReady()) + "_inst";
-    os << "  pyc::cpp::pycAsyncFifo<" << w << ", " << depth << "> " << instName << ";\n";
+    os << "  pyc::cpp::pycAsyncFifo<" << w << ", " << *depth << "> " << instName << ";\n";
     os << "  bool " << instName << "_eval_cache_valid = false;\n";
     os << "  " << cppType(fifo.getInRst().getType()) << " " << instName << "_eval_cache_in_rst{};\n";
     os << "  std::uint64_t " << instName << "_eval_cache_in_rst_ver = 1ull;\n";
@@ -2723,7 +2718,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << (firstInit ? " :\n" : ",\n");
     firstInit = false;
     unsigned w = bitWidth(fifo.getOutData().getType());
-    auto depth = fifo->getAttrOfType<IntegerAttr>("depth").getValue().getZExtValue();
+    auto depth = *fifo.getDepth();
     (void)w;
     (void)depth;
     os << "      " << nt.get(fifo.getInReady()) << "_inst(" << nt.get(fifo.getClk()) << ", " << nt.get(fifo.getRst())
@@ -2795,19 +2790,19 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       if (!firstDL)
         os << ", ";
       firstDL = false;
-      auto da = dl->getAttrOfType<IntegerAttr>("depth");
+      auto da = dl.getDepth();
       const unsigned words =
           (bitWidth(dl.getQ().getType()) + 63u) / 64u;
       os << "{" << nt.get(dl.getQ()) << ".data(), " << nt.get(dl.getNext())
          << ".data(), &" << nt.get(dl.getRst()) << ", &" << nt.get(dl.getEn())
          << ", " << nt.get(dl.getInit()) << ".data(), "
-         << da.getValue().getZExtValue() << "u, " << words << "u}";
+         << *da << "u, " << words << "u}";
     }
     os << "});\n";
   }
   for (auto delay : delayLines) {
     unsigned w = bitWidth(delay.getQ().getType());
-    auto depth = delay->getAttrOfType<IntegerAttr>("depth").getValue().getZExtValue();
+    auto depth = *delay.getDepth();
     if (isa<VectorType>(delay.getQ().getType()))
       os << "    " << nt.get(delay.getQ()) << "_inst = new pyc::cpp::pycVecDelayLine<"
          << cppType(delay.getQ().getType()) << ", " << depth << ">(";
@@ -2824,10 +2819,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       return mem.emitError("C++ emitter only supports integer sync_mem_nm types");
     unsigned addrW = addrTy.getWidth();
     unsigned dataW = dataTy.getWidth();
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
+    auto depth = mem.getDepth();
+    if (!depth)
       return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
     unsigned rp = mem.getRens().size();
     unsigned wp = mem.getWvalids().size();
     std::string instName = syncMemNMInstName.lookup(mem.getOperation());
@@ -2847,7 +2841,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_was_" << instName << "[] = {" << joinNames(mem.getWaddrs()) << "};\n";
     os << "      static const pyc::cpp::Wire<" << dataW << "> *const nm_wds_" << instName << "[] = {" << joinNames(mem.getWdatas()) << "};\n";
     os << "      static const pyc::cpp::Wire<" << ((dataW + 7) / 8) << "> *const nm_wss_" << instName << "[] = {" << joinNames(mem.getWstrbs()) << "};\n";
-    os << "      " << instName << " = new pyc::cpp::pycSyncMemNM<" << addrW << ", " << dataW << ", " << depth
+    os << "      " << instName << " = new pyc::cpp::pycSyncMemNM<" << addrW << ", " << dataW << ", " << *depth
        << ", " << rp << ", " << wp << ", "
        << (mem.getReadMode() == "old" ? "true" : "false") << ">("
        << nt.get(mem.getClk()) << ", "
@@ -4165,7 +4159,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   auto emitTapUpdates = [&](llvm::StringRef indent) -> LogicalResult {
     for (auto tap : delayTaps) {
       auto delay = tap.getLine().getDefiningOp<pyc::DelayLineOp>();
-      auto depth = tap->getAttrOfType<IntegerAttr>("depth");
+      auto depth = tap.getDepth();
       if (!delay || !depth)
         return tap.emitError("invalid delay tap source or depth");
       std::string tapExpr;
@@ -4173,11 +4167,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         if (!isa<VectorType>(delay.getQ().getType())) {
           // The tap's own depth indexes the stage, not the loop; the loop
           // key is (clock id, lane depth).
-          if (auto da = delay->getAttrOfType<IntegerAttr>("depth")) {
+          if (auto da = delay.getDepth()) {
             const unsigned w = bitWidth(delay.getQ().getType());
             const int64_t key =
                 idAttr.getValue().getSExtValue() * 256 +
-                da.getValue().getZExtValue();
+                *da;
             auto it = delayLoopLines.find(key);
             if (it != delayLoopLines.end()) {
               long lane = 0;
@@ -4190,14 +4184,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                 tapExpr = "delay_loop_" + std::to_string(key) +
                           ".lane_tap_next<" + std::to_string(w) + ">(" +
                           std::to_string(lane) + "u, " +
-                          std::to_string(depth.getValue().getZExtValue()) + "u)";
+                          std::to_string(*depth) + "u)";
             }
           }
         }
       }
       if (tapExpr.empty())
         tapExpr = nt.get(delay.getQ()) + "_inst->tap_next(" +
-                  std::to_string(depth.getInt()) + "u)";
+                  std::to_string(*depth) + "u)";
       os << indent << nt.get(tap.getTap()) << "_qNext = " << tapExpr << ";\n";
     }
     return success();
