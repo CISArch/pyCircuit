@@ -473,6 +473,28 @@ static void computeUniquePortNames(func::FuncOp f, std::vector<std::string> &inN
   }
 }
 
+// External-module ports carry their names in the ext symbol (the callee has no
+// body), so reuse the same uniquing as generated modules.
+static void computeUniqueExtPortNames(pyc::ExtModuleOp ext,
+                                      std::vector<std::string> &inNames,
+                                      std::vector<std::string> &outNames) {
+  NameTable nt;
+  inNames.clear();
+  outNames.clear();
+  auto ft = ext.getFunctionType();
+  auto nameAt = [&](std::optional<ArrayAttr> names, unsigned i,
+                    llvm::StringRef fallback) {
+    if (names && i < names->size())
+      if (auto s = dyn_cast<StringAttr>((*names)[i]))
+        return sanitizeId(s.getValue());
+    return std::string(fallback) + std::to_string(i);
+  };
+  for (unsigned i = 0; i < ft.getNumInputs(); ++i)
+    inNames.push_back(nt.unique(nameAt(ext.getArgNames(), i, "arg")));
+  for (unsigned i = 0; i < ft.getNumResults(); ++i)
+    outNames.push_back(nt.unique(nameAt(ext.getResultNames(), i, "out")));
+}
+
 enum class SeqStateKind : std::uint8_t {
   Unknown = 0,
   Visiting = 1,
@@ -1580,8 +1602,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   struct InstInfo {
     pyc::InstanceOp op;
     func::FuncOp callee;
+    pyc::ExtModuleOp ext;
     std::string member;
     std::string seg;
+    std::string childType;
     std::vector<std::string> inPorts;
     std::vector<std::string> outPorts;
     std::vector<char> clockOnlyIn;
@@ -1600,40 +1624,52 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
       if (!calleeAttr)
         return inst.emitError("missing required FlatSymbolRefAttr `callee`");
-      auto callee = mod.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
-      if (!callee)
-        return inst.emitError("callee symbol not found: ") << calleeAttr.getValue();
+      // A callee is either a func.func or an opaque pyc.ext_module boundary.
+      pyc::ExtModuleOp ext = mod.lookupSymbol<pyc::ExtModuleOp>(calleeAttr.getValue());
+      func::FuncOp callee;
+      if (!ext) {
+        callee = mod.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
+        if (!callee)
+          return inst.emitError("callee symbol not found: ") << calleeAttr.getValue();
+      }
 
       std::vector<std::string> inPorts;
       std::vector<std::string> outPorts;
-      computeUniquePortNames(callee, inPorts, outPorts);
+      if (ext)
+        computeUniqueExtPortNames(ext, inPorts, outPorts);
+      else
+        computeUniquePortNames(callee, inPorts, outPorts);
       if (inPorts.size() != inst.getNumOperands())
         return inst.emitError("operand count does not match callee signature: inst=")
                << inst.getNumOperands() << ", callee=" << inPorts.size()
-               << " (" << callee.getSymName() << ")";
+               << " (" << calleeAttr.getValue() << ")";
       if (outPorts.size() != inst.getNumResults())
         return inst.emitError("result count does not match callee signature: inst=")
                << inst.getNumResults() << ", callee=" << outPorts.size()
-               << " (" << callee.getSymName() << ")";
+               << " (" << calleeAttr.getValue() << ")";
 
+      std::string childType = sanitizeId(ext ? ext.getSymName() : callee.getSymName());
       std::string base = "inst";
       if (auto nameAttr = inst->getAttrOfType<StringAttr>("name"))
         base = sanitizeId(nameAttr.getValue());
       else
-        base = sanitizeId(callee.getSymName()) + std::string("_inst");
+        base = childType + std::string("_inst");
       std::string seg = base;
       if (auto shortAttr = inst->getAttrOfType<StringAttr>("short_name"))
         seg = sanitizeId(shortAttr.getValue());
       std::string member = nt.unique(base);
 
+      // An external module runs its own edge handling: no clock-only inference.
       std::vector<char> clockOnlyIn(inst.getNumOperands(), 0);
-      for (unsigned i = 0; i < inst.getNumOperands(); ++i)
-        clockOnlyIn[i] =
-            argumentIsClockOnly(callee, i, mod, clockOnlyMemo) ? 1 : 0;
+      if (callee)
+        for (unsigned i = 0; i < inst.getNumOperands(); ++i)
+          clockOnlyIn[i] =
+              argumentIsClockOnly(callee, i, mod, clockOnlyMemo) ? 1 : 0;
 
       unsigned idx = static_cast<unsigned>(instInfos.size());
       instIndex.try_emplace(inst.getOperation(), idx);
-      instInfos.push_back(InstInfo{inst, callee, std::move(member), std::move(seg),
+      instInfos.push_back(InstInfo{inst, callee, ext, std::move(member),
+                                   std::move(seg), std::move(childType),
                                    std::move(inPorts), std::move(outPorts),
                                    std::move(clockOnlyIn)});
     }
@@ -1674,10 +1710,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	  if (!instInfos.empty()) {
 	    os << "  // Sub-modules.\n";
 	    for (const auto &ii : instInfos) {
-	      auto callee = ii.callee;
 	      // Decision 0012: Parent SimObjects own children via unique_ptr.
-	      os << "  std::unique_ptr<" << sanitizeId(callee.getSymName()) << "> " << ii.member
-	         << " = std::make_unique<" << sanitizeId(callee.getSymName()) << ">();\n";
+	      // An external module binds a user class named after the ext symbol.
+	      os << "  std::unique_ptr<" << ii.childType << "> " << ii.member
+	         << " = std::make_unique<" << ii.childType << ">();\n";
 	    }
 	    os << "\n";
 
@@ -1843,8 +1879,27 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       os << "      std::string inst_path = pyc::cpp::shortenInstancePath(full);\n";
       os << "      if (enabledInst(inst_path) && child) child->pyc_trace_vcd(tb, full, enabledInst, enabledSig);\n";
       os << "    };\n";
-      for (const auto &ii : instInfos)
-        os << "    trace_child(" << ii.member << ", \"" << ii.seg << "\");\n";
+      for (const auto &ii : instInfos) {
+        if (!ii.ext) {
+          os << "    trace_child(" << ii.member << ", \"" << ii.seg << "\");\n";
+          continue;
+        }
+        // External black box: its port names live in the IR, so this module
+        // traces them directly instead of calling into the user class.
+        os << "    {\n";
+        os << "      std::string f = prefix + \".\" + \"" << ii.seg << "\";\n";
+        os << "      std::string ip = pyc::cpp::shortenInstancePath(f);\n";
+        os << "      if (enabledInst(ip)) {\n";
+        for (unsigned p = 0; p < ii.inPorts.size() + ii.outPorts.size(); ++p) {
+          const std::string &port = p < ii.inPorts.size()
+                                        ? ii.inPorts[p]
+                                        : ii.outPorts[p - ii.inPorts.size()];
+          os << "        if (enabledSig(ip + \":" << port << "\")) tb.vcdTrace("
+             << ii.member << "->" << port << ", ip + \":" << port << "\");\n";
+        }
+        os << "      }\n";
+        os << "    }\n";
+      }
     }
 	  os << "  }\n\n";
 
@@ -2208,8 +2263,27 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	    os << "      p += seg;\n";
 	    os << "      if (child) child->pyc_register_probes(reg, p);\n";
 	    os << "    };\n";
-	    for (const auto &ii : instInfos)
-	      os << "    reg_child(" << ii.member << ", \"" << ii.seg << "\");\n";
+	    for (const auto &ii : instInfos) {
+	      if (!ii.ext) {
+	        os << "    reg_child(" << ii.member << ", \"" << ii.seg << "\");\n";
+	        continue;
+	      }
+	      // External black box: register its ports from the IR port names.
+	      os << "    {\n";
+	      os << "      std::string p = prefix + \".\" + \"" << ii.seg << "\";\n";
+	      os << "      p = pyc::cpp::shortenInstancePath(p);\n";
+	      auto instOp = ii.op;
+	      unsigned nIn = static_cast<unsigned>(instOp.getNumOperands());
+	      for (unsigned k = 0; k < nIn + instOp.getNumResults(); ++k) {
+	        bool isOut = k >= nIn;
+	        Type ty = isOut ? instOp.getResult(k - nIn).getType()
+	                        : instOp.getOperand(k).getType();
+	        const std::string &port = isOut ? ii.outPorts[k - nIn] : ii.inPorts[k];
+	        os << "    reg.addWire<" << std::max(1u, bitWidth(ty)) << ">(p + \":"
+	           << port << "\", &" << ii.member << "->" << port << ");\n";
+	      }
+	      os << "    }\n";
+	    }
 	  }
       auto probeAliases = probeAliasesForTop(probePlans, f.getSymName());
       if (!probeAliases.empty()) {
@@ -4706,6 +4780,29 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   if (resolveCppParallelInstances(opts.parallelInstances) >= 2)
     os << "#include <cpp/pyc_parallel.hpp>\n";
   os << "\n";
+
+  // User-provided class headers for external modules (docs/external-modules.md):
+  // one include per distinct ext symbol, resolved via the build include dirs.
+  {
+    llvm::StringMap<char> extHeaders;
+    for (auto f0 : module.getOps<func::FuncOp>()) {
+      if (f0.isDeclaration())
+        continue;
+      f0.walk([&](pyc::InstanceOp inst) {
+        auto calleeAttr = inst->getAttrOfType<FlatSymbolRefAttr>("callee");
+        if (!calleeAttr)
+          return;
+        if (!module.lookupSymbol<pyc::ExtModuleOp>(calleeAttr.getValue()))
+          return;
+        std::string extName = sanitizeId(calleeAttr.getValue());
+        if (extHeaders.try_emplace(extName).second)
+          os << "#include \"" << extName << ".hpp\"\n";
+      });
+    }
+    if (!extHeaders.empty())
+      os << "\n";
+  }
+
   os << "namespace pyc::gen {\n\n";
 
   // Emit structs in dependency order so submodule types are defined before use.

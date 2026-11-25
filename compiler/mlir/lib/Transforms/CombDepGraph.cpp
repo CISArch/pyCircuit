@@ -143,6 +143,16 @@ resolveResultTransfer(Operation *op, unsigned resultIndex, ModuleOp module,
     Operation *symbol =
         module ? SymbolTable::lookupSymbolIn(module, calleeAttr.getValue())
                : nullptr;
+    if (dyn_cast_or_null<pyc::ExtModuleOp>(symbol)) {
+      // External black-box boundary (docs/external-modules.md): the result is
+      // combinationally live in the same cycle and depends on every input.
+      transfer.baseDepth = 1;
+      transfer.edgeKind = CombDepEdgeKind::InstancePort;
+      transfer.operandDependencies.reserve(instance.getNumOperands());
+      for (unsigned i = 0; i < instance.getNumOperands(); ++i)
+        transfer.operandDependencies.push_back({i, 1});
+      return transfer;
+    }
     auto callee = dyn_cast_or_null<func::FuncOp>(symbol);
     if (!callee) {
       instance.emitError("pyc.instance callee is not a func.func symbol: ")
