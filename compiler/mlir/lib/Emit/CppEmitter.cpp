@@ -2036,6 +2036,136 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                              byteMems.size() + syncMemNMs.size() +
                              asyncFifos.size() + cdcSyncs.size() &&
          "slot table must cover every sequential component");
+  // Single-phase scheduling (F6). A component may publish in the same pass in
+  // which its readers sample only when every reader sampled before it, so the
+  // schedule runs readers first. Registers are the fusable kind. Reading its
+  // own q is not a cycle (eval() samples before it publishes); a mutual
+  // dependency cannot be ordered and falls back to the two-phase lowering.
+  // Values that tick_sample() already publishes — fused state-loop lanes and
+  // delay taps — are hazards: a reader scheduled after them would sample a
+  // value the two-phase lowering keeps stable until commit.
+  llvm::SmallVector<unsigned> singlePhaseSlots;  // slot indices, readers first
+  if (opts.singlePhase != CppEmitterOptions::SinglePhaseMode::Off && hasState) {
+    llvm::DenseMap<Value, unsigned> regSlotOfQ;
+    for (auto r : regs)
+      regSlotOfQ.try_emplace(r.getQ(), slotIndex.lookup(r.getOperation()));
+    llvm::DenseSet<Value> tickPublished;
+    for (auto tap : delayTaps)
+      tickPublished.insert(tap.getTap());
+    for (int64_t loopId : fusedRegLoopIds)
+      for (pyc::RegOp r : regLoopRegs[loopId])
+        tickPublished.insert(r.getQ());
+
+    // A pyc.assign wire lowered to an alias is read as its driver, so it must
+    // be followed as a live value; a struct wire is written in eval() and is a
+    // stable snapshot during the tick, so it ends the cone like any other
+    // materialized value.
+    llvm::DenseMap<Value, llvm::SmallVector<Value>> wireDrivers;
+    f.walk([&](pyc::AssignOp a) {
+      if (getValueCppStorage(a.getDst()) == CppStorageKind::Alias)
+        wireDrivers[a.getDst()].push_back(a.getSrc());
+    });
+
+    // Fusable registers reachable from the operands of `op`, stopping at any
+    // state element. False when the cone reaches a tick-published value.
+    auto readProducers = [&](Operation *op,
+                             llvm::SmallVectorImpl<unsigned> &out) -> bool {
+      llvm::SmallPtrSet<Operation *, 16> visited;
+      llvm::SmallVector<Value, 16> work(op->getOperands());
+      while (!work.empty()) {
+        Value v = work.pop_back_val();
+        if (stateOutputs.contains(v)) {
+          if (tickPublished.contains(v))
+            return false;
+          auto it = regSlotOfQ.find(v);
+          if (it != regSlotOfQ.end() && it->second != slotIndex.lookup(op))
+            out.push_back(it->second);
+          continue;  // every other state output is published at commit time
+        }
+        if (auto drivers = wireDrivers.find(v); drivers != wireDrivers.end()) {
+          for (Value src : drivers->second)
+            work.push_back(src);
+          continue;
+        }
+        Operation *def = v.getDefiningOp();
+        if (!def)
+          continue;  // module port or block argument
+        if (!visited.insert(def).second)
+          continue;
+        for (Value operand : def->getOperands())
+          work.push_back(operand);
+      }
+      return true;
+    };
+
+    llvm::SmallVector<unsigned> candidates;
+    llvm::SmallVector<llvm::SmallVector<unsigned>> reads;
+    unsigned regSlots = 0;
+    unsigned hazardSkipped = 0;
+    for (unsigned i = 0; i < slots.size(); ++i) {
+      if (slots[i].kind != ComponentKind::Reg)
+        continue;
+      ++regSlots;
+      llvm::SmallVector<unsigned> producers;
+      if (!readProducers(slots[i].op, producers)) {
+        ++hazardSkipped;
+        continue;
+      }
+      candidates.push_back(i);
+      reads.push_back(std::move(producers));
+    }
+
+    unsigned cycleFallback = 0;
+    // Slot index -> position in `candidates`; readers before producers.
+    llvm::DenseMap<unsigned, unsigned> position;
+    for (unsigned ci = 0; ci < candidates.size(); ++ci)
+      position.try_emplace(candidates[ci], ci);
+    llvm::SmallVector<llvm::SmallVector<unsigned>> readersOf(candidates.size());
+    for (unsigned ci = 0; ci < candidates.size(); ++ci)
+      for (unsigned producerSlot : reads[ci])
+        if (auto it = position.find(producerSlot); it != position.end())
+          readersOf[it->second].push_back(ci);
+    llvm::SmallVector<char> ordered(candidates.size(), 0);
+    llvm::SmallVector<char> active(candidates.size(), 1);
+    unsigned remaining = candidates.size();
+    while (remaining) {
+      bool progress = false;
+      for (unsigned ci = 0; ci < candidates.size(); ++ci) {
+        if (!active[ci] || ordered[ci])
+          continue;
+        bool ready = true;
+        for (unsigned reader : readersOf[ci])
+          if (active[reader] && !ordered[reader]) {
+            ready = false;
+            break;
+          }
+        if (!ready)
+          continue;
+        ordered[ci] = 1;
+        --remaining;
+        progress = true;
+        singlePhaseSlots.push_back(candidates[ci]);
+      }
+      if (progress)
+        continue;
+      // Everything still active sits on a dependency cycle: keep it two-phase.
+      for (unsigned ci = 0; ci < candidates.size(); ++ci)
+        if (active[ci] && !ordered[ci]) {
+          active[ci] = 0;
+          --remaining;
+          ++cycleFallback;
+        }
+    }
+    if (std::getenv("PYC_SINGLE_PHASE_STATS"))
+      llvm::errs() << "[single-phase] " << f.getSymName()
+                   << ": regs=" << regSlots
+                   << " fused=" << singlePhaseSlots.size()
+                   << " tick-published-hazard=" << hazardSkipped
+                   << " cycle-fallback=" << cycleFallback << "\n";
+  }
+  llvm::DenseSet<Operation *> singlePhaseOps;
+  for (unsigned i : singlePhaseSlots)
+    singlePhaseOps.insert(slots[i].op);
 
 
 	  if (!instInfos.empty()) {
@@ -4312,6 +4442,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       if (slot.kind != ComponentKind::Reg &&
           slot.kind != ComponentKind::DelayLine)
         continue;
+      if (singlePhaseOps.contains(slot.op))
+        continue;  // single-phase: eval() runs at the end of tick_sample()
       os << indent << slot.member << "." << method << "("
          << (arg ? arg : "") << ");\n";
     }
@@ -4410,6 +4542,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       if (slot.kind != ComponentKind::Reg &&
           slot.kind != ComponentKind::DelayLine)
         continue;
+      if (singlePhaseOps.contains(slot.op))
+        continue;  // single-phase: eval() runs at the end of tick_sample()
       emitStateTickCompute(slot.member, slot.op->getOperands(), "    ",
                            [&](llvm::StringRef indent) {
                              os << indent << slot.member << ".tick_sample();\n";
@@ -4476,6 +4610,21 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
          << ".direct_commit(), _pyc_comb_dirty);\n";
     }
     os << "    }\n";
+  }
+  // Single-phase components publish here: after every two-phase element
+  // sampled its inputs, and in readers-first order, so no sampler can observe
+  // the value the fused publish produces within this pass.
+  for (unsigned slotIdx : singlePhaseSlots) {
+    const ComponentSlot &slot = slots[slotIdx];
+    auto r = cast<pyc::RegOp>(slot.op);
+    emitStateTickCompute(
+        slot.member, slot.op->getOperands(), "    ",
+        [&](llvm::StringRef indent) {
+          os << indent << "if (" << slot.member << ".eval()) {\n";
+          emitMetadataCombFanout(r.getQ(), os, *schedule, combIndex, nt,
+                                 (indent + "  ").str());
+          os << indent << "}\n";
+        });
   }
   if (hasState)
     os << "  }\n\n";
@@ -4601,6 +4750,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     const std::string &key = slot.member;
     std::string changed = "_pyc_commit_changed_" + key;
     if (slot.kind == ComponentKind::Reg) {
+      if (singlePhaseOps.contains(slot.op))
+        continue;  // published by eval() during tick_sample()
       auto r = cast<pyc::RegOp>(slot.op);
       os << "    const bool " << changed << " = " << key
          << ".tick_commit();\n";
