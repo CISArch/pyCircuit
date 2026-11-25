@@ -293,6 +293,17 @@ def PYC_AssignOp : PYC_Op<"assign", [SameTypeOperands, MemoryEffects<[MemWrite]>
   let assemblyFormat = "$dst `,` $src attr-dict `:` type($dst)";
 }
 
+//===----------------------------------------------------------------------===//
+// Component descriptor attributes (read by the emitters)
+//===----------------------------------------------------------------------===//
+
+// Optional so IR emitted before these declarations keeps parsing; the value
+// ranges are checked by the ODS invariants.
+
+def PYC_OptDepthAttr : OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<1>]>>;
+def PYC_OptPortCountAttr
+    : OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<1>, IntMaxValue<64>]>>;
+
 def PYC_RegOp : PYC_Op<"reg", [MemoryEffects<[MemRead, MemWrite]>, AllTypesMatch<["next", "init", "q"]>]> {
   let summary = "Clocked register with reset + enable";
   let arguments = (ins PYC_ClockType:$clk, PYC_ResetType:$rst, I1:$en, AnyIntegerOrV:$next, AnyIntegerOrV:$init);
@@ -305,7 +316,7 @@ def PYC_RegOp : PYC_Op<"reg", [MemoryEffects<[MemRead, MemWrite]>, AllTypesMatch
 // may choose an efficient simulator representation, but retain DEPTH states.
 def PYC_DelayLineOp : PYC_Op<"delay_line", [MemoryEffects<[MemRead, MemWrite]>, AllTypesMatch<["next", "init", "q"]>]> {
   let summary = "Fixed-latency delay line with reset + enable";
-  let arguments = (ins PYC_ClockType:$clk, PYC_ResetType:$rst, I1:$en, AnyIntegerOrV:$next, AnyIntegerOrV:$init);
+  let arguments = (ins PYC_ClockType:$clk, PYC_ResetType:$rst, I1:$en, AnyIntegerOrV:$next, AnyIntegerOrV:$init, PYC_OptDepthAttr:$depth);
   let results = (outs AnyIntegerOrV:$q);
   let hasVerifier = 1;
   let assemblyFormat = "$clk `,` $rst `,` $en `,` $next `,` $init attr-dict `:` type($q)";
@@ -318,7 +329,7 @@ def PYC_DelayTapOp : PYC_Op<"delay_tap",
     [AllTypesMatch<["line", "tap"]>,
      DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Read-only fixed-depth delay-line tap";
-  let arguments = (ins AnyIntegerOrV:$line);
+  let arguments = (ins AnyIntegerOrV:$line, PYC_OptDepthAttr:$depth);
   let results = (outs AnyIntegerOrV:$tap);
   let hasVerifier = 1;
   let assemblyFormat = "$line attr-dict `:` type($tap)";
@@ -326,7 +337,7 @@ def PYC_DelayTapOp : PYC_Op<"delay_tap",
 
 def PYC_FifoOp : PYC_Op<"fifo", [MemoryEffects<[MemRead, MemWrite]>, AllTypesMatch<["in_data", "out_data"]>]> {
   let summary = "Ready/valid FIFO (single-clock, strict handshake)";
-  let arguments = (ins PYC_ClockType:$clk, PYC_ResetType:$rst, I1:$in_valid, AnyInteger:$in_data, I1:$out_ready);
+  let arguments = (ins PYC_ClockType:$clk, PYC_ResetType:$rst, I1:$in_valid, AnyInteger:$in_data, I1:$out_ready, PYC_OptDepthAttr:$depth);
   let results = (outs I1:$in_ready, I1:$out_valid, AnyInteger:$out_data);
   let hasVerifier = 1;
   let assemblyFormat = "$clk `,` $rst `,` $in_valid `,` $in_data `,` $out_ready attr-dict `:` type($in_data)";
@@ -341,7 +352,9 @@ def PYC_ByteMemOp : PYC_Op<"byte_mem", [MemoryEffects<[MemRead, MemWrite]>,
                        I1:$wvalid,
                        AnyInteger:$waddr,
                        AnyInteger:$wdata,
-                       AnyInteger:$wstrb);
+                       AnyInteger:$wstrb,
+                       PYC_OptDepthAttr:$depth,
+                       OptionalAttr<StrAttr>:$name);
   let results = (outs AnyInteger:$rdata);
   let hasVerifier = 1;
   let assemblyFormat = "$clk `,` $raddr `,` $wvalid `,` $waddr `,` $wdata `,` $wstrb attr-dict `:` type($raddr) `,` type($rdata) `,` type($wstrb)";
@@ -356,7 +369,11 @@ def PYC_SyncMemNMOp : PYC_Op<"sync_mem_nm", [MemoryEffects<[MemRead, MemWrite]>,
                         Variadic<AnyInteger>:$wdatas,
                         Variadic<AnyInteger>:$wstrbs,
                         PYC_ClockType:$clk,
-                        DefaultValuedStrAttr<StrAttr, "forward">:$read_mode);
+                        DefaultValuedStrAttr<StrAttr, "forward">:$read_mode,
+                        PYC_OptDepthAttr:$depth,
+                        PYC_OptPortCountAttr:$rd_ports,
+                        PYC_OptPortCountAttr:$wr_ports,
+                        OptionalAttr<StrAttr>:$name);
   let results = (outs Variadic<AnyInteger>:$rdatas);
   let hasVerifier = 1;
 }
@@ -369,7 +386,8 @@ def PYC_AsyncFifoOp : PYC_Op<"async_fifo", [MemoryEffects<[MemRead, MemWrite]>, 
                        PYC_ResetType:$out_rst,
                        I1:$in_valid,
                        AnyInteger:$in_data,
-                       I1:$out_ready);
+                       I1:$out_ready,
+                       PYC_OptDepthAttr:$depth);
   let results = (outs I1:$in_ready, I1:$out_valid, AnyInteger:$out_data);
   let hasVerifier = 1;
   let assemblyFormat = "$in_clk `,` $in_rst `,` $out_clk `,` $out_rst `,` $in_valid `,` $in_data `,` $out_ready attr-dict `:` type($in_data)";

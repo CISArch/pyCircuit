@@ -106,8 +106,7 @@ static void combineStateChains(func::FuncOp function) {
         tail.getLoc(), tail.getQ().getType(), head.getClk(), head.getRst(),
         head.getEn(),
         stripStateAliases(head.getNext()),
-        head.getInit());
-    delay->setAttr("depth", builder.getI64IntegerAttr(depth));
+        head.getInit(), builder.getI64IntegerAttr(depth));
     if (allGenerated)
       delay->setAttr("pyc.generated",
                      builder.getStringAttr("cycle_balance"));
@@ -157,8 +156,8 @@ static void combineStateChains(func::FuncOp function) {
         continue;
       const int64_t tapDepth = static_cast<int64_t>(chainFromTail.size() - i);
       auto tap = builder.create<pyc::DelayTapOp>(
-          tail.getLoc(), delay.getQ().getType(), delay.getQ());
-      tap->setAttr("depth", builder.getI64IntegerAttr(tapDepth));
+          tail.getLoc(), delay.getQ().getType(), delay.getQ(),
+          builder.getI64IntegerAttr(tapDepth));
       tap->setAttr("pyc.optimized_by",
                    builder.getStringAttr("combine_delay_chain_tap"));
       remapStateOpIdentity(builder, reg.getOperation(), tap.getTap());

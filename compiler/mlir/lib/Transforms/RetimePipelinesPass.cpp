@@ -513,8 +513,7 @@ static void rewriteCommonDelayRegion(CommonDelayRegion &region,
   } else {
     auto delay = builder.create<pyc::DelayLineOp>(
         region.root->getLoc(), resultType, key.clk, key.rst, key.en, movedNext,
-        init.getResult());
-    delay->setAttr("depth", builder.getI64IntegerAttr(key.depth));
+        init.getResult(), builder.getI64IntegerAttr(key.depth));
     delay->setAttr("pyc.optimized_by", builder.getStringAttr(kCommonDelaySink));
     replacement = delay.getQ();
   }
@@ -760,8 +759,8 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
   const int64_t depth = static_cast<int64_t>(region.regs.size());
   auto line = lineBuilder.create<pyc::DelayLineOp>(
       head.getLoc(), head.getQ().getType(), head.getClk(), head.getRst(),
-      head.getEn(), head.getNext(), head.getInit());
-  line->setAttr("depth", lineBuilder.getI64IntegerAttr(depth));
+      head.getEn(), head.getNext(), head.getInit(),
+      lineBuilder.getI64IntegerAttr(depth));
   line->setAttr("pyc.optimized_by", lineBuilder.getStringAttr(kRetimedBy));
 
   llvm::SmallVector<llvm::SmallVector<OpOperand *>> externalUses(
@@ -796,8 +795,8 @@ static void rewriteRegion(PipelineRegion &region, RetimeStats &stats) {
     Value source = line.getQ();
     if (tapDepth != depth) {
       auto tap = builder.create<pyc::DelayTapOp>(
-          region.regs[i].getLoc(), head.getQ().getType(), line.getQ());
-      tap->setAttr("depth", builder.getI64IntegerAttr(tapDepth));
+          region.regs[i].getLoc(), head.getQ().getType(), line.getQ(),
+          builder.getI64IntegerAttr(tapDepth));
       tap->setAttr("pyc.optimized_by", builder.getStringAttr(kRetimedBy));
       source = tap.getTap();
       ++stats.tapsCreated;
