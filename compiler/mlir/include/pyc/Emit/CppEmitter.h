@@ -78,6 +78,12 @@ struct CppEmitterOptions {
   // Chunk fused comb helpers to avoid single mega-functions that dominate
   // downstream C++ TU cost even after file sharding.
   unsigned combChunkNodes = kDefaultCombChunkNodes;
+  /// Single-phase scheduling: Off keeps the two-phase tick_sample/tick_commit
+  /// lowering; Auto fuses the registers whose readers all sample before they
+  /// publish; All selects the widest set the analysis can prove, which today
+  /// equals Auto because the graph has no undecidable nodes.
+  enum class SinglePhaseMode { Off, Auto, All };
+  SinglePhaseMode singlePhase = SinglePhaseMode::Auto;
   std::string probePlanPath{};
 };
 

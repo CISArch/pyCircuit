@@ -175,6 +175,15 @@ static llvm::cl::opt<bool> stateLoop(
         "loops (--state-loop=false for the per-object lowering)"),
     llvm::cl::init(true));
 
+static llvm::cl::opt<std::string> cppSinglePhase(
+    "cpp-single-phase",
+    llvm::cl::desc(
+        "Single-phase scheduling for C++ components: off keeps the two-phase "
+        "tick_sample/tick_commit lowering, auto fuses the components whose "
+        "readers cannot observe the published value (default), all selects "
+        "the widest set the analysis can prove (currently the same as auto)"),
+    llvm::cl::init("auto"));
+
 static llvm::cl::opt<std::string> observeNamed(
     "observe-named",
     llvm::cl::desc(
@@ -279,6 +288,25 @@ static llvm::cl::opt<bool> clHierarchical(
     "hierarchical",
     llvm::cl::desc("Preserve module hierarchy: keep pyc.instance boundaries as separate Verilog modules"),
     llvm::cl::init(false));
+
+// Map --cpp-single-phase onto the emitter option; false on a bad value.
+static bool applySinglePhaseMode(pyc::CppEmitterOptions &opts) {
+  if (cppSinglePhase == "off") {
+    opts.singlePhase = pyc::CppEmitterOptions::SinglePhaseMode::Off;
+    return true;
+  }
+  if (cppSinglePhase == "auto") {
+    opts.singlePhase = pyc::CppEmitterOptions::SinglePhaseMode::Auto;
+    return true;
+  }
+  if (cppSinglePhase == "all") {
+    opts.singlePhase = pyc::CppEmitterOptions::SinglePhaseMode::All;
+    return true;
+  }
+  llvm::errs() << "error: --cpp-single-phase must be off|auto|all, got '"
+               << cppSinglePhase << "'\n";
+  return false;
+}
 
 static std::string topSymbol(ModuleOp module) {
   if (auto topAttr = module->getAttrOfType<FlatSymbolRefAttr>("pyc.top"))
@@ -2734,6 +2762,8 @@ int main(int argc, char **argv) {
       llvm::json::Array cppFiles;
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
+      if (!applySinglePhaseMode(cppEmitOpts))
+        return 1;
       cppEmitOpts.probePlanPath = probePlanPath;
 
       // Collect direct dependencies per module for header includes.
@@ -3094,6 +3124,8 @@ int main(int argc, char **argv) {
   }
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
+    if (!applySinglePhaseMode(cppEmitOpts))
+      return 1;
     cppEmitOpts.probePlanPath = probePlanPath;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
