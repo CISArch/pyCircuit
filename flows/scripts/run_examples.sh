@@ -690,12 +690,14 @@ else
       pyc_warn "positive check failed: comb() should delegate to eval()"
       fail=1
     fi
-    if ! grep -q "void top::tick() { tick_compute(); }" "${cpp}"; then
-      pyc_warn "positive check failed: tick() should delegate to tick_compute()"
+    # This fixture is comb-only: F2 deletes its clocked entries, and the phase
+    # API (Decision 0027) survives as a no-op so step() still type-checks.
+    if ! grep -q "void top::tick() { }" "${cpp}"; then
+      pyc_warn "positive check failed: comb-only tick() should be a no-op"
       fail=1
     fi
-    if ! grep -q "void top::transfer() { tick_commit(); }" "${cpp}"; then
-      pyc_warn "positive check failed: transfer() should delegate to tick_commit()"
+    if ! grep -q "void top::transfer() { }" "${cpp}"; then
+      pyc_warn "positive check failed: comb-only transfer() should be a no-op"
       fail=1
     fi
     if ! grep -q "commit();" "${cpp}"; then

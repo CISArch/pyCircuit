@@ -31,7 +31,7 @@ struct Ref {
   inline bool bound() const { return p != nullptr; }
 };
 
-// Root of the simulated component family: leaf primitives and (later) module
+// Root of the simulated component family: leaf primitives and module
 // instances. Deliberately data-free and virtual-free — it carries the shared
 // vocabulary, not behaviour, so generated code can treat every component
 // uniformly without a vtable.
@@ -61,6 +61,35 @@ enum ComponentFlags : std::uint32_t {
   kHasTap = 1u << 2,         // tap()/tap_next()/has_pending() exist
   kIsModule = 1u << 3,       // hierarchical instance (eval + tick + commit)
   kIsCombOnly = 1u << 4,     // stateless module: no tick/commit walk entry
+};
+
+// Root of the hierarchical module family. A module instance is just another
+// component to its parent, so a module exposes the same three entries as a
+// clocked leaf:
+//
+//   eval()         combinational read
+//   tick_sample()  first tick half (detect the edge, stage the next state)
+//   tick_commit()  second tick half; returns the visible change mask
+//
+// The generated class defines the bodies. The base carries the two traits the
+// parent's scheduling decisions read, so "can this instance's outputs change
+// while its inputs are held?" is answered by the instance, not inferred by the
+// parent:
+//
+//   kHasState        the module owns state, directly or through a sub-module.
+//   kStateMayChange  a clock edge can change a visible output with the inputs
+//                    unchanged; false means the module is comb-only and the
+//                    parent keeps no instance eval cache.
+//
+// Defaults are the conservative answer, so a hand-written model (e.g. an
+// external black-box module) is treated as stateful until it says otherwise.
+template <class Derived>
+class ModuleBase : public BaseElement {
+public:
+  using change_mask_t = BaseElement::change_mask_t;
+
+  static constexpr bool kHasState = true;
+  static constexpr bool kStateMayChange = true;
 };
 
 // Clocked single-port element: owns the clock wiring and exposes exactly three
