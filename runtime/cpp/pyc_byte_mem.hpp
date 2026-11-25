@@ -28,15 +28,34 @@ public:
   static_assert((DataWidth % 8) == 0, "pycByteMem requires DataWidth divisible by 8");
   static constexpr unsigned StrbWidth = DataWidth / 8;
 
+  pycByteMem() = default;
   pycByteMem(Wire<1> &clk,
                Wire<AddrWidth> &raddr,
                Wire<DataWidth> &rdata,
                Wire<1> &wvalid,
                Wire<AddrWidth> &waddr,
                Wire<DataWidth> &wdata,
-               Wire<StrbWidth> &wstrb)
-      : ClockedElement<pycByteMem<AddrWidth, DataWidth, DepthBytes>>(clk), raddr(raddr), rdata(rdata), wvalid(wvalid), waddr(waddr), wdata(wdata), wstrb(wstrb),
-        mem_(DepthBytes, 0u) {
+               Wire<StrbWidth> &wstrb) {
+    bind(clk, raddr, rdata, wvalid, waddr, wdata, wstrb);
+  }
+
+  // One-shot wiring (see RegBase::bind): sizes the backing store and publishes
+  // the initial combinational read, as the eager constructor did.
+  void bind(Wire<1> &clk,
+            Wire<AddrWidth> &raddr,
+            Wire<DataWidth> &rdata,
+            Wire<1> &wvalid,
+            Wire<AddrWidth> &waddr,
+            Wire<DataWidth> &wdata,
+            Wire<StrbWidth> &wstrb) {
+    this->bind_clock(clk);
+    this->raddr.set(raddr);
+    this->rdata.set(rdata);
+    this->wvalid.set(wvalid);
+    this->waddr.set(waddr);
+    this->wdata.set(wdata);
+    this->wstrb.set(wstrb);
+    mem_.assign(DepthBytes, 0u);
     eval();
   }
 
@@ -104,7 +123,8 @@ public:
   }
 
   void eval() {
-    std::size_t base = toIndex(raddr);
+    Wire<DataWidth> &rdata = this->rdata.get();
+    std::size_t base = toIndex(this->raddr.get());
     if (evalValid && !dataDirty && base == lastEvalRaddr)
       return;
 
@@ -138,16 +158,17 @@ public:
 
   void tick_sample() {
     pendingWrite = false;
-    if (wvalid.toBool()) {
+    if (this->wvalid.get().toBool()) {
       pendingWrite = true;
-      latchedAddr = toIndex(waddr);
-      latchedData = wdata;
-      latchedStrb = wstrb;
+      latchedAddr = toIndex(this->waddr.get());
+      latchedData = this->wdata.get();
+      latchedStrb = this->wstrb.get();
     }
   }
 
   // Preserves write/watch/eval side effects and reports only a visible rdata change.
   change_mask_t tick_commit() {
+    Wire<DataWidth> &rdata = this->rdata.get();
     const bool hadPendingWrite = pendingWrite;
     const Wire<DataWidth> oldRdata = rdata;
     if (pendingWrite) {
@@ -211,13 +232,13 @@ public:
   }
 
 public:
-  Wire<AddrWidth> &raddr;
-  Wire<DataWidth> &rdata;
+  Ref<Wire<AddrWidth>> raddr;
+  Ref<Wire<DataWidth>> rdata;
 
-  Wire<1> &wvalid;
-  Wire<AddrWidth> &waddr;
-  Wire<DataWidth> &wdata;
-  Wire<StrbWidth> &wstrb;
+  Ref<Wire<1>> wvalid;
+  Ref<Wire<AddrWidth>> waddr;
+  Ref<Wire<DataWidth>> wdata;
+  Ref<Wire<StrbWidth>> wstrb;
 
   bool pendingWrite = false;
   std::size_t latchedAddr = 0;

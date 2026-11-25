@@ -30,6 +30,7 @@ public:
   static_assert(WPorts > 0, "pycSyncMemNM WPorts must be > 0");
   static constexpr unsigned StrbWidth = (DataWidth + 7) / 8;
 
+  pycSyncMemNM() = default;
   pycSyncMemNM(Wire<1> &clk,
                   const Wire<1> *const *rens,
                   const Wire<AddrWidth> *const *raddrs,
@@ -37,8 +38,21 @@ public:
                   const Wire<1> *const *wvalids,
                   const Wire<AddrWidth> *const *waddrs,
                   const Wire<DataWidth> *const *wdatas,
-                  const Wire<StrbWidth> *const *wstrbs)
-      : ClockedElement<pycSyncMemNM<AddrWidth, DataWidth, DepthEntries, RPorts, WPorts, OldData>>(clk) {
+                  const Wire<StrbWidth> *const *wstrbs) {
+    bind(clk, rens, raddrs, rdatas, wvalids, waddrs, wdatas, wstrbs);
+  }
+
+  // One-shot wiring: the generated module declares this as a value member and
+  // binds the port tables in its constructor body (see RegBase::bind).
+  void bind(Wire<1> &clk,
+            const Wire<1> *const *rens,
+            const Wire<AddrWidth> *const *raddrs,
+            Wire<DataWidth> *const *rdatas,
+            const Wire<1> *const *wvalids,
+            const Wire<AddrWidth> *const *waddrs,
+            const Wire<DataWidth> *const *wdatas,
+            const Wire<StrbWidth> *const *wstrbs) {
+    this->bind_clock(clk);
     for (unsigned i = 0; i < RPorts; ++i) {
       ren[i] = rens[i];
       raddr[i] = raddrs[i];
@@ -50,6 +64,11 @@ public:
       wdata[k] = wdatas[k];
       wstrb[k] = wstrbs[k];
     }
+  }
+
+  bool bound() const {
+    return this->clk.bound() && ren[0] && raddr[0] && rdata[0] && wvalid[0] &&
+           waddr[0] && wdata[0] && wstrb[0];
   }
 
   std::uint64_t mem_hash(std::size_t lo = 0, std::size_t hi = (DepthEntries > 0 ? DepthEntries - 1 : 0)) const {

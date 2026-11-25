@@ -1,10 +1,35 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 
 #include "pyc_bits.hpp"
 
 namespace pyc::cpp {
+
+// Late-bound reference to a wire or a peer component.
+//
+// Components are value members of the generated module, and their ports are
+// bound once in the constructor body (C++ cannot re-seat a reference member,
+// so plain references would force the emitter to heap-allocate and take the
+// address at construction). The pointer is only there to make the object
+// default-constructible; nothing virtualizes or type-erases.
+template <class T>
+struct Ref {
+  T *p = nullptr;
+
+  inline T &get() const { return *p; }
+
+  // Used by every component bind(). A missing bind is a wiring bug; the
+  // generated constructor also calls bound() once per component, so the
+  // assertion here is only the first line of defence.
+  inline void set(T &v) {
+    p = &v;
+    assert(p != nullptr);
+  }
+
+  inline bool bound() const { return p != nullptr; }
+};
 
 // Root of the simulated component family: leaf primitives and (later) module
 // instances. Deliberately data-free and virtual-free — it carries the shared
@@ -53,17 +78,20 @@ class ClockedElement : public BaseElement {
 public:
   using change_mask_t = BaseElement::change_mask_t;
 
-  explicit ClockedElement(Wire<1> &clk) : clk(clk) {}
+  ClockedElement() = default;
+  explicit ClockedElement(Wire<1> &clk) { this->clk.set(clk); }
+
+  inline void bind_clock(Wire<1> &c) { this->clk.set(c); }
 
   inline change_mask_t eval() {
-    if (__builtin_expect(!rise(clk.toBool()), 1))
+    if (__builtin_expect(!rise(clk.get().toBool()), 1))
       return 0;
     pending = static_cast<Derived *>(this)->sample();
     return static_cast<Derived *>(this)->tick_commit();
   }
 
   inline void tick_sample() {
-    if (__builtin_expect(!rise(clk.toBool()), 1))
+    if (__builtin_expect(!rise(clk.get().toBool()), 1))
       return;
     pending = static_cast<Derived *>(this)->sample();
   }
@@ -76,7 +104,7 @@ public:
     return isRise;
   }
 
-  Wire<1> &clk;
+  Ref<Wire<1>> clk;
   bool clkPrev = false;
   bool pending = false;
 };

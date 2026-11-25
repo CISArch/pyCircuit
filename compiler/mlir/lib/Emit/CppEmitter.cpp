@@ -645,7 +645,7 @@ static std::string delayTapReadExpr(
       }
     }
   }
-  return inst + "->tap(" + std::to_string(depth) + "u)";
+  return inst + ".tap(" + std::to_string(depth) + "u)";
 }
 
 static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTable &nt,
@@ -1424,20 +1424,23 @@ enum class ComponentKind {
 
 struct ComponentKindTraits {
   llvm::StringRef keyword;  // IR mnemonic without the dialect prefix
-  bool pointerMember;       // member is a pointer: `new` at construction, `->` at use
-  bool memberInitList;      // constructed in the ctor member-initializer list
   bool probeRegistration;   // contributes a reg.addMem(...) probe slot
+  bool boundCheck;          // participates in the ctor's bind-completeness check
 };
 
+// Every kind is a value member of the generated module and is wired by one
+// bind() call in the constructor body, so there is no pointer/value duality
+// and no member-initializer entry left.
+//
 // Indexed by ComponentKind; keep in sync with the enum order.
 static constexpr ComponentKindTraits kComponentTraits[] = {
-    /*Reg*/       {"reg", true, false, false},
-    /*DelayLine*/ {"delay_line", true, false, false},
-    /*Fifo*/      {"fifo", false, true, false},
-    /*ByteMem*/   {"byte_mem", false, true, true},
-    /*SyncMemNM*/ {"sync_mem_nm", true, false, true},
-    /*AsyncFifo*/ {"async_fifo", false, true, false},
-    /*CdcSync*/   {"cdc_sync", false, true, false},
+    /*Reg*/       {"reg", false, true},
+    /*DelayLine*/ {"delay_line", false, true},
+    /*Fifo*/      {"fifo", false, false},
+    /*ByteMem*/   {"byte_mem", true, false},
+    /*SyncMemNM*/ {"sync_mem_nm", true, true},
+    /*AsyncFifo*/ {"async_fifo", false, false},
+    /*CdcSync*/   {"cdc_sync", false, false},
 };
 
 static constexpr unsigned kNumComponentKinds =
@@ -1759,7 +1762,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         }
       }
     }
-    return {inst, inst + "->pending", inst + "->qNext"};
+    return {inst, inst + ".pending", inst + ".qNext"};
   };
   // Probe write-intent binding for a scalar reg: either its pycReg inst
   // (unlooped) or the owning RegLoop's lane storage. Returns the C++ text
@@ -1790,8 +1793,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
               "reinterpret_cast<" + valTy + " *>(" + loop +
                   ".lane_qnext_raw(" + std::to_string(lane) + "u))"};
     }
-    return {nt.get(r.getQ()) + "_inst->pending",
-            nt.get(r.getQ()) + "_inst->qNext"};
+    return {nt.get(r.getQ()) + "_inst.pending",
+            nt.get(r.getQ()) + "_inst.qNext"};
   };
   auto delayKey = [&](pyc::DelayLineOp delay) { return nt.get(delay.getQ()); };
   auto delayTapKey = [&](pyc::DelayTapOp tap) { return nt.get(tap.getTap()); };
@@ -2136,12 +2139,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                 regInst = "&" + dpend;
               }
             } else {
-              regInst = "&" + nt.get(regQ->q) + "_inst->pending";
+              regInst = "&" + nt.get(regQ->q) + "_inst.pending";
             }
             regNext = "&" + nt.get(regQ->tap) + "_qNext";
           } else {
-            regInst = "&" + nt.get(regQ->q) + "_inst->pending";
-            regNext = "&" + nt.get(regQ->q) + "_inst->qNext";
+            regInst = "&" + nt.get(regQ->q) + "_inst.pending";
+            regNext = "&" + nt.get(regQ->q) + "_inst.qNext";
           }
         }
         namedProbes.push_back(NamedProbeInfo{
@@ -2225,10 +2228,10 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 		          srcReg = dyn_cast<pyc::RegOp>(d2);
 		      }
 		      std::string refP, refN;
-		      std::string pendBase = nt.get(source.q) + "_inst->pending";
+		      std::string pendBase = nt.get(source.q) + "_inst.pending";
 		      std::string nextBase = source.tap
 		                                         ? (nt.get(source.tap) + "_qNext")
-		                                         : (nt.get(source.q) + "_inst->qNext");
+		                                         : (nt.get(source.q) + "_inst.qNext");
 		      if (srcReg) {
 		        auto pn = probePendingNext(srcReg);
 		        pendBase = pn.first;
@@ -2309,9 +2312,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         // RegLoop lane bindings when the storage is a looped reg's q: the q
         // wire address is shared with the loop lane, so only pending/qNext
         // switch to the loop accessors.
-        std::string pendText = "&" + inst + "->pending";
-        std::string nextText = "&" + inst + "->qNext";
-        std::string qText = "&" + inst + "->q";
+        std::string pendText = "&" + inst + ".pending";
+        std::string nextText = "&" + inst + ".qNext";
+        std::string qText = "&" + inst + ".q.get()";
         {
           Value qVal = q;
           if (auto *def = qVal.getDefiningOp())
@@ -2410,11 +2413,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             else if (!loopQNext.empty())
               tapWriteNext = loopQNext;
             else
-              tapWriteNext = "&" + inst + "->qNext";
+              tapWriteNext = "&" + inst + ".qNext";
             if (tapViewRef.empty()) {
-              tapViewRef = inst;
+              tapViewRef = "&" + inst;
               if (loopPend.empty())
-                loopPend = "&" + inst + "->pending";
+                loopPend = "&" + inst + ".pending";
             }
             // Looped source delay: register the loop lane directly (tap reads
             // go through DelayLoop::lane_tap), with write-intent from the
@@ -2425,13 +2428,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                 os << "    reg.addDelayLoopTap<" << width << ">(reg_path("
                    << cppStringLiteral(field) << "), " << tapViewRef << ", "
                    << tapLane << ", " << tapDepth << "u, "
-                   << (loopPend.empty() ? ("&" + inst + "->pending") : loopPend)
+                   << (loopPend.empty() ? ("&" + inst + ".pending") : loopPend)
                    << ", " << tapWriteNext << ");\n";
               else
                 os << "    reg.addRegLazyTap<" << width << ">(reg_path("
                    << cppStringLiteral(field) << "), " << tapViewRef << ", "
                    << tapDepth << "u, "
-                   << (loopPend.empty() ? ("&" + inst + "->pending") : loopPend)
+                   << (loopPend.empty() ? ("&" + inst + ".pending") : loopPend)
                    << ", " << tapWriteNext << ");\n";
             } else {
               if (looped)
@@ -2439,14 +2442,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                    << storageWidth << ">(reg_path(" << cppStringLiteral(field)
                    << "), " << tapViewRef << ", " << tapLane << ", "
                    << tapDepth << "u, " << lsb << "u, "
-                   << (loopPend.empty() ? ("&" + inst + "->pending") : loopPend)
+                   << (loopPend.empty() ? ("&" + inst + ".pending") : loopPend)
                    << ", " << tapWriteNext << ");\n";
               else
                 os << "    reg.addRegLazyTapSlice<" << width << ", "
                    << storageWidth << ">(reg_path(" << cppStringLiteral(field)
                    << "), " << tapViewRef << ", " << tapDepth << "u, " << lsb
                    << "u, "
-                   << (loopPend.empty() ? ("&" + inst + "->pending") : loopPend)
+                   << (loopPend.empty() ? ("&" + inst + ".pending") : loopPend)
                    << ", " << tapWriteNext << ");\n";
             }
             continue;
@@ -2529,9 +2532,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
          << ".pendingWrite, &" << slot.member << ".latchedAddr, &" << slot.member << ".latchedData, &" << slot.member
          << ".latchedStrb);\n";
     else
-      os << "    if (" << slot.member << ") reg.addMem(reg_path(\"" << slot.member << "\"), " << slot.member << ", &" << slot.member
-         << "->pendingWrite[0], &" << slot.member << "->latchedWaddr[0], &" << slot.member << "->latchedWdata[0], &" << slot.member
-         << "->latchedWstrb[0]);\n";
+      os << "    reg.addMem(reg_path(\"" << slot.member << "\"), &" << slot.member << ", &" << slot.member
+         << ".pendingWrite[0], &" << slot.member << ".latchedWaddr[0], &" << slot.member << ".latchedWdata[0], &" << slot.member
+         << ".latchedWstrb[0]);\n";
   }
 	  if (!instInfos.empty()) {
 	    os << "    auto reg_child = [&](auto &child, const char *seg) {\n";
@@ -2562,9 +2565,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (w == 0)
       return r.emitError("invalid reg width");
     if (isa<VectorType>(r.getQ().getType()))
-      os << "  pyc::cpp::pycVecReg<" << cppType(r.getQ().getType()) << "> *" << slot.member << " = nullptr;\n";
+      os << "  pyc::cpp::pycVecReg<" << cppType(r.getQ().getType()) << "> " << slot.member << ";\n";
     else
-      os << "  pyc::cpp::pycReg<" << w << "> *" << slot.member << " = nullptr;\n";
+      os << "  pyc::cpp::pycReg<" << w << "> " << slot.member << ";\n";
   }
   for (int64_t loopId : regLoopIds) {
     os << "  pyc::cpp::RegLoop " << regLoopName(loopId) << ";\n";
@@ -2611,11 +2614,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         return delay.emitError("missing integer attribute `depth`");
       auto depth = depthAttr.getValue().getZExtValue();
       if (isa<VectorType>(delay.getQ().getType()))
-        os << "  pyc::cpp::pycVecDelayLine<" << cppType(delay.getQ().getType()) << ", " << depth << "> *"
-           << slot.member << " = nullptr;\n";
+        os << "  pyc::cpp::pycVecDelayLine<" << cppType(delay.getQ().getType()) << ", " << depth << "> "
+           << slot.member << ";\n";
       else
-        os << "  pyc::cpp::pycDelayLine<" << w << ", " << depth << "> *" << slot.member
-           << " = nullptr;\n";
+        os << "  pyc::cpp::pycDelayLine<" << w << ", " << depth << "> " << slot.member
+           << ";\n";
       break;
     }
     case ComponentKind::Fifo: {
@@ -2716,7 +2719,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       os << "  pyc::cpp::pycSyncMemNM<" << addrW << ", " << dataW << ", " << depth << ", " << rp
          << ", " << wp << ", "
          << (mem.getReadMode() == "old" ? "true" : "false")
-         << "> *" << instName << " = nullptr;\n";
+         << "> " << instName << ";\n";
       break;
     }
     case ComponentKind::AsyncFifo: {
@@ -2803,79 +2806,103 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 
   os << "  void _pyc_validate_primitive_bindings() const {\n";
   for (const ComponentSlot &slot : slots) {
-    if (!componentTraits(slot.kind).pointerMember)
+    if (!componentTraits(slot.kind).boundCheck)
       continue;
-    os << "    if (!" << slot.member << ") { std::cerr << \"pyc null "
+    os << "    if (!" << slot.member << ".bound()) { std::cerr << \"pyc null "
        << componentTraits(slot.kind).keyword << " binding: " << slot.member
        << "\" << \"\\n\"; std::abort(); }\n";
   }
   os << "  }\n\n";
 
-  // Constructor (wire members default-initialize to 0).
-  os << "  " << structName << "()";
-  bool firstInit = true;
+  // Constructor (wire members default-initialize to 0). Every component is a
+  // value member of this struct and gets exactly one bind() call here; the
+  // binds come first so no component can be read before it is wired.
+  os << "  " << structName << "() {\n";
   for (const ComponentSlot &slot : slots) {
-    if (!componentTraits(slot.kind).memberInitList)
-      continue;
-    os << (firstInit ? " :\n" : ",\n");
-    firstInit = false;
     switch (slot.kind) {
+    case ComponentKind::Reg: {
+      auto r = cast<pyc::RegOp>(slot.op);
+      os << "    " << slot.member << ".bind(" << nt.get(r.getClk()) << ", "
+         << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
+         << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", "
+         << nt.get(r.getQ()) << ");\n";
+      break;
+    }
+    case ComponentKind::DelayLine: {
+      auto delay = cast<pyc::DelayLineOp>(slot.op);
+      os << "    " << slot.member << ".bind(" << nt.get(delay.getClk()) << ", "
+         << nt.get(delay.getRst()) << ", " << nt.get(delay.getEn()) << ", "
+         << nt.get(delay.getNext()) << ", " << nt.get(delay.getInit()) << ", "
+         << nt.get(delay.getQ()) << ");\n";
+      break;
+    }
     case ComponentKind::Fifo: {
       auto fifo = cast<pyc::FifoOp>(slot.op);
-      os << "      " << slot.member << "(" << nt.get(fifo.getClk()) << ", " << nt.get(fifo.getRst())
+      os << "    " << slot.member << ".bind(" << nt.get(fifo.getClk()) << ", " << nt.get(fifo.getRst())
          << ", " << nt.get(fifo.getInValid()) << ", " << nt.get(fifo.getInReady()) << ", " << nt.get(fifo.getInData())
          << ", " << nt.get(fifo.getOutValid()) << ", " << nt.get(fifo.getOutReady()) << ", " << nt.get(fifo.getOutData())
-         << ")";
+         << ");\n";
       break;
     }
     case ComponentKind::ByteMem: {
       auto mem = cast<pyc::ByteMemOp>(slot.op);
-      os << "      " << slot.member << "(" << nt.get(mem.getClk()) << ", " << nt.get(mem.getRaddr())
+      os << "    " << slot.member << ".bind(" << nt.get(mem.getClk()) << ", " << nt.get(mem.getRaddr())
          << ", " << nt.get(mem.getRdata()) << ", " << nt.get(mem.getWvalid()) << ", " << nt.get(mem.getWaddr()) << ", "
-         << nt.get(mem.getWdata()) << ", " << nt.get(mem.getWstrb()) << ")";
+         << nt.get(mem.getWdata()) << ", " << nt.get(mem.getWstrb()) << ");\n";
       break;
     }
     case ComponentKind::AsyncFifo: {
       auto fifo = cast<pyc::AsyncFifoOp>(slot.op);
-      os << "      " << slot.member << "(" << nt.get(fifo.getInClk()) << ", " << nt.get(fifo.getInRst())
+      os << "    " << slot.member << ".bind(" << nt.get(fifo.getInClk()) << ", " << nt.get(fifo.getInRst())
          << ", " << nt.get(fifo.getInValid()) << ", " << nt.get(fifo.getInReady()) << ", " << nt.get(fifo.getInData())
          << ", " << nt.get(fifo.getOutClk()) << ", " << nt.get(fifo.getOutRst()) << ", " << nt.get(fifo.getOutValid())
-         << ", " << nt.get(fifo.getOutReady()) << ", " << nt.get(fifo.getOutData()) << ")";
+         << ", " << nt.get(fifo.getOutReady()) << ", " << nt.get(fifo.getOutData()) << ");\n";
       break;
     }
     case ComponentKind::CdcSync: {
       auto s = cast<pyc::CdcSyncOp>(slot.op);
-      os << "      " << slot.member << "(" << nt.get(s.getClk()) << ", " << nt.get(s.getRst()) << ", "
-         << nt.get(s.getIn()) << ", " << nt.get(s.getOut()) << ")";
+      os << "    " << slot.member << ".bind(" << nt.get(s.getClk()) << ", " << nt.get(s.getRst()) << ", "
+         << nt.get(s.getIn()) << ", " << nt.get(s.getOut()) << ");\n";
       break;
     }
-    case ComponentKind::Reg:
-    case ComponentKind::DelayLine:
-    case ComponentKind::SyncMemNM:
-      llvm_unreachable("component is not built in the ctor init list");
+    case ComponentKind::SyncMemNM: {
+      auto mem = cast<pyc::SyncMemNMOp>(slot.op);
+      auto addrTy = dyn_cast<IntegerType>(mem.getRaddrs()[0].getType());
+      auto dataTy = dyn_cast<IntegerType>(mem.getRdatas()[0].getType());
+      if (!addrTy || !dataTy)
+        return mem.emitError("C++ emitter only supports integer sync_mem_nm types");
+      unsigned addrW = addrTy.getWidth();
+      unsigned dataW = dataTy.getWidth();
+      const std::string &instName = slot.member;
+      auto joinNames = [&](auto range) {
+        std::string s;
+        for (auto v : range) {
+          if (!s.empty()) s += ", ";
+          s += "&" + nt.get(v);
+        }
+        return s;
+      };
+      os << "    {\n";
+      os << "      static const pyc::cpp::Wire<1> *const nm_rens_" << instName << "[] = {" << joinNames(mem.getRens()) << "};\n";
+      os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_ras_" << instName << "[] = {" << joinNames(mem.getRaddrs()) << "};\n";
+      os << "      pyc::cpp::Wire<" << dataW << "> *const nm_rds_" << instName << "[] = {" << joinNames(mem.getRdatas()) << "};\n";
+      os << "      static const pyc::cpp::Wire<1> *const nm_wvs_" << instName << "[] = {" << joinNames(mem.getWvalids()) << "};\n";
+      os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_was_" << instName << "[] = {" << joinNames(mem.getWaddrs()) << "};\n";
+      os << "      static const pyc::cpp::Wire<" << dataW << "> *const nm_wds_" << instName << "[] = {" << joinNames(mem.getWdatas()) << "};\n";
+      os << "      static const pyc::cpp::Wire<" << ((dataW + 7) / 8) << "> *const nm_wss_" << instName << "[] = {" << joinNames(mem.getWstrbs()) << "};\n";
+      os << "      " << instName << ".bind(" << nt.get(mem.getClk()) << ", "
+         << "nm_rens_" << instName << ", nm_ras_" << instName << ", nm_rds_" << instName << ", "
+         << "nm_wvs_" << instName << ", nm_was_" << instName << ", nm_wds_" << instName << ", nm_wss_" << instName << ");\n";
+      os << "    }\n";
+      break;
+    }
     }
   }
-  os << " {\n";
   if (!combs.empty()) {
     // The only guarantee that every comb runs on its first eval.
     os << "    for (unsigned _pyc_id = 0; _pyc_id < " << combs.size()
        << "u; ++_pyc_id)\n";
     os << "      _pyc_comb_dirty.mark(_pyc_id);\n";
-  }
-  for (const ComponentSlot &slot : slots) {
-    if (slot.kind != ComponentKind::Reg)
-      continue;
-    auto r = cast<pyc::RegOp>(slot.op);
-    unsigned w = bitWidth(r.getQ().getType());
-    if (w == 0)
-      return r.emitError("invalid reg width");
-    if (isa<VectorType>(r.getQ().getType()))
-      os << "    " << slot.member << " = new pyc::cpp::pycVecReg<"
-         << cppType(r.getQ().getType()) << ">(";
-    else
-      os << "    " << slot.member << " = new pyc::cpp::pycReg<" << w << ">(";
-    os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
-       << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
   }
   for (int64_t loopId : regLoopIds) {
     os << "    " << regLoopName(loopId) << ".add_lanes({";
@@ -2909,70 +2936,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
          << da.getValue().getZExtValue() << "u, " << words << "u}";
     }
     os << "});\n";
-  }
-  for (const ComponentSlot &slot : slots) {
-    switch (slot.kind) {
-    case ComponentKind::DelayLine: {
-      auto delay = cast<pyc::DelayLineOp>(slot.op);
-      unsigned w = bitWidth(delay.getQ().getType());
-      auto depth = delay->getAttrOfType<IntegerAttr>("depth").getValue().getZExtValue();
-      if (isa<VectorType>(delay.getQ().getType()))
-        os << "    " << slot.member << " = new pyc::cpp::pycVecDelayLine<"
-           << cppType(delay.getQ().getType()) << ", " << depth << ">(";
-      else
-        os << "    " << slot.member << " = new pyc::cpp::pycDelayLine<" << w << ", " << depth
-           << ">(";
-      os << nt.get(delay.getClk()) << ", " << nt.get(delay.getRst()) << ", " << nt.get(delay.getEn()) << ", "
-         << nt.get(delay.getNext()) << ", " << nt.get(delay.getInit()) << ", " << nt.get(delay.getQ()) << ");\n";
-      break;
-    }
-    case ComponentKind::SyncMemNM: {
-      auto mem = cast<pyc::SyncMemNMOp>(slot.op);
-      auto addrTy = dyn_cast<IntegerType>(mem.getRaddrs()[0].getType());
-      auto dataTy = dyn_cast<IntegerType>(mem.getRdatas()[0].getType());
-      if (!addrTy || !dataTy)
-        return mem.emitError("C++ emitter only supports integer sync_mem_nm types");
-      unsigned addrW = addrTy.getWidth();
-      unsigned dataW = dataTy.getWidth();
-      auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-      if (!depthAttr)
-        return mem.emitError("missing integer attribute `depth`");
-      auto depth = depthAttr.getValue().getZExtValue();
-      unsigned rp = mem.getRens().size();
-      unsigned wp = mem.getWvalids().size();
-      const std::string &instName = slot.member;
-      auto joinNames = [&](auto range) {
-        std::string s;
-        for (auto v : range) {
-          if (!s.empty()) s += ", ";
-          s += "&" + nt.get(v);
-        }
-        return s;
-      };
-      os << "    {\n";
-      os << "      static const pyc::cpp::Wire<1> *const nm_rens_" << instName << "[] = {" << joinNames(mem.getRens()) << "};\n";
-      os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_ras_" << instName << "[] = {" << joinNames(mem.getRaddrs()) << "};\n";
-      os << "      pyc::cpp::Wire<" << dataW << "> *const nm_rds_" << instName << "[] = {" << joinNames(mem.getRdatas()) << "};\n";
-      os << "      static const pyc::cpp::Wire<1> *const nm_wvs_" << instName << "[] = {" << joinNames(mem.getWvalids()) << "};\n";
-      os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_was_" << instName << "[] = {" << joinNames(mem.getWaddrs()) << "};\n";
-      os << "      static const pyc::cpp::Wire<" << dataW << "> *const nm_wds_" << instName << "[] = {" << joinNames(mem.getWdatas()) << "};\n";
-      os << "      static const pyc::cpp::Wire<" << ((dataW + 7) / 8) << "> *const nm_wss_" << instName << "[] = {" << joinNames(mem.getWstrbs()) << "};\n";
-      os << "      " << instName << " = new pyc::cpp::pycSyncMemNM<" << addrW << ", " << dataW << ", " << depth
-         << ", " << rp << ", " << wp << ", "
-         << (mem.getReadMode() == "old" ? "true" : "false") << ">("
-         << nt.get(mem.getClk()) << ", "
-         << "nm_rens_" << instName << ", nm_ras_" << instName << ", nm_rds_" << instName << ", "
-         << "nm_wvs_" << instName << ", nm_was_" << instName << ", nm_wds_" << instName << ", nm_wss_" << instName << ");\n";
-      os << "    }\n";
-      break;
-    }
-    case ComponentKind::Reg:
-    case ComponentKind::Fifo:
-    case ComponentKind::ByteMem:
-    case ComponentKind::AsyncFifo:
-    case ComponentKind::CdcSync:
-      break;  // built elsewhere
-    }
   }
   os << "    _pyc_validate_primitive_bindings();\n";
   os << "    _pyc_init_runtime_controls();\n";
@@ -4279,7 +4242,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       if (slot.kind != ComponentKind::Reg &&
           slot.kind != ComponentKind::DelayLine)
         continue;
-      os << indent << slot.member << "->" << method << "("
+      os << indent << slot.member << "." << method << "("
          << (arg ? arg : "") << ");\n";
     }
   };
@@ -4317,7 +4280,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         }
       }
       if (tapExpr.empty())
-        tapExpr = nt.get(delay.getQ()) + "_inst->tap_next(" +
+        tapExpr = nt.get(delay.getQ()) + "_inst.tap_next(" +
                   std::to_string(depth.getInt()) + "u)";
       os << indent << nt.get(tap.getTap()) << "_qNext = " << tapExpr << ";\n";
     }
@@ -4379,7 +4342,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
         continue;
       emitStateTickCompute(slot.member, slot.op->getOperands(), "    ",
                            [&](llvm::StringRef indent) {
-                             os << indent << slot.member << "->tick_sample();\n";
+                             os << indent << slot.member << ".tick_sample();\n";
                            });
     }
     for (int64_t dbk : delayLoopIds) {
@@ -4397,11 +4360,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (slot.kind == ComponentKind::Reg ||
         slot.kind == ComponentKind::DelayLine)
       continue;  // sampled above, before the delay loops
-    const char *arrow = componentTraits(slot.kind).pointerMember ? "->" : ".";
     emitStateTickCompute(slot.member, slot.op->getOperands(), "    ",
                          [&](llvm::StringRef indent) {
-                           os << indent << slot.member << arrow
-                              << "tick_sample();\n";
+                           os << indent << slot.member << ".tick_sample();\n";
                          });
   }
   if (!fusedRegLoopIds.empty()) {
@@ -4569,7 +4530,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (slot.kind == ComponentKind::Reg) {
       auto r = cast<pyc::RegOp>(slot.op);
       os << "    const bool " << changed << " = " << key
-         << "->tick_commit();\n";
+         << ".tick_commit();\n";
       emitCommitWake(changed, r.getQ());
       continue;
     }
@@ -4579,9 +4540,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     // enabled edge shifts every tap) even when the tail repeats.
     std::string advanced = "_pyc_commit_advanced_" + key;
     os << "    const bool " << advanced << " = " << key
-       << "->has_pending();\n";
+       << ".has_pending();\n";
     os << "    const bool " << changed << " = " << key
-       << "->tick_commit();\n";
+       << ".tick_commit();\n";
     emitCommitWake(changed, delay.getQ());
     for (auto tap : delayTaps) {
       if (tap.getLine() != delay.getQ())
@@ -4624,9 +4585,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     case ComponentKind::SyncMemNM: {
       auto mem = cast<pyc::SyncMemNMOp>(slot.op);
       os << "    const auto " << changed << " = " << key
-         << "->tick_commit();\n";
+         << ".tick_commit();\n";
       for (auto [i, rd] : llvm::enumerate(mem.getRdatas()))
-        emitCommitWake(changed + " & (std::remove_reference_t<decltype(*" + key +
+        emitCommitWake(changed + " & (std::remove_reference_t<decltype(" + key +
                            ")>::change_mask_t{1} << " + std::to_string(i) + ")",
                        rd);
       break;

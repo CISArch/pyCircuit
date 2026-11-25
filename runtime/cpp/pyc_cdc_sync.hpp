@@ -17,21 +17,35 @@ class CdcBase : public ClockedElement<CdcBase<ValT, Stages>> {
   static_assert(Stages >= 1, "CdcBase requires Stages >= 1");
 
 public:
-  CdcBase(Wire<1> &clk, Wire<1> &rst, ValT &in, ValT &out)
-      : Base(clk), rst(rst), in(in), out(out) {
+  CdcBase() = default;
+  CdcBase(Wire<1> &clk, Wire<1> &rst, ValT &in, ValT &out) {
+    bind(clk, rst, in, out);
+  }
+
+  // One-shot wiring (see RegBase::bind): clears the pipeline and the visible
+  // output, as the eager constructor did.
+  void bind(Wire<1> &clk, Wire<1> &rst, ValT &in, ValT &out) {
+    this->bind_clock(clk);
+    this->rst.set(rst);
+    this->in.set(in);
+    this->out.set(out);
     for (auto &e : pipe_)
       e = ValT(0);
-    out = ValT(0);
+    this->out.get() = ValT(0);
+  }
+
+  bool bound() const {
+    return this->clk.bound() && rst.bound() && in.bound() && out.bound();
   }
 
   // Every destination-clock edge is pending: the pipeline always advances.
   bool sample() {
-    if (rst.toBool()) {
+    if (this->rst.get().toBool()) {
       for (auto &e : pipeNext_)
         e = ValT(0);
       return true;
     }
-    pipeNext_[0] = in;
+    pipeNext_[0] = this->in.get();
     for (unsigned i = 1; i < Stages; i++)
       pipeNext_[i] = pipe_[i - 1];
     return true;
@@ -43,15 +57,16 @@ public:
       return 0;
     for (unsigned i = 0; i < Stages; i++)
       pipe_[i] = pipeNext_[i];
+    ValT &out = this->out.get();
     const bool changed = out != pipe_[Stages - 1];
     out = pipe_[Stages - 1];
     this->pending = false;
     return changed ? Base::kChanged : change_mask_t{0};
   }
 
-  Wire<1> &rst;
-  ValT &in;
-  ValT &out;
+  Ref<Wire<1>> rst;
+  Ref<ValT> in;
+  Ref<ValT> out;
 
 private:
   std::array<ValT, Stages> pipe_{};

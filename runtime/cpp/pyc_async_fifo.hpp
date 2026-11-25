@@ -43,6 +43,7 @@ public:
   static constexpr change_mask_t kOutValidChanged = change_mask_t{1} << 1;
   static constexpr change_mask_t kOutDataChanged = change_mask_t{1} << 2;
 
+  pycAsyncFifo() = default;
   pycAsyncFifo(Wire<1> &in_clk,
                  Wire<1> &in_rst,
                  Wire<1> &in_valid,
@@ -52,14 +53,41 @@ public:
                  Wire<1> &out_rst,
                  Wire<1> &out_valid,
                  Wire<1> &out_ready,
-                 Wire<Width> &out_data)
-      : in_clk(in_clk), in_rst(in_rst), in_valid(in_valid), in_ready(in_ready), in_data(in_data), out_clk(out_clk),
-        out_rst(out_rst), out_valid(out_valid), out_ready(out_ready), out_data(out_data) {
+                 Wire<Width> &out_data) {
+    bind(in_clk, in_rst, in_valid, in_ready, in_data, out_clk, out_rst,
+         out_valid, out_ready, out_data);
+  }
+
+  // One-shot wiring (see RegBase::bind): clears the storage and publishes the
+  // initial combinational ready/valid state, as the eager constructor did.
+  void bind(Wire<1> &in_clk,
+            Wire<1> &in_rst,
+            Wire<1> &in_valid,
+            Wire<1> &in_ready,
+            Wire<Width> &in_data,
+            Wire<1> &out_clk,
+            Wire<1> &out_rst,
+            Wire<1> &out_valid,
+            Wire<1> &out_ready,
+            Wire<Width> &out_data) {
+    this->in_clk.set(in_clk);
+    this->in_rst.set(in_rst);
+    this->in_valid.set(in_valid);
+    this->in_ready.set(in_ready);
+    this->in_data.set(in_data);
+    this->out_clk.set(out_clk);
+    this->out_rst.set(out_rst);
+    this->out_valid.set(out_valid);
+    this->out_ready.set(out_ready);
+    this->out_data.set(out_data);
     resetState();
     eval();
   }
 
   void eval() {
+    Wire<1> &in_ready = this->in_ready.get();
+    Wire<1> &out_valid = this->out_valid.get();
+    Wire<Width> &out_data = this->out_data.get();
     if (evalValid_ && lastEvalWfull_ == wfull_ && lastEvalOutValid_ == out_valid_r_ && lastEvalOutData_ == out_data_r_)
       return;
     in_ready = Wire<1>(wfull_ ? 0u : 1u);
@@ -75,11 +103,11 @@ public:
     pendingIn_ = false;
     pendingOut_ = false;
 
-    bool inClkNow = in_clk.toBool();
+    bool inClkNow = this->in_clk.get().toBool();
     bool inPosedge = (!inClkPrev_) && inClkNow;
     inClkPrev_ = inClkNow;
 
-    bool outClkNow = out_clk.toBool();
+    bool outClkNow = this->out_clk.get().toBool();
     bool outPosedge = (!outClkPrev_) && outClkNow;
     outClkPrev_ = outClkNow;
 
@@ -91,6 +119,9 @@ public:
 
   // Commits both clock domains and identifies each externally visible change.
   change_mask_t tick_commit() {
+    Wire<1> &in_ready = this->in_ready.get();
+    Wire<1> &out_valid = this->out_valid.get();
+    Wire<Width> &out_data = this->out_data.get();
     const Wire<1> oldInReady = in_ready;
     const Wire<1> oldOutValid = out_valid;
     const Wire<Width> oldOutData = out_data;
@@ -164,7 +195,7 @@ private:
     writeAddr_ = 0;
     writeData_ = Wire<Width>(0);
 
-    if (in_rst.toBool()) {
+    if (this->in_rst.get().toBool()) {
       wptr_bin_next_ = 0;
       wptr_gray_next_ = 0;
       wfull_next_ = false;
@@ -178,12 +209,12 @@ private:
     rptr_gray_w2_next_ = rptr_gray_w1_;
 
     bool canPush = !wfull_;
-    bool do_push = in_valid.toBool() && canPush;
+    bool do_push = this->in_valid.get().toBool() && canPush;
 
     if (do_push) {
       doWrite_ = true;
       writeAddr_ = wptr_bin_ & indexMask();
-      writeData_ = in_data;
+      writeData_ = this->in_data.get();
     }
 
     ptr_t wptr_bin_inc = (wptr_bin_ + (do_push ? 1u : 0u)) & ptrMask();
@@ -216,7 +247,7 @@ private:
     out_valid_r_next_ = out_valid_r_;
     out_data_r_next_ = out_data_r_;
 
-    if (out_rst.toBool()) {
+    if (this->out_rst.get().toBool()) {
       rptr_bin_next_ = 0;
       rptr_gray_next_ = 0;
       wptr_gray_r1_next_ = 0;
@@ -240,7 +271,7 @@ private:
       return;
     }
 
-    bool do_pop = out_valid_r_ && out_ready.toBool();
+    bool do_pop = out_valid_r_ && this->out_ready.get().toBool();
     if (!do_pop)
       return;
 
@@ -271,17 +302,17 @@ private:
   }
 
 public:
-  Wire<1> &in_clk;
-  Wire<1> &in_rst;
-  Wire<1> &in_valid;
-  Wire<1> &in_ready;
-  Wire<Width> &in_data;
+  Ref<Wire<1>> in_clk;
+  Ref<Wire<1>> in_rst;
+  Ref<Wire<1>> in_valid;
+  Ref<Wire<1>> in_ready;
+  Ref<Wire<Width>> in_data;
 
-  Wire<1> &out_clk;
-  Wire<1> &out_rst;
-  Wire<1> &out_valid;
-  Wire<1> &out_ready;
-  Wire<Width> &out_data;
+  Ref<Wire<1>> out_clk;
+  Ref<Wire<1>> out_rst;
+  Ref<Wire<1>> out_valid;
+  Ref<Wire<1>> out_ready;
+  Ref<Wire<Width>> out_data;
 
 private:
   std::array<Wire<Width>, Depth> mem_{};
