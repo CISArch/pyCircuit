@@ -1401,6 +1401,61 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
   return success();
 }
 
+// ---------------------------------------------------------------------------
+// Component slot table (F1).
+//
+// Each sequential leaf used to keep its own llvm::SmallVector, and every
+// emission phase walked them with one loop per kind (declaration, construction,
+// tick, commit, probe registration, ...). The slot table holds one entry per
+// emitted component in the order those phases expect (kind groups in emission
+// order, original order inside a group), so a phase is a single walk plus a
+// switch over the kind. A new kind touches the enum, its traits row and the
+// switches; the walks stay.
+// ---------------------------------------------------------------------------
+enum class ComponentKind {
+  Reg,
+  DelayLine,
+  Fifo,
+  ByteMem,
+  SyncMemNM,
+  AsyncFifo,
+  CdcSync
+};
+
+struct ComponentKindTraits {
+  llvm::StringRef keyword;  // IR mnemonic without the dialect prefix
+  bool pointerMember;       // member is a pointer: `new` at construction, `->` at use
+  bool memberInitList;      // constructed in the ctor member-initializer list
+  bool probeRegistration;   // contributes a reg.addMem(...) probe slot
+};
+
+// Indexed by ComponentKind; keep in sync with the enum order.
+static constexpr ComponentKindTraits kComponentTraits[] = {
+    /*Reg*/       {"reg", true, false, false},
+    /*DelayLine*/ {"delay_line", true, false, false},
+    /*Fifo*/      {"fifo", false, true, false},
+    /*ByteMem*/   {"byte_mem", false, true, true},
+    /*SyncMemNM*/ {"sync_mem_nm", true, false, true},
+    /*AsyncFifo*/ {"async_fifo", false, true, false},
+    /*CdcSync*/   {"cdc_sync", false, true, false},
+};
+
+static constexpr unsigned kNumComponentKinds =
+    sizeof(kComponentTraits) / sizeof(kComponentTraits[0]);
+static_assert(kNumComponentKinds ==
+                  static_cast<unsigned>(ComponentKind::CdcSync) + 1,
+              "kComponentTraits must have one row per ComponentKind");
+
+static const ComponentKindTraits &componentTraits(ComponentKind kind) {
+  return kComponentTraits[static_cast<unsigned>(kind)];
+}
+
+struct ComponentSlot {
+  ComponentKind kind;
+  Operation *op;
+  std::string member;  // C++ member/instance name
+};
+
 static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
                               const CppEmitterOptions &opts,
                               const ObservationPlans &probePlans) {
@@ -1746,7 +1801,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       return sanitizeId(nameAttr.getValue());
     return nt.get(m.getRdata());
   };
-  llvm::DenseMap<Operation *, std::string> syncMemNMInstName;  // NM names, filled post-sort
   auto syncMemNMKey = [&](pyc::SyncMemNMOp m) -> std::string {
     if (auto nameAttr = m->getAttrOfType<StringAttr>("name"))
       return sanitizeId(nameAttr.getValue());
@@ -1764,15 +1818,6 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   std::sort(fifos.begin(), fifos.end(), [&](pyc::FifoOp a, pyc::FifoOp b) { return fifoKey(a) < fifoKey(b); });
   std::sort(byteMems.begin(), byteMems.end(), [&](pyc::ByteMemOp a, pyc::ByteMemOp b) { return memKey(a) < memKey(b); });
   std::sort(syncMemNMs.begin(), syncMemNMs.end(), [&](pyc::SyncMemNMOp a, pyc::SyncMemNMOp b) { return syncMemNMKey(a) < syncMemNMKey(b); });
-  {
-    unsigned nmSeq = 0;
-    for (auto mem : syncMemNMs) {
-      std::string instName = "m" + std::to_string(nmSeq++) + "_inst";
-      if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-        instName = sanitizeId(nameAttr.getValue());
-      syncMemNMInstName.try_emplace(mem.getOperation(), instName);
-    }
-  }
   std::sort(cdcSyncs.begin(), cdcSyncs.end(), [&](pyc::CdcSyncOp a, pyc::CdcSyncOp b) { return cdcKey(a) < cdcKey(b); });
   auto scheduleSlot = [&](Operation *op) -> uint64_t {
     if (!op || op->getNumResults() == 0)
@@ -1921,7 +1966,53 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             (packedWords >= kPackedInstanceCacheWordThreshold));
   };
 
-  llvm::DenseMap<Operation *, std::string> byteMemInstName;
+  // Component slots (F1): one entry per emitted sequential leaf, in the kind
+  // group order every emission phase below walks.
+  llvm::SmallVector<ComponentSlot> slots;
+  llvm::DenseMap<Operation *, unsigned> slotIndex;
+  auto addSlot = [&](ComponentKind kind, Operation *op, std::string member) {
+    slotIndex.try_emplace(op, static_cast<unsigned>(slots.size()));
+    slots.push_back(ComponentSlot{kind, op, std::move(member)});
+  };
+  for (auto r : regs)
+    addSlot(ComponentKind::Reg, r.getOperation(), nt.get(r.getQ()) + "_inst");
+  for (auto delay : delayLines)
+    addSlot(ComponentKind::DelayLine, delay.getOperation(),
+            nt.get(delay.getQ()) + "_inst");
+  for (auto fifo : fifos)
+    addSlot(ComponentKind::Fifo, fifo.getOperation(),
+            nt.get(fifo.getInReady()) + "_inst");
+  for (auto mem : byteMems) {
+    std::string instName = nt.get(mem.getRdata()) + "_inst";
+    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
+      instName = sanitizeId(nameAttr.getValue());
+    addSlot(ComponentKind::ByteMem, mem.getOperation(), std::move(instName));
+  }
+  {
+    unsigned nmSeq = 0;
+    for (auto mem : syncMemNMs) {
+      std::string instName = "m" + std::to_string(nmSeq++) + "_inst";
+      if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
+        instName = sanitizeId(nameAttr.getValue());
+      addSlot(ComponentKind::SyncMemNM, mem.getOperation(), std::move(instName));
+    }
+  }
+  for (auto fifo : asyncFifos)
+    addSlot(ComponentKind::AsyncFifo, fifo.getOperation(),
+            nt.get(fifo.getInReady()) + "_inst");
+  for (auto sync : cdcSyncs)
+    addSlot(ComponentKind::CdcSync, sync.getOperation(),
+            nt.get(sync.getOut()) + "_inst");
+  auto memberOf = [&](Operation *op) -> std::string {
+    auto it = slotIndex.find(op);
+    assert(it != slotIndex.end() && "component op missing from the slot table");
+    return slots[it->second].member;
+  };
+  assert(slots.size() == regs.size() + delayLines.size() + fifos.size() +
+                             byteMems.size() + syncMemNMs.size() +
+                             asyncFifos.size() + cdcSyncs.size() &&
+         "slot table must cover every sequential component");
+
 
 	  if (!instInfos.empty()) {
 	    os << "  // Sub-modules.\n";
@@ -2430,20 +2521,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       });
       if (lazyWireFailed)
         return failure();
-		  for (auto mem : byteMems) {
-		    std::string instName = nt.get(mem.getRdata()) + "_inst";
-		    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-	      instName = sanitizeId(nameAttr.getValue());
-	    os << "    reg.addMem(reg_path(\"" << instName << "\"), &" << instName << ", &" << instName
-	       << ".pendingWrite, &" << instName << ".latchedAddr, &" << instName << ".latchedData, &" << instName
-	       << ".latchedStrb);\n";
-	  }
-	  for (auto mem : syncMemNMs) {
-	    std::string instName = syncMemNMInstName.lookup(mem.getOperation());
-	    os << "    if (" << instName << ") reg.addMem(reg_path(\"" << instName << "\"), " << instName << ", &" << instName
-	       << "->pendingWrite[0], &" << instName << "->latchedWaddr[0], &" << instName << "->latchedWdata[0], &" << instName
-	       << "->latchedWstrb[0]);\n";
-	  }
+  for (const ComponentSlot &slot : slots) {
+    if (!componentTraits(slot.kind).probeRegistration)
+      continue;
+    if (slot.kind == ComponentKind::ByteMem)
+      os << "    reg.addMem(reg_path(\"" << slot.member << "\"), &" << slot.member << ", &" << slot.member
+         << ".pendingWrite, &" << slot.member << ".latchedAddr, &" << slot.member << ".latchedData, &" << slot.member
+         << ".latchedStrb);\n";
+    else
+      os << "    if (" << slot.member << ") reg.addMem(reg_path(\"" << slot.member << "\"), " << slot.member << ", &" << slot.member
+         << "->pendingWrite[0], &" << slot.member << "->latchedWaddr[0], &" << slot.member << "->latchedWdata[0], &" << slot.member
+         << "->latchedWstrb[0]);\n";
+  }
 	  if (!instInfos.empty()) {
 	    os << "    auto reg_child = [&](auto &child, const char *seg) {\n";
 	    os << "      std::string p = prefix;\n";
@@ -2463,14 +2552,19 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       }
 	  os << "  }\n\n";
 
-	  for (auto r : regs) {
-	    unsigned w = bitWidth(r.getQ().getType());
-	    if (w == 0)
-	      return r.emitError("invalid reg width");
+  // Declarations: one walk over the slot table. The state loops are declared
+  // between the per-reg members and the remaining components.
+  for (const ComponentSlot &slot : slots) {
+    if (slot.kind != ComponentKind::Reg)
+      continue;
+    auto r = cast<pyc::RegOp>(slot.op);
+    unsigned w = bitWidth(r.getQ().getType());
+    if (w == 0)
+      return r.emitError("invalid reg width");
     if (isa<VectorType>(r.getQ().getType()))
-      os << "  pyc::cpp::pycVecReg<" << cppType(r.getQ().getType()) << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
+      os << "  pyc::cpp::pycVecReg<" << cppType(r.getQ().getType()) << "> *" << slot.member << " = nullptr;\n";
     else
-      os << "  pyc::cpp::pycReg<" << w << "> *" << nt.get(r.getQ()) << "_inst = nullptr;\n";
+      os << "  pyc::cpp::pycReg<" << w << "> *" << slot.member << " = nullptr;\n";
   }
   for (int64_t loopId : regLoopIds) {
     os << "  pyc::cpp::RegLoop " << regLoopName(loopId) << ";\n";
@@ -2502,160 +2596,176 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "  bool _pyc_seq_armed = false;\n";
     os << "  bool _pyc_commit_needed = false;\n";
   }
-  for (auto delay : delayLines) {
-    unsigned w = bitWidth(delay.getQ().getType());
-    if (w == 0)
-      return delay.emitError("invalid delay_line width");
-    auto depthAttr = delay->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return delay.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-    if (isa<VectorType>(delay.getQ().getType()))
-      os << "  pyc::cpp::pycVecDelayLine<" << cppType(delay.getQ().getType()) << ", " << depth << "> *"
-         << nt.get(delay.getQ()) << "_inst = nullptr;\n";
-    else
-      os << "  pyc::cpp::pycDelayLine<" << w << ", " << depth << "> *" << nt.get(delay.getQ())
-         << "_inst = nullptr;\n";
-  }
-  for (auto fifo : fifos) {
-    unsigned w = bitWidth(fifo.getOutData().getType());
-    if (w == 0)
-      return fifo.emitError("invalid fifo width");
-    auto depthAttr = fifo->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return fifo.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-    std::string instName = nt.get(fifo.getInReady()) + "_inst";
-    os << "  pyc::cpp::pycFifo<" << w << ", " << depth << "> " << instName << ";\n";
-    os << "  bool " << instName << "_eval_cache_valid = false;\n";
-    os << "  " << cppType(fifo.getInValid().getType()) << " " << instName << "_eval_cache_in_valid{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_valid_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_valid_seen_ver = 0ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_valid_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getInData().getType()) << " " << instName << "_eval_cache_in_data{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_data_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_data_seen_ver = 0ull;\n";
-    if (w <= 64)
-      os << "  std::uint64_t " << instName << "_eval_cache_in_data_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getOutReady().getType()) << " " << instName << "_eval_cache_out_ready{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_out_ready_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_out_ready_seen_ver = 0ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_out_ready_fp = 0ull;\n";
-  }
-  for (auto mem : byteMems) {
-    auto addrTy = dyn_cast<IntegerType>(mem.getRaddr().getType());
-    auto dataTy = dyn_cast<IntegerType>(mem.getRdata().getType());
-    if (!addrTy || !dataTy)
-      return mem.emitError("C++ emitter only supports integer byte_mem types");
-    unsigned addrW = addrTy.getWidth();
-    unsigned dataW = dataTy.getWidth();
-    if (addrW == 0)
-      return mem.emitError("invalid byte_mem addr width");
-    if (dataW == 0)
-      return mem.emitError("invalid byte_mem data width");
+  // Remaining component members, still in slot order (kind groups).
+  for (const ComponentSlot &slot : slots) {
+    switch (slot.kind) {
+    case ComponentKind::Reg:
+      break;  // declared above, before the state loops
+    case ComponentKind::DelayLine: {
+      auto delay = cast<pyc::DelayLineOp>(slot.op);
+      unsigned w = bitWidth(delay.getQ().getType());
+      if (w == 0)
+        return delay.emitError("invalid delay_line width");
+      auto depthAttr = delay->getAttrOfType<IntegerAttr>("depth");
+      if (!depthAttr)
+        return delay.emitError("missing integer attribute `depth`");
+      auto depth = depthAttr.getValue().getZExtValue();
+      if (isa<VectorType>(delay.getQ().getType()))
+        os << "  pyc::cpp::pycVecDelayLine<" << cppType(delay.getQ().getType()) << ", " << depth << "> *"
+           << slot.member << " = nullptr;\n";
+      else
+        os << "  pyc::cpp::pycDelayLine<" << w << ", " << depth << "> *" << slot.member
+           << " = nullptr;\n";
+      break;
+    }
+    case ComponentKind::Fifo: {
+      auto fifo = cast<pyc::FifoOp>(slot.op);
+      unsigned w = bitWidth(fifo.getOutData().getType());
+      if (w == 0)
+        return fifo.emitError("invalid fifo width");
+      auto depthAttr = fifo->getAttrOfType<IntegerAttr>("depth");
+      if (!depthAttr)
+        return fifo.emitError("missing integer attribute `depth`");
+      auto depth = depthAttr.getValue().getZExtValue();
+      const std::string &instName = slot.member;
+      os << "  pyc::cpp::pycFifo<" << w << ", " << depth << "> " << instName << ";\n";
+      os << "  bool " << instName << "_eval_cache_valid = false;\n";
+      os << "  " << cppType(fifo.getInValid().getType()) << " " << instName << "_eval_cache_in_valid{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_valid_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_valid_seen_ver = 0ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_valid_fp = 0ull;\n";
+      os << "  " << cppType(fifo.getInData().getType()) << " " << instName << "_eval_cache_in_data{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_data_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_data_seen_ver = 0ull;\n";
+      if (w <= 64)
+        os << "  std::uint64_t " << instName << "_eval_cache_in_data_fp = 0ull;\n";
+      os << "  " << cppType(fifo.getOutReady().getType()) << " " << instName << "_eval_cache_out_ready{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_out_ready_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_out_ready_seen_ver = 0ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_out_ready_fp = 0ull;\n";
+      break;
+    }
+    case ComponentKind::ByteMem: {
+      auto mem = cast<pyc::ByteMemOp>(slot.op);
+      auto addrTy = dyn_cast<IntegerType>(mem.getRaddr().getType());
+      auto dataTy = dyn_cast<IntegerType>(mem.getRdata().getType());
+      if (!addrTy || !dataTy)
+        return mem.emitError("C++ emitter only supports integer byte_mem types");
+      unsigned addrW = addrTy.getWidth();
+      unsigned dataW = dataTy.getWidth();
+      if (addrW == 0)
+        return mem.emitError("invalid byte_mem addr width");
+      if (dataW == 0)
+        return mem.emitError("invalid byte_mem data width");
 
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
+      auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
+      if (!depthAttr)
+        return mem.emitError("missing integer attribute `depth`");
+      auto depth = depthAttr.getValue().getZExtValue();
 
-    std::string instName = nt.get(mem.getRdata()) + "_inst";
-    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
-      instName = sanitizeId(nameAttr.getValue());
-    byteMemInstName.try_emplace(mem.getOperation(), instName);
+      const std::string &instName = slot.member;
 
-    os << "  pyc::cpp::pycByteMem<" << addrW << ", " << dataW << ", " << depth << "> " << instName << ";\n";
-    os << "  bool " << instName << "_eval_cache_valid = false;\n";
+      os << "  pyc::cpp::pycByteMem<" << addrW << ", " << dataW << ", " << depth << "> " << instName << ";\n";
+      os << "  bool " << instName << "_eval_cache_valid = false;\n";
       os << "  " << cppType(mem.getRaddr().getType()) << " " << instName << "_eval_cache_raddr{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_raddr_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_raddr_seen_ver = 0ull;\n";
-    if (addrW <= 64)
-      os << "  std::uint64_t " << instName << "_eval_cache_raddr_fp = 0ull;\n";
-    os << "  " << cppType(mem.getWvalid().getType()) << " " << instName << "_eval_cache_wvalid{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_wvalid_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_wvalid_seen_ver = 0ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_wvalid_fp = 0ull;\n";
-    os << "  " << cppType(mem.getWaddr().getType()) << " " << instName << "_eval_cache_waddr{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_waddr_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_waddr_seen_ver = 0ull;\n";
-    if (addrW <= 64)
-      os << "  std::uint64_t " << instName << "_eval_cache_waddr_fp = 0ull;\n";
-    os << "  " << cppType(mem.getWdata().getType()) << " " << instName << "_eval_cache_wdata{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_wdata_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_wdata_seen_ver = 0ull;\n";
-    if (dataW <= 64)
-      os << "  std::uint64_t " << instName << "_eval_cache_wdata_fp = 0ull;\n";
-    os << "  " << cppType(mem.getWstrb().getType()) << " " << instName << "_eval_cache_wstrb{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_wstrb_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_wstrb_seen_ver = 0ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_wstrb_fp = 0ull;\n";
-  }
-  for (auto mem : syncMemNMs) {
-    auto addrTy = dyn_cast<IntegerType>(mem.getRaddrs()[0].getType());
-    auto dataTy = dyn_cast<IntegerType>(mem.getRdatas()[0].getType());
-    if (!addrTy || !dataTy)
-      return mem.emitError("C++ emitter only supports integer sync_mem_nm types");
-    unsigned addrW = addrTy.getWidth();
-    unsigned dataW = dataTy.getWidth();
-    if (addrW == 0)
-      return mem.emitError("invalid sync_mem_nm addr width");
-    if (dataW == 0)
-      return mem.emitError("invalid sync_mem_nm data width");
+      os << "  std::uint64_t " << instName << "_eval_cache_raddr_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_raddr_seen_ver = 0ull;\n";
+      if (addrW <= 64)
+        os << "  std::uint64_t " << instName << "_eval_cache_raddr_fp = 0ull;\n";
+      os << "  " << cppType(mem.getWvalid().getType()) << " " << instName << "_eval_cache_wvalid{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_wvalid_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_wvalid_seen_ver = 0ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_wvalid_fp = 0ull;\n";
+      os << "  " << cppType(mem.getWaddr().getType()) << " " << instName << "_eval_cache_waddr{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_waddr_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_waddr_seen_ver = 0ull;\n";
+      if (addrW <= 64)
+        os << "  std::uint64_t " << instName << "_eval_cache_waddr_fp = 0ull;\n";
+      os << "  " << cppType(mem.getWdata().getType()) << " " << instName << "_eval_cache_wdata{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_wdata_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_wdata_seen_ver = 0ull;\n";
+      if (dataW <= 64)
+        os << "  std::uint64_t " << instName << "_eval_cache_wdata_fp = 0ull;\n";
+      os << "  " << cppType(mem.getWstrb().getType()) << " " << instName << "_eval_cache_wstrb{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_wstrb_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_wstrb_seen_ver = 0ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_wstrb_fp = 0ull;\n";
+      break;
+    }
+    case ComponentKind::SyncMemNM: {
+      auto mem = cast<pyc::SyncMemNMOp>(slot.op);
+      auto addrTy = dyn_cast<IntegerType>(mem.getRaddrs()[0].getType());
+      auto dataTy = dyn_cast<IntegerType>(mem.getRdatas()[0].getType());
+      if (!addrTy || !dataTy)
+        return mem.emitError("C++ emitter only supports integer sync_mem_nm types");
+      unsigned addrW = addrTy.getWidth();
+      unsigned dataW = dataTy.getWidth();
+      if (addrW == 0)
+        return mem.emitError("invalid sync_mem_nm addr width");
+      if (dataW == 0)
+        return mem.emitError("invalid sync_mem_nm data width");
 
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-    unsigned rp = mem.getRens().size();
-    unsigned wp = mem.getWvalids().size();
+      auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
+      if (!depthAttr)
+        return mem.emitError("missing integer attribute `depth`");
+      auto depth = depthAttr.getValue().getZExtValue();
+      unsigned rp = mem.getRens().size();
+      unsigned wp = mem.getWvalids().size();
 
-    std::string instName = syncMemNMInstName.lookup(mem.getOperation());
-    os << "  pyc::cpp::pycSyncMemNM<" << addrW << ", " << dataW << ", " << depth << ", " << rp
-       << ", " << wp << ", "
-       << (mem.getReadMode() == "old" ? "true" : "false")
-       << "> *" << instName << " = nullptr;\n";
-  }
-  for (auto fifo : asyncFifos) {
-    unsigned w = bitWidth(fifo.getOutData().getType());
-    if (w == 0 || w > 64)
-      return fifo.emitError("C++ emitter only supports async_fifo widths 1..64 in the prototype");
-    auto depthAttr = fifo->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return fifo.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-    std::string instName = nt.get(fifo.getInReady()) + "_inst";
-    os << "  pyc::cpp::pycAsyncFifo<" << w << ", " << depth << "> " << instName << ";\n";
-    os << "  bool " << instName << "_eval_cache_valid = false;\n";
-    os << "  " << cppType(fifo.getInRst().getType()) << " " << instName << "_eval_cache_in_rst{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_rst_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_rst_seen_ver = 0ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_rst_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getOutRst().getType()) << " " << instName << "_eval_cache_out_rst{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_out_rst_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_out_rst_seen_ver = 0ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_out_rst_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getInValid().getType()) << " " << instName << "_eval_cache_in_valid{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_valid_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_valid_seen_ver = 0ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_valid_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getInData().getType()) << " " << instName << "_eval_cache_in_data{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_data_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_in_data_seen_ver = 0ull;\n";
-    if (w <= 64)
-      os << "  std::uint64_t " << instName << "_eval_cache_in_data_fp = 0ull;\n";
-    os << "  " << cppType(fifo.getOutReady().getType()) << " " << instName << "_eval_cache_out_ready{};\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_out_ready_ver = 1ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_out_ready_seen_ver = 0ull;\n";
-    os << "  std::uint64_t " << instName << "_eval_cache_out_ready_fp = 0ull;\n";
-  }
-  for (auto s : cdcSyncs) {
-    unsigned w = bitWidth(s.getOut().getType());
-    if (w == 0 || w > 64)
-      return s.emitError("C++ emitter only supports cdc_sync widths 1..64 in the prototype");
-    std::uint64_t stages = 2;
-    if (auto st = s->getAttrOfType<IntegerAttr>("stages"))
-      stages = st.getValue().getZExtValue();
-    os << "  pyc::cpp::pycCdcSync<" << w << ", " << stages << "> " << nt.get(s.getOut()) << "_inst;\n";
+      const std::string &instName = slot.member;
+      os << "  pyc::cpp::pycSyncMemNM<" << addrW << ", " << dataW << ", " << depth << ", " << rp
+         << ", " << wp << ", "
+         << (mem.getReadMode() == "old" ? "true" : "false")
+         << "> *" << instName << " = nullptr;\n";
+      break;
+    }
+    case ComponentKind::AsyncFifo: {
+      auto fifo = cast<pyc::AsyncFifoOp>(slot.op);
+      unsigned w = bitWidth(fifo.getOutData().getType());
+      if (w == 0 || w > 64)
+        return fifo.emitError("C++ emitter only supports async_fifo widths 1..64 in the prototype");
+      auto depthAttr = fifo->getAttrOfType<IntegerAttr>("depth");
+      if (!depthAttr)
+        return fifo.emitError("missing integer attribute `depth`");
+      auto depth = depthAttr.getValue().getZExtValue();
+      const std::string &instName = slot.member;
+      os << "  pyc::cpp::pycAsyncFifo<" << w << ", " << depth << "> " << instName << ";\n";
+      os << "  bool " << instName << "_eval_cache_valid = false;\n";
+      os << "  " << cppType(fifo.getInRst().getType()) << " " << instName << "_eval_cache_in_rst{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_rst_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_rst_seen_ver = 0ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_rst_fp = 0ull;\n";
+      os << "  " << cppType(fifo.getOutRst().getType()) << " " << instName << "_eval_cache_out_rst{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_out_rst_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_out_rst_seen_ver = 0ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_out_rst_fp = 0ull;\n";
+      os << "  " << cppType(fifo.getInValid().getType()) << " " << instName << "_eval_cache_in_valid{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_valid_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_valid_seen_ver = 0ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_valid_fp = 0ull;\n";
+      os << "  " << cppType(fifo.getInData().getType()) << " " << instName << "_eval_cache_in_data{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_data_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_in_data_seen_ver = 0ull;\n";
+      if (w <= 64)
+        os << "  std::uint64_t " << instName << "_eval_cache_in_data_fp = 0ull;\n";
+      os << "  " << cppType(fifo.getOutReady().getType()) << " " << instName << "_eval_cache_out_ready{};\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_out_ready_ver = 1ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_out_ready_seen_ver = 0ull;\n";
+      os << "  std::uint64_t " << instName << "_eval_cache_out_ready_fp = 0ull;\n";
+      break;
+    }
+    case ComponentKind::CdcSync: {
+      auto s = cast<pyc::CdcSyncOp>(slot.op);
+      unsigned w = bitWidth(s.getOut().getType());
+      if (w == 0 || w > 64)
+        return s.emitError("C++ emitter only supports cdc_sync widths 1..64 in the prototype");
+      std::uint64_t stages = 2;
+      if (auto st = s->getAttrOfType<IntegerAttr>("stages"))
+        stages = st.getValue().getZExtValue();
+      os << "  pyc::cpp::pycCdcSync<" << w << ", " << stages << "> " << slot.member << ";\n";
+      break;
+    }
+    }
   }
   auto emitTickSnapshotDecls = [&](llvm::StringRef key,
                                    OperandRange operands) {
@@ -2667,23 +2777,12 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   os << "\n  // State-source snapshots used by dirty tick_compute.\n";
   for (const auto &ii : instInfos)
     emitTickSnapshotDecls(ii.member, ii.op->getOperands());
-  for (auto r : regs)
-    emitTickSnapshotDecls(nt.get(r.getQ()) + "_inst", r->getOperands());
-  for (auto fifo : fifos)
-    emitTickSnapshotDecls(nt.get(fifo.getInReady()) + "_inst",
-                          fifo->getOperands());
-  for (auto mem : byteMems)
-    emitTickSnapshotDecls(byteMemInstName.lookup(mem.getOperation()),
-                          mem->getOperands());
-  for (auto mem : syncMemNMs)
-    emitTickSnapshotDecls(syncMemNMInstName.lookup(mem.getOperation()),
-                          mem->getOperands());
-  for (auto fifo : asyncFifos)
-    emitTickSnapshotDecls(nt.get(fifo.getInReady()) + "_inst",
-                          fifo->getOperands());
-  for (auto sync : cdcSyncs)
-    emitTickSnapshotDecls(nt.get(sync.getOut()) + "_inst",
-                          sync->getOperands());
+  for (const ComponentSlot &slot : slots) {
+    // Delay lines are snapshotted through their taps, not as components.
+    if (slot.kind == ComponentKind::DelayLine)
+      continue;
+    emitTickSnapshotDecls(slot.member, slot.op->getOperands());
+  }
   os << "\n";
 
   os << "  bool _pyc_sim_fast_enable = false;\n";
@@ -2703,15 +2802,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   os << "  }\n\n";
 
   os << "  void _pyc_validate_primitive_bindings() const {\n";
-  for (auto r : regs)
-    os << "    if (!" << nt.get(r.getQ()) << "_inst) { std::cerr << \"pyc null reg binding: " << nt.get(r.getQ())
-       << "_inst\" << \"\\n\"; std::abort(); }\n";
-  for (auto delay : delayLines)
-    os << "    if (!" << nt.get(delay.getQ()) << "_inst) { std::cerr << \"pyc null delay_line binding: "
-       << nt.get(delay.getQ()) << "_inst\" << \"\\n\"; std::abort(); }\n";
-  for (auto mem : syncMemNMs) {
-    std::string instName = syncMemNMInstName.lookup(mem.getOperation());
-    os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem_nm binding: " << instName
+  for (const ComponentSlot &slot : slots) {
+    if (!componentTraits(slot.kind).pointerMember)
+      continue;
+    os << "    if (!" << slot.member << ") { std::cerr << \"pyc null "
+       << componentTraits(slot.kind).keyword << " binding: " << slot.member
        << "\" << \"\\n\"; std::abort(); }\n";
   }
   os << "  }\n\n";
@@ -2719,39 +2814,46 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // Constructor (wire members default-initialize to 0).
   os << "  " << structName << "()";
   bool firstInit = true;
-  for (auto fifo : fifos) {
+  for (const ComponentSlot &slot : slots) {
+    if (!componentTraits(slot.kind).memberInitList)
+      continue;
     os << (firstInit ? " :\n" : ",\n");
     firstInit = false;
-    unsigned w = bitWidth(fifo.getOutData().getType());
-    auto depth = fifo->getAttrOfType<IntegerAttr>("depth").getValue().getZExtValue();
-    (void)w;
-    (void)depth;
-    os << "      " << nt.get(fifo.getInReady()) << "_inst(" << nt.get(fifo.getClk()) << ", " << nt.get(fifo.getRst())
-       << ", " << nt.get(fifo.getInValid()) << ", " << nt.get(fifo.getInReady()) << ", " << nt.get(fifo.getInData())
-       << ", " << nt.get(fifo.getOutValid()) << ", " << nt.get(fifo.getOutReady()) << ", " << nt.get(fifo.getOutData())
-       << ")";
-  }
-  for (auto mem : byteMems) {
-    os << (firstInit ? " :\n" : ",\n");
-    firstInit = false;
-    std::string instName = byteMemInstName.lookup(mem.getOperation());
-    os << "      " << instName << "(" << nt.get(mem.getClk()) << ", " << nt.get(mem.getRaddr())
-       << ", " << nt.get(mem.getRdata()) << ", " << nt.get(mem.getWvalid()) << ", " << nt.get(mem.getWaddr()) << ", "
-       << nt.get(mem.getWdata()) << ", " << nt.get(mem.getWstrb()) << ")";
-  }
-  for (auto fifo : asyncFifos) {
-    os << (firstInit ? " :\n" : ",\n");
-    firstInit = false;
-    os << "      " << nt.get(fifo.getInReady()) << "_inst(" << nt.get(fifo.getInClk()) << ", " << nt.get(fifo.getInRst())
-       << ", " << nt.get(fifo.getInValid()) << ", " << nt.get(fifo.getInReady()) << ", " << nt.get(fifo.getInData())
-       << ", " << nt.get(fifo.getOutClk()) << ", " << nt.get(fifo.getOutRst()) << ", " << nt.get(fifo.getOutValid())
-       << ", " << nt.get(fifo.getOutReady()) << ", " << nt.get(fifo.getOutData()) << ")";
-  }
-  for (auto s : cdcSyncs) {
-    os << (firstInit ? " :\n" : ",\n");
-    firstInit = false;
-    os << "      " << nt.get(s.getOut()) << "_inst(" << nt.get(s.getClk()) << ", " << nt.get(s.getRst()) << ", "
-       << nt.get(s.getIn()) << ", " << nt.get(s.getOut()) << ")";
+    switch (slot.kind) {
+    case ComponentKind::Fifo: {
+      auto fifo = cast<pyc::FifoOp>(slot.op);
+      os << "      " << slot.member << "(" << nt.get(fifo.getClk()) << ", " << nt.get(fifo.getRst())
+         << ", " << nt.get(fifo.getInValid()) << ", " << nt.get(fifo.getInReady()) << ", " << nt.get(fifo.getInData())
+         << ", " << nt.get(fifo.getOutValid()) << ", " << nt.get(fifo.getOutReady()) << ", " << nt.get(fifo.getOutData())
+         << ")";
+      break;
+    }
+    case ComponentKind::ByteMem: {
+      auto mem = cast<pyc::ByteMemOp>(slot.op);
+      os << "      " << slot.member << "(" << nt.get(mem.getClk()) << ", " << nt.get(mem.getRaddr())
+         << ", " << nt.get(mem.getRdata()) << ", " << nt.get(mem.getWvalid()) << ", " << nt.get(mem.getWaddr()) << ", "
+         << nt.get(mem.getWdata()) << ", " << nt.get(mem.getWstrb()) << ")";
+      break;
+    }
+    case ComponentKind::AsyncFifo: {
+      auto fifo = cast<pyc::AsyncFifoOp>(slot.op);
+      os << "      " << slot.member << "(" << nt.get(fifo.getInClk()) << ", " << nt.get(fifo.getInRst())
+         << ", " << nt.get(fifo.getInValid()) << ", " << nt.get(fifo.getInReady()) << ", " << nt.get(fifo.getInData())
+         << ", " << nt.get(fifo.getOutClk()) << ", " << nt.get(fifo.getOutRst()) << ", " << nt.get(fifo.getOutValid())
+         << ", " << nt.get(fifo.getOutReady()) << ", " << nt.get(fifo.getOutData()) << ")";
+      break;
+    }
+    case ComponentKind::CdcSync: {
+      auto s = cast<pyc::CdcSyncOp>(slot.op);
+      os << "      " << slot.member << "(" << nt.get(s.getClk()) << ", " << nt.get(s.getRst()) << ", "
+         << nt.get(s.getIn()) << ", " << nt.get(s.getOut()) << ")";
+      break;
+    }
+    case ComponentKind::Reg:
+    case ComponentKind::DelayLine:
+    case ComponentKind::SyncMemNM:
+      llvm_unreachable("component is not built in the ctor init list");
+    }
   }
   os << " {\n";
   if (!combs.empty()) {
@@ -2760,15 +2862,18 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
        << "u; ++_pyc_id)\n";
     os << "      _pyc_comb_dirty.mark(_pyc_id);\n";
   }
-  for (auto r : regs) {
+  for (const ComponentSlot &slot : slots) {
+    if (slot.kind != ComponentKind::Reg)
+      continue;
+    auto r = cast<pyc::RegOp>(slot.op);
     unsigned w = bitWidth(r.getQ().getType());
     if (w == 0)
       return r.emitError("invalid reg width");
     if (isa<VectorType>(r.getQ().getType()))
-      os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pycVecReg<"
+      os << "    " << slot.member << " = new pyc::cpp::pycVecReg<"
          << cppType(r.getQ().getType()) << ">(";
     else
-      os << "    " << nt.get(r.getQ()) << "_inst = new pyc::cpp::pycReg<" << w << ">(";
+      os << "    " << slot.member << " = new pyc::cpp::pycReg<" << w << ">(";
     os << nt.get(r.getClk()) << ", " << nt.get(r.getRst()) << ", " << nt.get(r.getEn()) << ", "
        << nt.get(r.getNext()) << ", " << nt.get(r.getInit()) << ", " << nt.get(r.getQ()) << ");\n";
   }
@@ -2805,55 +2910,69 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
     os << "});\n";
   }
-  for (auto delay : delayLines) {
-    unsigned w = bitWidth(delay.getQ().getType());
-    auto depth = delay->getAttrOfType<IntegerAttr>("depth").getValue().getZExtValue();
-    if (isa<VectorType>(delay.getQ().getType()))
-      os << "    " << nt.get(delay.getQ()) << "_inst = new pyc::cpp::pycVecDelayLine<"
-         << cppType(delay.getQ().getType()) << ", " << depth << ">(";
-    else
-      os << "    " << nt.get(delay.getQ()) << "_inst = new pyc::cpp::pycDelayLine<" << w << ", " << depth
-         << ">(";
-    os << nt.get(delay.getClk()) << ", " << nt.get(delay.getRst()) << ", " << nt.get(delay.getEn()) << ", "
-       << nt.get(delay.getNext()) << ", " << nt.get(delay.getInit()) << ", " << nt.get(delay.getQ()) << ");\n";
-  }
-  for (auto mem : syncMemNMs) {
-    auto addrTy = dyn_cast<IntegerType>(mem.getRaddrs()[0].getType());
-    auto dataTy = dyn_cast<IntegerType>(mem.getRdatas()[0].getType());
-    if (!addrTy || !dataTy)
-      return mem.emitError("C++ emitter only supports integer sync_mem_nm types");
-    unsigned addrW = addrTy.getWidth();
-    unsigned dataW = dataTy.getWidth();
-    auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
-    if (!depthAttr)
-      return mem.emitError("missing integer attribute `depth`");
-    auto depth = depthAttr.getValue().getZExtValue();
-    unsigned rp = mem.getRens().size();
-    unsigned wp = mem.getWvalids().size();
-    std::string instName = syncMemNMInstName.lookup(mem.getOperation());
-    auto joinNames = [&](auto range) {
-      std::string s;
-      for (auto v : range) {
-        if (!s.empty()) s += ", ";
-        s += "&" + nt.get(v);
-      }
-      return s;
-    };
-    os << "    {\n";
-    os << "      static const pyc::cpp::Wire<1> *const nm_rens_" << instName << "[] = {" << joinNames(mem.getRens()) << "};\n";
-    os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_ras_" << instName << "[] = {" << joinNames(mem.getRaddrs()) << "};\n";
-    os << "      pyc::cpp::Wire<" << dataW << "> *const nm_rds_" << instName << "[] = {" << joinNames(mem.getRdatas()) << "};\n";
-    os << "      static const pyc::cpp::Wire<1> *const nm_wvs_" << instName << "[] = {" << joinNames(mem.getWvalids()) << "};\n";
-    os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_was_" << instName << "[] = {" << joinNames(mem.getWaddrs()) << "};\n";
-    os << "      static const pyc::cpp::Wire<" << dataW << "> *const nm_wds_" << instName << "[] = {" << joinNames(mem.getWdatas()) << "};\n";
-    os << "      static const pyc::cpp::Wire<" << ((dataW + 7) / 8) << "> *const nm_wss_" << instName << "[] = {" << joinNames(mem.getWstrbs()) << "};\n";
-    os << "      " << instName << " = new pyc::cpp::pycSyncMemNM<" << addrW << ", " << dataW << ", " << depth
-       << ", " << rp << ", " << wp << ", "
-       << (mem.getReadMode() == "old" ? "true" : "false") << ">("
-       << nt.get(mem.getClk()) << ", "
-       << "nm_rens_" << instName << ", nm_ras_" << instName << ", nm_rds_" << instName << ", "
-       << "nm_wvs_" << instName << ", nm_was_" << instName << ", nm_wds_" << instName << ", nm_wss_" << instName << ");\n";
-    os << "    }\n";
+  for (const ComponentSlot &slot : slots) {
+    switch (slot.kind) {
+    case ComponentKind::DelayLine: {
+      auto delay = cast<pyc::DelayLineOp>(slot.op);
+      unsigned w = bitWidth(delay.getQ().getType());
+      auto depth = delay->getAttrOfType<IntegerAttr>("depth").getValue().getZExtValue();
+      if (isa<VectorType>(delay.getQ().getType()))
+        os << "    " << slot.member << " = new pyc::cpp::pycVecDelayLine<"
+           << cppType(delay.getQ().getType()) << ", " << depth << ">(";
+      else
+        os << "    " << slot.member << " = new pyc::cpp::pycDelayLine<" << w << ", " << depth
+           << ">(";
+      os << nt.get(delay.getClk()) << ", " << nt.get(delay.getRst()) << ", " << nt.get(delay.getEn()) << ", "
+         << nt.get(delay.getNext()) << ", " << nt.get(delay.getInit()) << ", " << nt.get(delay.getQ()) << ");\n";
+      break;
+    }
+    case ComponentKind::SyncMemNM: {
+      auto mem = cast<pyc::SyncMemNMOp>(slot.op);
+      auto addrTy = dyn_cast<IntegerType>(mem.getRaddrs()[0].getType());
+      auto dataTy = dyn_cast<IntegerType>(mem.getRdatas()[0].getType());
+      if (!addrTy || !dataTy)
+        return mem.emitError("C++ emitter only supports integer sync_mem_nm types");
+      unsigned addrW = addrTy.getWidth();
+      unsigned dataW = dataTy.getWidth();
+      auto depthAttr = mem->getAttrOfType<IntegerAttr>("depth");
+      if (!depthAttr)
+        return mem.emitError("missing integer attribute `depth`");
+      auto depth = depthAttr.getValue().getZExtValue();
+      unsigned rp = mem.getRens().size();
+      unsigned wp = mem.getWvalids().size();
+      const std::string &instName = slot.member;
+      auto joinNames = [&](auto range) {
+        std::string s;
+        for (auto v : range) {
+          if (!s.empty()) s += ", ";
+          s += "&" + nt.get(v);
+        }
+        return s;
+      };
+      os << "    {\n";
+      os << "      static const pyc::cpp::Wire<1> *const nm_rens_" << instName << "[] = {" << joinNames(mem.getRens()) << "};\n";
+      os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_ras_" << instName << "[] = {" << joinNames(mem.getRaddrs()) << "};\n";
+      os << "      pyc::cpp::Wire<" << dataW << "> *const nm_rds_" << instName << "[] = {" << joinNames(mem.getRdatas()) << "};\n";
+      os << "      static const pyc::cpp::Wire<1> *const nm_wvs_" << instName << "[] = {" << joinNames(mem.getWvalids()) << "};\n";
+      os << "      static const pyc::cpp::Wire<" << addrW << "> *const nm_was_" << instName << "[] = {" << joinNames(mem.getWaddrs()) << "};\n";
+      os << "      static const pyc::cpp::Wire<" << dataW << "> *const nm_wds_" << instName << "[] = {" << joinNames(mem.getWdatas()) << "};\n";
+      os << "      static const pyc::cpp::Wire<" << ((dataW + 7) / 8) << "> *const nm_wss_" << instName << "[] = {" << joinNames(mem.getWstrbs()) << "};\n";
+      os << "      " << instName << " = new pyc::cpp::pycSyncMemNM<" << addrW << ", " << dataW << ", " << depth
+         << ", " << rp << ", " << wp << ", "
+         << (mem.getReadMode() == "old" ? "true" : "false") << ">("
+         << nt.get(mem.getClk()) << ", "
+         << "nm_rens_" << instName << ", nm_ras_" << instName << ", nm_rds_" << instName << ", "
+         << "nm_wvs_" << instName << ", nm_was_" << instName << ", nm_wds_" << instName << ", nm_wss_" << instName << ");\n";
+      os << "    }\n";
+      break;
+    }
+    case ComponentKind::Reg:
+    case ComponentKind::Fifo:
+    case ComponentKind::ByteMem:
+    case ComponentKind::AsyncFifo:
+    case ComponentKind::CdcSync:
+      break;  // built elsewhere
+    }
   }
   os << "    _pyc_validate_primitive_bindings();\n";
   os << "    _pyc_init_runtime_controls();\n";
@@ -3512,7 +3631,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 
   auto emitByteMemEvalWithCache =
       [&](pyc::ByteMemOp mem, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) {
-    std::string instName = byteMemInstName.lookup(mem.getOperation());
+    std::string instName = memberOf(mem.getOperation());
     std::string changedFlag = instName + "_eval_cache_changed";
     std::string raddr = nt.get(mem.getRaddr());
     std::string wvalid = nt.get(mem.getWvalid());
@@ -4155,12 +4274,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // so leaves never re-read the clock wire on the fast path.
   auto emitEdgeCall = [&](const char *method, llvm::StringRef indent,
                           const char *arg = nullptr) {
-    for (auto r : regs)
-      os << indent << nt.get(r.getQ()) << "_inst->" << method << "("
+    for (const ComponentSlot &slot : slots) {
+      // Registers and delay lines are the edge-driven leaves.
+      if (slot.kind != ComponentKind::Reg &&
+          slot.kind != ComponentKind::DelayLine)
+        continue;
+      os << indent << slot.member << "->" << method << "("
          << (arg ? arg : "") << ");\n";
-    for (auto delay : delayLines)
-      os << indent << nt.get(delay.getQ()) << "_inst->" << method << "("
-         << (arg ? arg : "") << ");\n";
+    }
   };
   auto emitTapUpdates = [&](llvm::StringRef indent) -> LogicalResult {
     for (auto tap : delayTaps) {
@@ -4252,18 +4373,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "      }\n";
     os << "    }\n";
   } else {
-    for (auto r : regs) {
-      std::string key = nt.get(r.getQ()) + "_inst";
-      emitStateTickCompute(key, r->getOperands(), "    ",
+    for (const ComponentSlot &slot : slots) {
+      if (slot.kind != ComponentKind::Reg &&
+          slot.kind != ComponentKind::DelayLine)
+        continue;
+      emitStateTickCompute(slot.member, slot.op->getOperands(), "    ",
                            [&](llvm::StringRef indent) {
-                             os << indent << key << "->tick_sample();\n";
-                           });
-    }
-    for (auto delay : delayLines) {
-      std::string key = nt.get(delay.getQ()) + "_inst";
-      emitStateTickCompute(key, delay->getOperands(), "    ",
-                           [&](llvm::StringRef indent) {
-                             os << indent << key << "->tick_sample();\n";
+                             os << indent << slot.member << "->tick_sample();\n";
                            });
     }
     for (int64_t dbk : delayLoopIds) {
@@ -4277,39 +4393,15 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     if (failed(emitTapUpdates("    ")))
       return failure();
   }
-  for (auto fifo : fifos) {
-    std::string key = nt.get(fifo.getInReady()) + "_inst";
-    emitStateTickCompute(key, fifo->getOperands(), "    ",
+  for (const ComponentSlot &slot : slots) {
+    if (slot.kind == ComponentKind::Reg ||
+        slot.kind == ComponentKind::DelayLine)
+      continue;  // sampled above, before the delay loops
+    const char *arrow = componentTraits(slot.kind).pointerMember ? "->" : ".";
+    emitStateTickCompute(slot.member, slot.op->getOperands(), "    ",
                          [&](llvm::StringRef indent) {
-                           os << indent << key << ".tick_sample();\n";
-                         });
-  }
-  for (auto mem : byteMems) {
-    std::string key = byteMemInstName.lookup(mem.getOperation());
-    emitStateTickCompute(key, mem->getOperands(), "    ",
-                         [&](llvm::StringRef indent) {
-                           os << indent << key << ".tick_sample();\n";
-                         });
-  }
-  for (auto mem : syncMemNMs) {
-    std::string key = syncMemNMInstName.lookup(mem.getOperation());
-    emitStateTickCompute(key, mem->getOperands(), "    ",
-                         [&](llvm::StringRef indent) {
-                           os << indent << key << "->tick_sample();\n";
-                         });
-  }
-  for (auto fifo : asyncFifos) {
-    std::string key = nt.get(fifo.getInReady()) + "_inst";
-    emitStateTickCompute(key, fifo->getOperands(), "    ",
-                         [&](llvm::StringRef indent) {
-                           os << indent << key << ".tick_sample();\n";
-                         });
-  }
-  for (auto sync : cdcSyncs) {
-    std::string key = nt.get(sync.getOut()) + "_inst";
-    emitStateTickCompute(key, sync->getOperands(), "    ",
-                         [&](llvm::StringRef indent) {
-                           os << indent << key << ".tick_sample();\n";
+                           os << indent << slot.member << arrow
+                              << "tick_sample();\n";
                          });
   }
   if (!fusedRegLoopIds.empty()) {
@@ -4468,16 +4560,20 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "    " << wake << ".apply(" << loop
        << ".commit(), _pyc_comb_dirty);\n";
   }
-  for (auto r : regs) {
-    std::string key = nt.get(r.getQ()) + "_inst";
+  for (const ComponentSlot &slot : slots) {
+    if (slot.kind != ComponentKind::Reg &&
+        slot.kind != ComponentKind::DelayLine)
+      continue;
+    const std::string &key = slot.member;
     std::string changed = "_pyc_commit_changed_" + key;
-    os << "    const bool " << changed << " = " << key
-       << "->tick_commit();\n";
-    emitCommitWake(changed, r.getQ());
-  }
-  for (auto delay : delayLines) {
-    std::string key = nt.get(delay.getQ()) + "_inst";
-    std::string changed = "_pyc_commit_changed_" + key;
+    if (slot.kind == ComponentKind::Reg) {
+      auto r = cast<pyc::RegOp>(slot.op);
+      os << "    const bool " << changed << " = " << key
+         << "->tick_commit();\n";
+      emitCommitWake(changed, r.getQ());
+      continue;
+    }
+    auto delay = cast<pyc::DelayLineOp>(slot.op);
     // Two wake domains: tail-`q` consumers re-evaluate only when the tail
     // changes, while tap consumers must wake on every advanced edge (each
     // enabled edge shifts every tap) even when the tail repeats.
@@ -4495,60 +4591,71 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   if (gateLocalCommit)
     os << "    }\n";
-  for (auto fifo : fifos) {
-    std::string key = nt.get(fifo.getInReady()) + "_inst";
+  for (const ComponentSlot &slot : slots) {
+    if (slot.kind == ComponentKind::Reg ||
+        slot.kind == ComponentKind::DelayLine)
+      continue;
+    const std::string &key = slot.member;
     std::string changed = "_pyc_commit_changed_" + key;
-    os << "    const auto " << changed << " = " << key
-       << ".tick_commit();\n";
-    os << "    if (" << changed << " != 0) " << key << ".eval();\n";
-    emitCommitWake(changed + " & decltype(" + key +
-                       ")::kInReadyChanged",
-                   fifo.getInReady());
-    emitCommitWake(changed + " & decltype(" + key +
-                       ")::kOutValidChanged",
-                   fifo.getOutValid());
-    emitCommitWake(changed + " & decltype(" + key +
-                       ")::kOutDataChanged",
-                   fifo.getOutData());
-  }
-  for (auto mem : byteMems) {
-    std::string key = byteMemInstName.lookup(mem.getOperation());
-    std::string changed = "_pyc_commit_changed_" + key;
-    os << "    const bool " << changed << " = " << key
-       << ".tick_commit();\n";
-    emitCommitWake(changed, mem.getRdata());
-  }
-  for (auto mem : syncMemNMs) {
-    std::string key = syncMemNMInstName.lookup(mem.getOperation());
-    std::string changed = "_pyc_commit_changed_" + key;
-    os << "    const auto " << changed << " = " << key
-       << "->tick_commit();\n";
-    for (auto [i, rd] : llvm::enumerate(mem.getRdatas()))
-      emitCommitWake(changed + " & (std::remove_reference_t<decltype(*" + key +
-                         ")>::change_mask_t{1} << " + std::to_string(i) + ")",
-                     rd);
-  }
-  for (auto fifo : asyncFifos) {
-    std::string key = nt.get(fifo.getInReady()) + "_inst";
-    std::string changed = "_pyc_commit_changed_" + key;
-    os << "    const auto " << changed << " = " << key
-       << ".tick_commit();\n";
-    emitCommitWake(changed + " & decltype(" + key +
-                       ")::kInReadyChanged",
-                   fifo.getInReady());
-    emitCommitWake(changed + " & decltype(" + key +
-                       ")::kOutValidChanged",
-                   fifo.getOutValid());
-    emitCommitWake(changed + " & decltype(" + key +
-                       ")::kOutDataChanged",
-                   fifo.getOutData());
-  }
-  for (auto sync : cdcSyncs) {
-    std::string key = nt.get(sync.getOut()) + "_inst";
-    std::string changed = "_pyc_commit_changed_" + key;
-    os << "    const bool " << changed << " = " << key
-       << ".tick_commit();\n";
-    emitCommitWake(changed, sync.getOut());
+    switch (slot.kind) {
+    case ComponentKind::Fifo: {
+      auto fifo = cast<pyc::FifoOp>(slot.op);
+      os << "    const auto " << changed << " = " << key
+         << ".tick_commit();\n";
+      os << "    if (" << changed << " != 0) " << key << ".eval();\n";
+      emitCommitWake(changed + " & decltype(" + key +
+                         ")::kInReadyChanged",
+                     fifo.getInReady());
+      emitCommitWake(changed + " & decltype(" + key +
+                         ")::kOutValidChanged",
+                     fifo.getOutValid());
+      emitCommitWake(changed + " & decltype(" + key +
+                         ")::kOutDataChanged",
+                     fifo.getOutData());
+      break;
+    }
+    case ComponentKind::ByteMem: {
+      auto mem = cast<pyc::ByteMemOp>(slot.op);
+      os << "    const bool " << changed << " = " << key
+         << ".tick_commit();\n";
+      emitCommitWake(changed, mem.getRdata());
+      break;
+    }
+    case ComponentKind::SyncMemNM: {
+      auto mem = cast<pyc::SyncMemNMOp>(slot.op);
+      os << "    const auto " << changed << " = " << key
+         << "->tick_commit();\n";
+      for (auto [i, rd] : llvm::enumerate(mem.getRdatas()))
+        emitCommitWake(changed + " & (std::remove_reference_t<decltype(*" + key +
+                           ")>::change_mask_t{1} << " + std::to_string(i) + ")",
+                       rd);
+      break;
+    }
+    case ComponentKind::AsyncFifo: {
+      auto fifo = cast<pyc::AsyncFifoOp>(slot.op);
+      os << "    const auto " << changed << " = " << key
+         << ".tick_commit();\n";
+      emitCommitWake(changed + " & decltype(" + key +
+                         ")::kInReadyChanged",
+                     fifo.getInReady());
+      emitCommitWake(changed + " & decltype(" + key +
+                         ")::kOutValidChanged",
+                     fifo.getOutValid());
+      emitCommitWake(changed + " & decltype(" + key +
+                         ")::kOutDataChanged",
+                     fifo.getOutData());
+      break;
+    }
+    case ComponentKind::CdcSync: {
+      auto sync = cast<pyc::CdcSyncOp>(slot.op);
+      os << "    const bool " << changed << " = " << key
+         << ".tick_commit();\n";
+      emitCommitWake(changed, sync.getOut());
+      break;
+    }
+    default:
+      llvm_unreachable("reg/delay commit is emitted above");
+    }
   }
   if (!instInfos.empty()) {
     os << "    // Force re-eval on next eval() only for stateful sub-modules.\n";
