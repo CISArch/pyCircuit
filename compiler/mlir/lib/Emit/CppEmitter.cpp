@@ -1477,7 +1477,28 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   Block &top = f.getBody().front();
 
   std::string structName = sanitizeId(f.getSymName());
-  os << "struct " << structName << " {\n";
+
+  // F2: an instance is a component to its parent, so every module derives from
+  // ModuleBase and declares the two traits the parent's scheduling reads. A
+  // module with no state has no clocked phase; its tick entries are deleted and
+  // the parent omits them, turning a stale call into a compile error.
+  ModuleOp parentModule = f->getParentOfType<ModuleOp>();
+  llvm::DenseMap<Operation *, SeqStateKind> traitMemo;
+  const bool hasState =
+      parentModule ? functionHasSequentialState(f, parentModule, traitMemo)
+                   : true;
+  const bool stateMayChange = hasState;
+  os << "struct " << structName << " : public pyc::cpp::ModuleBase<" << structName
+     << "> {\n";
+  os << "  static constexpr bool kHasState = " << (hasState ? "true" : "false")
+     << ";\n";
+  os << "  static constexpr bool kStateMayChange = "
+     << (stateMayChange ? "true" : "false") << ";\n";
+  if (!hasState) {
+    os << "  // Comb-only: no clocked phase exists, so these are deleted.\n";
+    os << "  void tick_sample() = delete;\n";
+    os << "  pyc::cpp::BaseElement::change_mask_t tick_commit() = delete;\n";
+  }
   os << "  static constexpr const char *_pyc_change_schedule_schema = \""
      << kChangeScheduleSchema << "\";\n";
   os << "  static constexpr unsigned _pyc_change_schedule_node_count = "
@@ -1892,7 +1913,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   ModuleOp mod = f->getParentOfType<ModuleOp>();
   if (!mod)
     return f.emitError("C++ emitter: missing parent module for instance resolution");
-  std::vector<bool> instHasSequentialCallee{};
+  std::vector<bool> instStateMayChange{};
 
   llvm::DenseMap<std::pair<Operation *, unsigned>, bool> clockOnlyMemo;
   if (!instances.empty()) {
@@ -1939,9 +1960,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
 
     llvm::DenseMap<Operation *, SeqStateKind> seqMemo{};
-    instHasSequentialCallee.reserve(instInfos.size());
+    instStateMayChange.reserve(instInfos.size());
     for (const auto &ii : instInfos) {
-      instHasSequentialCallee.push_back(functionHasSequentialState(ii.callee, mod, seqMemo));
+      instStateMayChange.push_back(functionHasSequentialState(ii.callee, mod, seqMemo));
     }
   }
 
@@ -2025,11 +2046,31 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 	      os << "  std::unique_ptr<" << sanitizeId(callee.getSymName()) << "> " << ii.member
 	         << " = std::make_unique<" << sanitizeId(callee.getSymName()) << ">();\n";
 	    }
+	    // The cache decision above must be the child's own trait, not a second
+	    // analysis spliced into the parent: a divergence fails to compile.
+	    for (unsigned idx = 0; idx < instInfos.size(); ++idx)
+	      os << "  static_assert(" << sanitizeId(instInfos[idx].callee.getSymName())
+	         << "::kStateMayChange == "
+	         << ((idx < instStateMayChange.size() && instStateMayChange[idx]) ? "true"
+	                                                                         : "false")
+	         << ", \"instance eval cache must follow the child trait\");\n";
 	    os << "\n";
 
+    // A child whose kStateMayChange is false is a pure function of its inputs:
+    // it gets no eval cache, and the parent calls eval() directly (see the
+    // helper below). The trait, not the parent's own analysis, is the decision.
+    bool anyStateMayChange = false;
+    for (unsigned idx = 0; idx < instInfos.size(); ++idx)
+      if (idx < instStateMayChange.size() && instStateMayChange[idx])
+        anyStateMayChange = true;
+    if (anyStateMayChange) {
     os << "  // Sub-module eval cache (default-on in C++; can be disabled with\n";
     os << "  // -DPYC_DISABLE_INSTANCE_EVAL_CACHE).\n";
-    for (const auto &ii : instInfos) {
+    }
+    for (unsigned idx = 0; idx < instInfos.size(); ++idx) {
+      if (idx >= instStateMayChange.size() || !instStateMayChange[idx])
+        continue;
+      const auto &ii = instInfos[idx];
       auto inst = ii.op;
       os << "  bool " << ii.member << "_eval_cache_valid = false;\n";
       if (usePackedInstanceEvalCache(ii)) {
@@ -3266,11 +3307,22 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     instanceEvalHelperNames.push_back(helperName);
   }
 
-  auto emitInstanceEvalHelperDefinition = [&](const InstInfo &ii, llvm::StringRef helperName) {
+  auto emitInstanceEvalHelperDefinition = [&](const InstInfo &ii,
+                                              llvm::StringRef helperName,
+                                              bool mayChange) {
     auto inst = ii.op;
     bool usePackedCache = usePackedInstanceEvalCache(ii);
     os << "  inline bool " << helperName << "() {\n";
     os << "    bool _pyc_inst_changed = false;\n";
+    if (!mayChange) {
+      os << "    // Comb-only child (kStateMayChange == false): eval() is a pure\n";
+      os << "    // function of the inputs, so there is no cache to consult.\n";
+      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        std::string inValue = nt.get(inst.getOperand(i));
+        os << "    " << ii.member << "->" << ii.inPorts[i] << " = " << inValue << ";\n";
+      }
+      os << "    " << ii.member << "->eval();\n";
+    } else {
     os << "    #ifdef PYC_DISABLE_INSTANCE_EVAL_CACHE\n";
     for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
       std::string inValue = nt.get(inst.getOperand(i));
@@ -3393,6 +3445,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       os << "    " << ii.member << "_eval_cache_valid = true;\n";
       os << "    #endif\n";
     }
+    }
     // The current IR does not carry a callee output-to-input dependency
     // summary. Keep the conservative child input cache/eval, then publish each
     // output independently and wake only its local direct-comb users.
@@ -3414,7 +3467,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   };
 
   for (unsigned idx = 0; idx < instInfos.size(); ++idx)
-    emitInstanceEvalHelperDefinition(instInfos[idx], instanceEvalHelperNames[idx]);
+    emitInstanceEvalHelperDefinition(
+        instInfos[idx], instanceEvalHelperNames[idx],
+        idx < instStateMayChange.size() && instStateMayChange[idx]);
 
   auto emitInstanceEvalWithCache =
       [&](const InstInfo &ii, llvm::StringRef indent, llvm::StringRef changedAnyVar = llvm::StringRef()) {
@@ -4191,9 +4246,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       };
 
   auto emitTickComputePart = [&](unsigned begin, unsigned end, unsigned partIdx) {
-    os << "  inline void tick_compute_part_" << partIdx << "() {\n";
-    // Sub-modules (inputs + tick_compute).
+    os << "  inline void tick_sample_part_" << partIdx << "() {\n";
+    // Sub-modules (inputs + tick_sample).
     for (unsigned i = begin; i < end && i < instInfos.size(); ++i) {
+      // Comb-only children have no clocked phase (their tick entries are
+      // deleted), so the parent must not call them.
+      if (i >= instStateMayChange.size() || !instStateMayChange[i])
+        continue;
       const auto &ii = instInfos[i];
       auto inst = ii.op;
       emitStateTickCompute(
@@ -4202,7 +4261,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             for (unsigned j = 0; j < inst.getNumOperands(); ++j)
               os << indent << ii.member << "->" << ii.inPorts[j] << " = "
                  << nt.get(inst.getOperand(j)) << ";\n";
-            os << indent << ii.member << "->tick_compute();\n";
+            os << indent << ii.member << "->tick_sample();\n";
           });
     }
     os << "  }\n\n";
@@ -4211,14 +4270,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   auto emitTickCommitPart = [&](unsigned begin, unsigned end, unsigned partIdx) {
     os << "  inline void tick_commit_part_" << partIdx << "() {\n";
     // Sub-modules.
-    for (unsigned i = begin; i < end && i < instInfos.size(); ++i)
+    for (unsigned i = begin; i < end && i < instInfos.size(); ++i) {
+      if (i >= instStateMayChange.size() || !instStateMayChange[i])
+        continue;
       os << "    " << instInfos[i].member << "->tick_commit();\n";
+    }
     os << "  }\n\n";
   };
 
-  // Emit chunked submodule tick helpers.
+  // Emit chunked submodule tick helpers. A comb-only module has no clocked
+  // phase at all: its entries are the deleted declarations emitted above, and
+  // a comb-only child contributes no phase work, so it gets no part either.
+  bool anyStatefulChild = false;
+  for (unsigned idx = 0; idx < instInfos.size(); ++idx)
+    if (idx < instStateMayChange.size() && instStateMayChange[idx])
+      anyStatefulChild = true;
   unsigned subParts = 0;
-  if (!instInfos.empty()) {
+  if (hasState && anyStatefulChild) {
     for (unsigned b = 0; b < instInfos.size(); b += kTickChunk)
       emitTickComputePart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), subParts++);
     unsigned commitParts = 0;
@@ -4226,13 +4294,15 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       emitTickCommitPart(b, std::min<unsigned>(static_cast<unsigned>(instInfos.size()), b + kTickChunk), commitParts++);
   }
 
-  os << "  void tick_compute() {\n";
-  if (!instInfos.empty()) {
+  if (hasState)
+    os << "  void tick_sample() {\n";
+  if (hasState && anyStatefulChild) {
     os << "    // Sub-modules.\n";
     for (unsigned i = 0; i < subParts; ++i)
-      os << "    tick_compute_part_" << i << "();\n";
+      os << "    tick_sample_part_" << i << "();\n";
   }
-  os << "    // Local sequential primitives.\n";
+  if (hasState)
+    os << "    // Local sequential primitives.\n";
   // Call every edge-driven leaf. arg is the already-classified clock level,
   // so leaves never re-read the clock wire on the fast path.
   auto emitEdgeCall = [&](const char *method, llvm::StringRef indent,
@@ -4407,18 +4477,21 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
     os << "    }\n";
   }
-  os << "  }\n\n";
+  if (hasState)
+    os << "  }\n\n";
 
-  os << "  void tick_commit() {\n";
+  if (hasState)
+    os << "  pyc::cpp::BaseElement::change_mask_t tick_commit() {\n";
   if (fastEdge)
     os << "    _pyc_seq_armed = false;\n";
-  if (!instInfos.empty()) {
+  if (hasState && anyStatefulChild) {
     os << "    // Sub-modules.\n";
     unsigned commitParts = (static_cast<unsigned>(instInfos.size()) + kTickChunk - 1) / kTickChunk;
     for (unsigned i = 0; i < commitParts; ++i)
       os << "    tick_commit_part_" << i << "();\n";
   }
-  os << "    // Local sequential primitives.\n";
+  if (hasState)
+    os << "    // Local sequential primitives.\n";
   auto emitCommitWake = [&](llvm::StringRef condition, Value output,
                             llvm::StringRef indent = "    ") {
     os << indent << "if (" << condition << ") {\n";
@@ -4618,22 +4691,35 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       llvm_unreachable("reg/delay commit is emitted above");
     }
   }
-  if (!instInfos.empty()) {
+  if (hasState && anyStatefulChild) {
     os << "    // Force re-eval on next eval() only for stateful sub-modules.\n";
     for (unsigned i = 0; i < instInfos.size(); ++i) {
-      if (i < instHasSequentialCallee.size() && instHasSequentialCallee[i]) {
+      if (i < instStateMayChange.size() && instStateMayChange[i]) {
         os << "    " << instInfos[i].member << "_eval_cache_valid = false;\n";
       }
     }
   }
-	  os << "  }\n\n";
+  if (hasState) {
+    // The parent ignores the mask today (it compares published outputs), but
+    // the clocked entries must read the same as a leaf's.
+    os << "    return 0;\n";
+    os << "  }\n\n";
+  }
 
 	  // Decision 0027: provide explicit comb/tick/commit APIs + high-level step().
 	  // Decision 0001: expose transfer() as an alias of commit().
 	  os << "  void comb() { eval(); }\n";
-	  os << "  void tick() { tick_compute(); }\n";
-	  os << "  void commit() { tick_commit(); }\n";
-	  os << "  void transfer() { tick_commit(); }\n";
+	  if (hasState) {
+	    os << "  void tick() { tick_sample(); }\n";
+	    os << "  void commit() { tick_commit(); }\n";
+	    os << "  void transfer() { tick_commit(); }\n";
+	  } else {
+	    // Decision 0027 keeps the phase API on every module; a comb-only module
+	    // has no clocked phase, and its tick entries are deleted.
+	    os << "  void tick() { }\n";
+	    os << "  void commit() { }\n";
+	    os << "  void transfer() { }\n";
+	  }
 	  os << "  void step() {\n";
 	  os << "    comb();\n";
 	  os << "    tick();\n";

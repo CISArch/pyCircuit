@@ -1767,8 +1767,11 @@ static bool isMethodStartLine(llvm::StringRef line, llvm::StringRef structName) 
     return false;
   if (t.size() >= 2 && t[0] == '/' && t[1] == '/')
     return false;
+  // A module's tick_commit() returns the component change mask (F2), so the
+  // return type is spelled out on the definition.
   if (!(startsWithWord(t, "inline") || startsWithWord(t, "void") || startsWithWord(t, "static") ||
-        startsWithWord(t, "bool") || startsWithWord(t, structName) || startsWithWord(t, "~" + structName.str()))) {
+        startsWithWord(t, "bool") || startsWithWord(t, structName) || startsWithWord(t, "~" + structName.str()) ||
+        startsWithWord(t, "pyc::cpp::BaseElement::change_mask_t"))) {
     return false;
   }
   size_t semi = t.find(';');
@@ -1799,8 +1802,9 @@ static std::optional<SplitModuleResult> splitEmittedModule(llvm::StringRef emitt
   llvm::StringRef body = emitted.substr(open + 1, close - open - 1);
   SplitModuleResult out;
   out.headerBody.reserve(body.size() / 2);
-  out.headerBody.append("struct ");
-  out.headerBody.append(structName.str());
+  // Keep the emitted class head verbatim (base clause included): F2 makes every
+  // module derive from pyc::cpp::ModuleBase<self>.
+  out.headerBody.append(normalizeWhitespace(emitted.substr(structPos, open - structPos)));
   out.headerBody.append(" {\n");
 
   // Template member functions must remain header-only (their definitions may
