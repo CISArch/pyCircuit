@@ -81,4 +81,16 @@ createCppPlacementPass(unsigned combChunkNodes,
                        std::string traceCodegenPlanPath = {});
 std::unique_ptr<::mlir::Pass> createVectorUnrollPass();
 
+/// DFS-merge retiming: share the common register stages of each fork
+/// upstream and leave extra stages on the branch edge. See
+/// docs/reg_upstream_dfs_merge_plan.md.
+void runForkMergeRetime(::mlir::func::FuncOp function);
+std::unique_ptr<::mlir::Pass> createForkMergeRetimePass();
+
+/// Analysis-only: tag each pyc.reg / scalar pyc.delay_line with
+/// `pyc.loop_id` (one loop per equivalent clock domain) plus function-level
+/// stats; the C++ emitter lowers each loop into one pyc::cpp::RegLoop<W> /
+/// DelayLoop<W> update loop.
+std::unique_ptr<::mlir::Pass> createStateLoopPartitionPass();
+
 } // namespace pyc

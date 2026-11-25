@@ -74,6 +74,10 @@ def main() -> int:
     lines.append(f"set(CMAKE_CXX_STANDARD {std.replace('c++', '')})\n")
     lines.append("set(CMAKE_CXX_STANDARD_REQUIRED ON)\n")
     lines.append("set(CMAKE_CXX_EXTENSIONS OFF)\n\n")
+    # Generated simulators use std::thread (runtime/cpp/pyc_thread_pool.hpp) when
+    # --cpp-parallel-tick is enabled; without -pthread that fails at link/run time.
+    lines.append("set(THREADS_PREFER_PTHREAD_FLAG ON)\n")
+    lines.append("find_package(Threads REQUIRED)\n\n")
 
     lines.append("set(PYC_TB_SOURCES\n")
     for s in srcs:
@@ -82,6 +86,7 @@ def main() -> int:
     lines.append(")\n\n")
 
     lines.append("add_executable(pyc_tb ${PYC_TB_SOURCES})\n")
+    lines.append("target_link_libraries(pyc_tb PRIVATE Threads::Threads)\n")
     if incs:
         lines.append("target_include_directories(pyc_tb PRIVATE\n")
         for i in incs:

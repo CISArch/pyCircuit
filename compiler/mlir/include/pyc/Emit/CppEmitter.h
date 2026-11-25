@@ -26,7 +26,7 @@ inline constexpr llvm::StringLiteral kCppMethodAttr = "pyc.cpp.method";
 inline constexpr llvm::StringLiteral kCppPlacementSummaryAttr = "pyc.cpp.placement_summary";
 inline constexpr llvm::StringLiteral kCppCombChunkNodesAttr = "pyc.cpp.comb_chunk_nodes";
 
-enum class CppStorageKind { Struct, Local };
+enum class CppStorageKind { Struct, Local, Alias };
 
 struct CppPlacementSummary {
   unsigned structMembers = 0;
@@ -79,6 +79,30 @@ struct CppEmitterOptions {
   // downstream C++ TU cost even after file sharding.
   unsigned combChunkNodes = kDefaultCombChunkNodes;
   std::string probePlanPath{};
+  /// Dispatch submodule tick helper parts through the runtime thread pool
+  /// (pyc_thread_pool.hpp). Parts touch disjoint SimObjects (parent wires are
+  /// read-only during tick), so the fork-join is race-free; the actual thread
+  /// count is resolved at runtime via PYC_THREADS / pyc_set_threads().
+  bool parallelTick = false;
+  /// Submodule instances per tick helper part (default 256). Smaller chunks
+  /// give a finer parallel grain when parallelTick is enabled; the value also
+  /// controls tick TU sharding granularity for --cpp-split=module.
+  unsigned tickChunkInstances = 256;
+  /// Tick part boundary policy with parallelTick: "uniform" keeps the
+  /// fixed-stride chunking; "weighted" keeps the same part count but places
+  /// boundaries via a min-max DP over p2sim-style static instance weights
+  /// (tick weight = state arms + per-instance propagation cost; instances
+  /// roll up their callee's weight recursively).
+  std::string tickPartition = "uniform";
+  /// Gate the generated tick_commit's local reg/delay-line walk behind a
+  /// module-level `_pyc_commit_needed` flag. Modules on a single unique clock
+  /// (fastEdge) set it on rising/unchanged tick_compute and leave it clear on
+  /// a falling edge, where every local reg/delay-line already has pending==0
+  /// and the walk was provably a no-op. Sub-module recursion and clocked
+  /// fifo/mem/cdc primitives keep their unconditional tick_commit: they
+  /// maintain their own edge state. On by default on this line; pass
+  /// --no-fall-commit-gate for the old A/B comparison.
+  bool fallCommitGate = true;
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,
@@ -93,6 +117,10 @@ struct CppEmitterOptions {
 
 /// Read storage decision for a value (default struct).
 CppStorageKind getValueCppStorage(::mlir::Value v);
+
+/// Value whose storage an Alias value shares: the single assign source of a
+/// pyc.wire or the input of a pyc.alias. Null for non-Alias values.
+::mlir::Value getValueCppAliasTarget(::mlir::Value v);
 
 /// Owner method name for local values (empty if struct or unknown).
 ::llvm::StringRef getValueCppOwner(::mlir::Value v);

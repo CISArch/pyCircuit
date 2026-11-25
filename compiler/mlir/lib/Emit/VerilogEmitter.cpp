@@ -421,10 +421,15 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
   }
   if (auto t = dyn_cast<pyc::TruncOp>(op)) {
     auto outTy = leafIntType(t.getResult().getType());
-    if (!outTy)
+    auto inTy = leafIntType(t.getIn().getType());
+    if (!outTy || !inTy)
       return {t.emitError("verilog emitter only supports integer trunc")};
     unsigned w = outTy.getWidth();
-    if (w == 1)
+    if (w == 1 && inTy.getWidth() == 1)
+      // 1-bit source wires are emitted without a range ("wire x;"), so a
+      // [0] bit-select would be illegal Verilog; the value itself is the bit.
+      os << "assign " << nt.get(t.getResult()) << " = " << nt.get(t.getIn()) << ";\n";
+    else if (w == 1)
       os << "assign " << nt.get(t.getResult()) << " = " << nt.get(t.getIn()) << "[0];\n";
     else
       os << "assign " << nt.get(t.getResult()) << " = " << nt.get(t.getIn()) << "[" << (w - 1) << ":0];\n";
@@ -452,6 +457,11 @@ static std::optional<LogicalResult> emitScalarOpAssign(Operation &op, raw_ostrea
     unsigned ow = outTy.getWidth();
     if (ow == iw)
       os << "assign " << nt.get(s.getResult()) << " = " << nt.get(s.getIn()) << ";\n";
+    else if (iw == 1)
+      // A 1-bit source wire has no bit range ("wire x;"); x[0] is illegal
+      // Verilog. The value itself is the sign bit, so replicate it directly.
+      os << "assign " << nt.get(s.getResult()) << " = {{" << (ow - iw) << "{" << nt.get(s.getIn())
+         << "}}, " << nt.get(s.getIn()) << "};\n";
     else
       os << "assign " << nt.get(s.getResult()) << " = {{" << (ow - iw) << "{" << nt.get(s.getIn()) << "["
          << (iw - 1) << "]}}, " << nt.get(s.getIn()) << "};\n";

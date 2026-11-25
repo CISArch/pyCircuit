@@ -147,6 +147,21 @@ static llvm::cl::opt<unsigned> cppShardMaxAstNodes(
     llvm::cl::desc("Chunk large eval topologies into helper methods (node budget per chunk; 0=default policy)"),
     llvm::cl::init(0));
 
+static llvm::cl::opt<bool> cppParallelTick(
+    "cpp-parallel-tick",
+    llvm::cl::desc("Dispatch submodule tick helper parts through the runtime thread pool (set PYC_THREADS at runtime)"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<unsigned> cppTickChunkInstances(
+    "cpp-tick-chunk",
+    llvm::cl::desc("Submodule instances per tick helper part (default 256; smaller values give finer parallel grain with --cpp-parallel-tick)"),
+    llvm::cl::init(128));
+
+static llvm::cl::opt<std::string> cppTickPartition(
+    "cpp-tick-partition",
+    llvm::cl::desc("Tick part boundary policy with --cpp-parallel-tick: uniform stride or weighted min-max DP over p2sim-style static instance weights (uniform|weighted)"),
+    llvm::cl::init("uniform"));
+
 static llvm::cl::opt<std::string> cppManifestPath(
     "cpp-manifest",
     llvm::cl::desc("C++ compile manifest path (default: <out-dir>/cpp_compile_manifest.json)"),
@@ -168,6 +183,12 @@ static llvm::cl::opt<std::string> traceCodegenPlanPath(
         "Resolved per-module internal trace fields used by C++ placement"),
     llvm::cl::init(""));
 
+static llvm::cl::opt<bool> stateLoop(
+    "state-loop",
+    llvm::cl::desc(
+        "Lower same-clock registers and delay lines into per-clock state "
+        "loops (--state-loop=false for the per-object lowering)"),
+    llvm::cl::init(true));
 static llvm::cl::opt<std::string> observeNamed(
     "observe-named",
     llvm::cl::desc(
@@ -198,6 +219,20 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     "cpp-only-preserve-ops",
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
+
+// Gate the generated tick_commit's local reg/delay-line walk behind a
+// module-level _pyc_commit_needed flag: single-clock (fastEdge) modules set it
+// on rising/unchanged tick_compute and skip the walk on a falling edge, where
+// every local reg/delay-line already has pending==0 (their pending is set only
+// by posedge_tick_compute / tick_compute and cleared by tick_commit). Clocked
+// fifo/mem/cdc primitives and sub-module recursion keep the unconditional
+// walk: they own their edge state. A/B switch; measured before flipping any
+// default.
+static llvm::cl::opt<bool> cppFallCommitGate(
+    "cpp-fall-commit-gate",
+    llvm::cl::desc("Skip tick_commit's local reg/delay-line walk on falling edges "
+                   "(single-clock modules; A/B switch)"),
+    llvm::cl::init(true));
 
 static llvm::cl::opt<bool> unrollVector(
     "unroll-vector",
@@ -2082,8 +2117,7 @@ struct CompileStatsSummary {
   int64_t stateOptPackDelayGroups = 0;
   int64_t stateOptPackedStateOps = 0;
   int64_t stateOptStatePrimitivesRemoved = 0;
-  int64_t stateOptPackBits = 0;
-  int64_t memCount = 0;
+  int64_t stateOptPackBits = 0;  int64_t memCount = 0;
   int64_t memBits = 0;
   int64_t maxLogicDepth = 0;
   int64_t wns = 0;
@@ -2226,8 +2260,7 @@ static CompileStatsSummary collectCompileStats(ModuleOp module, int64_t depthLim
         getI64Attr(f, "pyc.stats.state_opt_state_primitives_removed", 0));
     s.stateOptPackBits = satAdd(
         s.stateOptPackBits,
-        getI64Attr(f, "pyc.stats.state_opt_pack_bits", 0));
-    s.memCount = satAdd(s.memCount, getI64Attr(f, "pyc.stats.mem_count", 0));
+        getI64Attr(f, "pyc.stats.state_opt_pack_bits", 0));    s.memCount = satAdd(s.memCount, getI64Attr(f, "pyc.stats.mem_count", 0));
     s.memBits = satAdd(s.memBits, getI64Attr(f, "pyc.stats.mem_bits", 0));
     s.observeNamedNamesLazy = satAdd(
         s.observeNamedNamesLazy,
@@ -2263,8 +2296,7 @@ static void printCompileStats(const CompileStatsSummary &s) {
                << ", merged=" << s.stateOptRegsMerged
                << ", bits_removed=" << s.stateOptRegBitsRemoved
                << ", delay_chains=" << s.delayChainsCombined
-               << ", pack_groups=" << s.stateOptPackGroups
-               << ", retime_rewritten=" << s.retimeRegionsRewritten
+               << ", pack_groups=" << s.stateOptPackGroups               << ", retime_rewritten=" << s.retimeRegionsRewritten
                << ", comb_moved=" << s.retimeCombOpsMoved
                << ", mems=" << s.memCount << " (" << s.memBits << " bits)"
                << ", max_depth=" << s.maxLogicDepth << "/" << s.logicDepthLimit
@@ -2335,7 +2367,6 @@ static llvm::json::Object compileStatsToJson(const CompileStatsSummary &s) {
   obj["observe_named_names_kept"] = s.observeNamedNamesKept;
   return obj;
 }
-
 static LogicalResult writeCompileStatsJson(llvm::StringRef outPath, const CompileStatsSummary &s) {
   std::string buf;
   llvm::raw_string_ostream ss(buf);
@@ -2409,6 +2440,12 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (observeNamed != "demand" && observeNamed != "all") {
+    llvm::errs() << "error: unknown --observe-named: " << observeNamed
+                 << " (expected: demand|all)\n";
+    return 1;
+  }
+
   std::string buildProfileNorm = llvm::StringRef(buildProfile).lower();
   if (buildProfileNorm != "release" && buildProfileNorm != "dev-fast") {
     llvm::errs() << "error: unknown --build-profile: " << buildProfile
@@ -2442,6 +2479,13 @@ int main(int argc, char **argv) {
   mlir::func::registerInlinerExtension(registry);
 
   MLIRContext ctx(registry);
+  // The parallel pass adaptor races on large fir2pyc-emitted IR (ops with
+  // malformed types reach the verifier, which then crashes while printing the
+  // diagnostic). Allow a single-threaded escape hatch until the race is
+  // root-caused.
+  if (const char *single = getenv("PYC_DISABLE_THREADS"))
+    if (llvm::StringRef(single) != "0")
+      ctx.disableMultithreading();
 #ifdef _WIN32
   // MSYS2/MinGW builds can hit non-deterministic crashes when running nested
   // pass pipelines with multithreading enabled. Bring-up prefers robustness.
@@ -2646,6 +2690,55 @@ int main(int argc, char **argv) {
     pm.addInstrumentation(std::move(passIRDumperStorage));
   }
   pm.addPass(pyc::createCheckFrontendContractPass());
+  // F2P_DEBUG: trace Rocket mux count after every pass to find where the
+  // rf read-mux tree disappears.
+  {
+    auto *ctx = pm.getContext();
+    struct MuxCounter {
+      size_t after = 0, before = 0, total = 0;
+    };
+    static llvm::StringRef targetFn = "Rocket";
+    static bool traceEnabled = [] {
+      const char *e = ::getenv("F2P_TRACE_MUX");
+      return e && e[0] == '1';
+    }();
+    if (traceEnabled) {
+      struct TraceInst : public mlir::PassInstrumentation {
+        void runAfterPass(Pass *pass, Operation *op) override {
+          auto fn = llvm::dyn_cast<mlir::func::FuncOp>(op);
+          auto module = llvm::dyn_cast<mlir::ModuleOp>(op);
+          if (!fn && !module)
+            return;
+          if (!fn && module) {
+            for (auto &f : module->getRegion(0).getOps()) {
+              auto cand = llvm::dyn_cast<mlir::func::FuncOp>(f);
+              if (cand && cand.getSymName() == targetFn) {
+                fn = cand;
+                break;
+              }
+            }
+            if (!fn) {
+              llvm::errs() << "[F2P_TRACE_MUX] after " << pass->getName()
+                           << ": <Rocket gone>\n";
+              return;
+            }
+          } else if (fn && fn.getSymName() != targetFn) {
+            return;
+          }
+          unsigned mux = 0, reg = 0;
+          fn.walk([&](Operation *o) {
+            if (o->getName().getStringRef() == "pyc.mux")
+              ++mux;
+            if (o->getName().getStringRef() == "pyc.reg")
+              ++reg;
+          });
+          llvm::errs() << "[F2P_TRACE_MUX] after " << pass->getName()
+                       << ": mux=" << mux << " reg=" << reg << "\n";
+        }
+      };
+      pm.addInstrumentation(std::make_unique<TraceInst>());
+    }
+  }
   pm.addPass(pyc::createInlineFunctionsPass());
   if (wantFlatten)
     pm.addPass(pyc::createFlattenInstancesPass());
@@ -2681,19 +2774,32 @@ int main(int argc, char **argv) {
     pm.addNestedPass<func::FuncOp>(
         pyc::createStateOptimizePass(stateTunables));
   }
+  // Fork-merge retiming after unified state-optimize: retiming and chain
+  // forming must not see the merged multiplicity (their interaction with it
+  // crashes), and the merge itself only deletes duplicates.
+  if (emitKind == "cpp" && !noStateOpt)
+    pm.addNestedPass<func::FuncOp>(pyc::createForkMergeRetimePass());
   if (!unrollVector)
     pm.addNestedPass<func::FuncOp>(pyc::createSLPPackWiresPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCombCanonicalizePass());
   pm.addPass(pyc::createCheckClockDomainsPass());
   pm.addNestedPass<func::FuncOp>(pyc::createPackI1RegsPass());
+  // Loop partition runs after all state rewrites so loops cover the final
+  // state set; the C++ emitter reads the ids. fuse-comb only hoists state,
+  // keeping its relative order.
+  if (emitKind == "cpp" && stateLoop)
+    pm.addNestedPass<func::FuncOp>(pyc::createStateLoopPartitionPass());
   // Demand mode drops undemanded pyc.name after identities were remapped,
   // before fuse-comb treats leftover names as barriers.
   if (emitKind == "cpp" && llvm::StringRef(observeNamed) == "demand")
     pm.addPass(pyc::createApplyObservationDemandPass(
         probePlanPath, traceCodegenPlanPath));
   const bool enableFuseComb = (!cppOnly) || !cppOnlyPreserveOps;
-  if (enableFuseComb)
+  if (enableFuseComb) {
+    // State rewrites add wire readers; restore dependency order before fusion.
+    pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
     pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+  }
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());
   addRemoveDeadValuesPassIfSupported(pm);
@@ -2788,6 +2894,9 @@ int main(int argc, char **argv) {
     obj["cpp_shard_threshold_lines"] = static_cast<int64_t>(cppShardThresholdLines);
     obj["cpp_shard_threshold_bytes"] = static_cast<int64_t>(cppShardThresholdBytes);
     obj["cpp_shard_max_ast_nodes"] = static_cast<int64_t>(cppShardMaxAstNodes);
+    obj["cpp_parallel_tick"] = cppParallelTick.getValue();
+    obj["cpp_tick_chunk_instances"] = static_cast<int64_t>(cppTickChunkInstances);
+    obj["cpp_tick_partition"] = cppTickPartition.getValue();
     obj["cpp_pch"] = cppPch.getValue();
     obj["profile_pass_timing"] = collectPassTiming;
     {
@@ -2844,7 +2953,6 @@ int main(int argc, char **argv) {
     root["canonicalize_budget"] = static_cast<int64_t>(effectiveCanonicalizeBudget);
 
     root["compile_stats"] = compileStatsToJson(compileStats);
-
     if (passTimingCollector)
       root["passes"] = passTimingCollector->toJson();
 
@@ -2956,8 +3064,15 @@ int main(int argc, char **argv) {
       std::vector<CppManifestSource> cppManifestSources;
       pyc::CppEmitterOptions cppEmitOpts;
       cppEmitOpts.probePlanPath = probePlanPath;
-
-      // Collect direct dependencies per module for header includes.
+      cppEmitOpts.parallelTick = cppParallelTick;
+      cppEmitOpts.tickChunkInstances = cppTickChunkInstances;
+    if (cppTickPartition != "uniform" && cppTickPartition != "weighted") {
+      llvm::errs() << "error: --cpp-tick-partition must be uniform|weighted\n";
+      return 1;
+    }
+    cppEmitOpts.tickPartition = cppTickPartition;
+    cppEmitOpts.fallCommitGate = cppFallCommitGate;
+    // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
       for (auto f : module->getOps<func::FuncOp>()) {
         if (f.isDeclaration())
@@ -2995,6 +3110,7 @@ int main(int argc, char **argv) {
         os << "#include <string>\n";
         os << "#include <type_traits>\n";
         os << "#include <cpp/pyc_sim.hpp>\n";
+        os << "#include <cpp/pyc_state_loop.hpp>\n";
         os << "#include <cpp/pyc_change_scheduler.hpp>\n";
       };
 
@@ -3223,6 +3339,7 @@ int main(int argc, char **argv) {
           hos << "#include <memory>\n";
           hos << "#include <type_traits>\n";
           hos << "#include <cpp/pyc_sim.hpp>\n";
+          hos << "#include <cpp/pyc_state_loop.hpp>\n";
           hos << "#include <cpp/pyc_change_scheduler.hpp>\n";
           for (const std::string &dep : deps[f.getSymName()])
             hos << "#include \"" << dep << ".hpp\"\n";
@@ -3314,6 +3431,14 @@ int main(int argc, char **argv) {
   if (emitKind == "cpp") {
     pyc::CppEmitterOptions cppEmitOpts;
     cppEmitOpts.probePlanPath = probePlanPath;
+    cppEmitOpts.parallelTick = cppParallelTick;
+    cppEmitOpts.tickChunkInstances = cppTickChunkInstances;
+    if (cppTickPartition != "uniform" && cppTickPartition != "weighted") {
+      llvm::errs() << "error: --cpp-tick-partition must be uniform|weighted\n";
+      return 1;
+    }
+    cppEmitOpts.tickPartition = cppTickPartition;
+    cppEmitOpts.fallCommitGate = cppFallCommitGate;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))

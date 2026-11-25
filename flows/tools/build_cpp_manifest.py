@@ -15,6 +15,13 @@ def _root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _load_manifest(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
@@ -72,6 +79,12 @@ def main() -> int:
     ap.add_argument("--cxx", default=os.environ.get("CXX", "clang++"))
     ap.add_argument("--extra-include", action="append", default=[])
     ap.add_argument("--extra-define", action="append", default=[])
+    ap.add_argument(
+        "--pthread",
+        action="store_true",
+        default=_env_flag("PYC_CPP_PTHREAD"),
+        help="Compile and link with -pthread (required when the simulator was emitted with --cpp-parallel-tick)",
+    )
     ap.add_argument("--obj-dir", default="", help="Object directory (default: <manifest-dir>/.objs)")
     args = ap.parse_args()
 
@@ -88,6 +101,8 @@ def main() -> int:
         cflags += ["-O1"]
     else:
         cflags += ["-O2", "-DNDEBUG"]
+    if args.pthread:
+        cflags.append("-pthread")
 
     include_dirs: list[Path] = []
     for p in manifest.get("include_dirs", []):
@@ -207,6 +222,8 @@ def main() -> int:
             for lib in runtime_libs:
                 link_cmd.append(lib if lib.startswith("-l") else f"-l{lib}")
 
+        if args.pthread:
+            link_cmd.append("-pthread")
         link_cmd.extend(["-o", str(out_exe)])
         _run(link_cmd)
 
