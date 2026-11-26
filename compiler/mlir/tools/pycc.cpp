@@ -214,6 +214,12 @@ static llvm::cl::opt<bool> cppOnlyPreserveOps(
     llvm::cl::desc("Preserve operation-granular C++ scheduling in --sim-mode=cpp-only (disables comb fusion)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<std::string> combFuseAlgo(
+    "comb-fuse-algo",
+    llvm::cl::desc("pyc-fuse-comb run grouping algorithm: signature (default) or greedy "
+                   "(keep each contiguous combinational run whole)"),
+    llvm::cl::init("signature"));
+
 static llvm::cl::opt<bool> noInline(
     "noinline",
     llvm::cl::desc("Disable MLIR inliner to preserve module boundaries (prevents merge/flatten)"),
@@ -2457,7 +2463,7 @@ int main(int argc, char **argv) {
   if (enableFuseComb) {
     // State rewrites add wire readers; restore dependency order before fusion.
     pm.addNestedPass<func::FuncOp>(pyc::createEliminateWiresPass());
-    pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass());
+    pm.addNestedPass<func::FuncOp>(pyc::createFuseCombPass(combFuseAlgo));
   }
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());

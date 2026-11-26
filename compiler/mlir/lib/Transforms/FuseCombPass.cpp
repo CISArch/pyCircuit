@@ -274,6 +274,17 @@ static llvm::DenseSet<Operation *> splitRuns(Block &block) {
 struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseCombPass)
 
+  FuseCombPass() = default;
+  FuseCombPass(const FuseCombPass &other) : PassWrapper(other) {}
+  explicit FuseCombPass(const std::string &algo) { combFuseAlgo = algo; }
+
+  // "signature" splits runs by the inputs each op reads; "greedy" keeps each
+  // contiguous run whole (the grouping used before splitting existed).  Both
+  // share the hoisting and run barriers; only the cuts differ.
+  Option<std::string> combFuseAlgo{
+      *this, "algo", llvm::cl::desc("run grouping: signature (default) or greedy"),
+      llvm::cl::init("signature")};
+
   StringRef getArgument() const override { return "pyc-fuse-comb"; }
   StringRef getDescription() const override {
     return "Fuse consecutive pyc combinational ops into codegen-friendly pyc.comb regions";
@@ -286,10 +297,19 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
       if (v.equals_insensitive("true") || v == "1")
         return;
     }
+    if (combFuseAlgo != "signature" && combFuseAlgo != "greedy") {
+      f.emitError("pyc-fuse-comb: unknown algo \"")
+          << combFuseAlgo << "\" (signature|greedy)";
+      signalPassFailure();
+      return;
+    }
     for (Block &b : f.getBody()) {
       detachObservationAttrs(b);
       hoistSources(b);
-      fuseBlock(b, splitRuns(b));
+      if (combFuseAlgo == "greedy")
+        fuseBlock(b, {}); // no signature cuts: every run fuses whole
+      else
+        fuseBlock(b, splitRuns(b));
     }
   }
 
@@ -488,7 +508,9 @@ struct FuseCombPass : public PassWrapper<FuseCombPass, OperationPass<func::FuncO
 
 } // namespace
 
-std::unique_ptr<mlir::Pass> createFuseCombPass() { return std::make_unique<FuseCombPass>(); }
+std::unique_ptr<mlir::Pass> createFuseCombPass(const std::string &algo) {
+  return std::make_unique<FuseCombPass>(algo);
+}
 
 static PassRegistration<FuseCombPass> pass;
 

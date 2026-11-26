@@ -39,7 +39,7 @@
 | 20 | `pyc-pack-i1-regs` | function | 将可合并的标量 `i1` 寄存器压缩为 packed 寄存器，并把被删寄存器的外部可读身份挂到 packed bit alias。 | 始终 |
 | 21 | `pyc-state-loop-partition` | function | 分析 pass（仅 C++）：给同时钟域的标量 `pyc.reg` / `pyc.delay_line` 打 `pyc.loop_id`，供 emitter 生成每域一个更新循环。 | `--emit=cpp` 且 `--state-loop`（默认开） |
 | 22 | `pyc-apply-observation-demand` | module | 状态优化重映射身份之后，把未声明的 `pyc.name` 标成懒查找（`pyc.observe_lazy` + 存储切片描述），声明过的探针（`@probe` source、`--trace-codegen-plan`、`debug_keep` / `observable` / `probe*` / `trace*`）仍急切。懒名字不钉 struct、不每拍抄，但 `findByPath` 仍可按名读。 | `--emit=cpp` 且 `--observe-named=demand`（默认） |
-| 23 | `pyc-fuse-comb` | function | 将连续组合逻辑融合为 `pyc.comb` 区域，减少 emitter 调度开销；仍带稳定名字或观测属性的 op 是 fusion barrier。 | 默认启用；仅当同时设置 `--sim-mode=cpp-only` 与 `--cpp-only-preserve-ops` 时跳过 |
+| 23 | `pyc-fuse-comb` | function | 将连续组合逻辑融合为 `pyc.comb` 区域，减少 emitter 调度开销；仍带稳定名字或观测属性的 op 是 fusion barrier。 | 默认启用；仅当同时设置 `--sim-mode=cpp-only` 与 `--cpp-only-preserve-ops` 时跳过；`--comb-fuse-algo=greedy` 退回逐 run 整块融合的贪婪分组（与签名划分消融对比） |
 | 24 | `canonicalize` | module | 对前面 lowering/fusion 产生的新模式再次规范化。 | 始终 |
 | 25 | `cse` | module | 再次消除公共子表达式。 | 始终 |
 | 26 | `remove-dead-values` | module | 清理二次优化后的无用 SSA value。 | LLVM < 19；LLVM 19+ 跳过 |

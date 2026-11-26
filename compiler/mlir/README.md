@@ -50,6 +50,10 @@ Fuses consecutive pure combinational ops (`pyc.add/mux/and/or/xor/not/constant`)
 
 `pycc` runs this pass by default before emission.
 
+`--pyc-fuse-comb=algo=greedy` (or `pycc --comb-fuse-algo=greedy`) keeps every
+contiguous combinational run whole instead of splitting it into per-input
+cones; the default `signature` grouping stays as described above.
+
 ### `pyc-check-flat-types`
 
 Verifies that the IR is fully lowered to flat hardware-carrying types
