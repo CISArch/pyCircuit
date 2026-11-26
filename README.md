@@ -183,6 +183,34 @@ pyCircuit
 | [FastFWD](designs/examples/fastfwd/) | Network packet forwarding |
 | [Linx CPU](contrib/linx/designs/examples/linx_cpu_pyc/) | Full 5-stage pipeline CPU |
 
+## 消融实验开关总表（`test` 分支专用）
+
+本分支（`test`，基 dev@`17b23c41`）是**消融实验专用分支**：论文需要的「关闭/替换某一项设计决策」对照都在这里以开关档位实现，每档默认值保持 dev 行为。所有消融开关登记在下面两张表里，新开关合入时必须同步加行。
+
+**新增消融开关的固定流程**：① 默认值 = dev 行为（PR 形态默认不变）；② 实现落在 MLIR pass + 驱动旗标（gate-first），未知取值要报错；③ 配一个 smoke 门并挂进 `ci.yml`；④ 测量时另做 `MEASUREMENT ONLY — do not merge` 本地提交把默认翻到待测档（存 `backup-meas-*` 分支，不 push），导出提测树与 dev 基线**背靠背成对**提测；⑤ 出数后把数字回填到下表（绑定精确 SHA）并同步工作区根 README 与 branch-ancestry-perf.md。
+
+### 本分支新增的消融开关
+
+| 开关 | 层级 | 默认 | 档位与语义 | 消融测量 |
+|---|---|---|---|---|
+| `--comb-fuse-algo=signature\|greedy` | `pycc` 驱动 | `signature` | comb run 分组算法。`signature`：按 op 读取的输入集合签名划分 run，每梳只在自己输入变化时唤醒（端口经一个转发 comb 轮询）；`greedy`：签名划分引入前的旧基本算法——不划分，连续 run 一梳到底融成整块 comb（每模块一大 comb，端口直读、无转发 comb） | **6.4655×**（signature vs greedy，2026-11-26 同窗口成对，34/34 更快，min 5.77/max 8.28）：signature=dev@`17b23c41` pyc_gm 16375.7，greedy=`0d8b612d`（backup-meas-fusecomb）2532.8；Verilator 哨兵 1.0025≈1；34/34 MATCH |
+| `--pyc-fuse-comb=algo=signature\|greedy` | `pyc-opt` pass 选项 | `signature` | 同上，pass 级入口（IR 级实验用；pycc 档即由此传入） | 同上 |
+
+门：`compiler/mlir/test/fuse_comb_greedy_smoke.sh`（断言 greedy 态 fixture 融成单 comb 直读端口）；已挂 `ci.yml`。
+
+### dev 既有、可作消融对照的开关（本分支不改动，备查）
+
+| 开关 | 默认 | 语义（消融视角） |
+|---|---|---|
+| `--cpp-parallel-instances=<N>` | `1` | 1=串行（逐字节同基线）；0=按硬件核数 auto（夹 [2,32]）；N≥2=固定 N 路池。宽度扫描：=2 是唯一正收益档 |
+| `--sim-mode=cpp-only` + `--cpp-only-preserve-ops` | `default` / `false` | 两项同时设置时跳过 comb 融合（per-op 发射），可作「无融合」对照档 |
+| `--emit-structural=auto\|on\|off` | `auto` | comb fusion 的结构化发射策略 |
+| `--state-loop` | `true` | 同时钟域 reg/delay_line 降成每时钟域一个状态更新循环（关掉=退回逐 reg 形态） |
+| `--hierarchy-policy=strict\|instantiate` / `--hierarchical` / `--flatten` | `strict` | 层级保持 vs 拍平的发射形态对照 |
+| `--inline-policy=default\|off\|threshold:<n>` / `--noinline` | `default` | inliner 策略（模块边界保持 vs 内联） |
+| `--logic-depth=<N>` | `32` | 组合逻辑深度检查上限（合法性门，非性能开关） |
+| `--cpp-shard-max-ast-nodes=<N>` / `--cpp-shard-threshold-*` | `0` / 4MiB | 巨型 eval 拓扑分片（代码布局类对照） |
+
 ## License
 
 pyCircuit is licensed under the MIT License. See `LICENSE`.
