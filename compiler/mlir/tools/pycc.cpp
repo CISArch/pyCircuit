@@ -1689,7 +1689,7 @@ static std::string methodKindForName(llvm::StringRef shortName) {
     return "comb";
   if (shortName == "eval" || shortName == "eval_comb_pass" || shortName.starts_with("eval_"))
     return "eval";
-  if (shortName.starts_with("tick"))
+  if (shortName.starts_with("tick") || shortName.starts_with("transfer"))
     return "tick";
   return "core";
 }
@@ -2755,11 +2755,9 @@ int main(int argc, char **argv) {
         os << "#include <array>\n";
         os << "#include <cstdlib>\n";
         os << "#include <cstdint>\n";
-        os << "#include <fstream>\n";
         os << "#include <iostream>\n";
         os << "#include <memory>\n";
         os << "#include <string>\n";
-        os << "#include <type_traits>\n";
         os << "#include <cpp/pyc_sim.hpp>\n";
         os << "#include <cpp/pyc_state_loop.hpp>\n";
         os << "#include <cpp/pyc_change_scheduler.hpp>\n";
@@ -2990,7 +2988,6 @@ int main(int argc, char **argv) {
           hos << "#include <cstdlib>\n";
           hos << "#include <iostream>\n";
           hos << "#include <memory>\n";
-          hos << "#include <type_traits>\n";
           hos << "#include <cpp/pyc_sim.hpp>\n";
           hos << "#include <cpp/pyc_state_loop.hpp>\n";
           hos << "#include <cpp/pyc_change_scheduler.hpp>\n";

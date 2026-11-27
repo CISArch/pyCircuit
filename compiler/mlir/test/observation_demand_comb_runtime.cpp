@@ -19,7 +19,7 @@ int main() {
 
   dut.a = pyc::cpp::Wire<8>(0xa5);
   dut.b = pyc::cpp::Wire<8>(0x3c);
-  dut.comb();
+  dut.eval();
   if (ready->readU64() != UINT64_C(0x24) || alias->readU64() != UINT64_C(0x24))
     return 2;
   if (out->readU64() != ready->readU64())

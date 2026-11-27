@@ -588,6 +588,8 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
       (void)ps->emitLocalDeclIfNeeded(v, v.getType(), nt.get(v), os);
   }
   if (auto c = dyn_cast<arith::ConstantOp>(op)) {
+    if (getValueCppStorage(c.getResult()) == CppStorageKind::Struct)
+      return success(); // member constant: initialized once at declaration
     auto value = dyn_cast<IntegerAttr>(c.getValue());
     unsigned w = bitWidth(c.getType());
     if (!value || w == 0)
@@ -612,6 +614,8 @@ static LogicalResult emitCombAssign(Operation &op, llvm::raw_ostream &os, NameTa
     return success();
   }
   if (auto c = dyn_cast<pyc::ConstantOp>(op)) {
+    if (getValueCppStorage(c.getResult()) == CppStorageKind::Struct)
+      return success(); // member constant: initialized once at declaration
     unsigned w = bitWidth(c.getType());
     if (w == 0)
       return c.emitError("invalid constant width");
@@ -996,6 +1000,17 @@ static void emitMetadataCombFanout(
   collectFanoutWordMasks(value, schedule, combIndices, wordMasks);
   if (wordMasks.empty())
     return;
+  if (wordMasks.size() == 1) {
+    // Single fanout word: mark it directly instead of a loop over a table.
+    const auto &wm = wordMasks.front();
+    if (deferredWake)
+      os << indent << "_pyc_wake[" << wm.first << "u] |= 0x"
+         << llvm::utohexstr(wm.second) << "ull;\n";
+    else
+      os << indent << "_pyc_comb_dirty.markWordUnchecked(" << wm.first
+         << "u, 0x" << llvm::utohexstr(wm.second) << "ull);\n";
+    return;
+  }
   std::string fanoutName = "_pyc_direct_fanout_" + sanitizeId(nt.get(value));
   os << indent << "static constexpr std::array<std::pair<unsigned, std::uint64_t>, "
      << wordMasks.size() << "> " << fanoutName << "{{";
@@ -1065,18 +1080,15 @@ static void emitLaneMarks(const llvm::SmallVector<LaneMark> &marks,
 }
 
 static void emitCombResultPublish(
-    pyc::CombOp comb, unsigned combIndex, unsigned resultIndex, Value candidate,
+    pyc::CombOp comb, unsigned resultIndex, Value candidate,
     llvm::raw_ostream &os, NameTable &nt, const EmissionSchedule &schedule,
     const llvm::DenseMap<Operation *, unsigned> &combIndices,
     const llvm::SmallVector<LaneMark> *laneMarks = nullptr) {
   Value result = comb.getResult(resultIndex);
   std::string resultName = nt.get(result);
-  std::string candidateName = "_pyc_comb_" + std::to_string(combIndex) +
-                              "_candidate_" + std::to_string(resultIndex);
-  os << "    const auto &" << candidateName << " = " << nt.get(candidate)
-     << ";\n";
-  os << "    if (" << resultName << " != " << candidateName << ") {\n";
-  os << "      " << resultName << " = " << candidateName << ";\n";
+  const std::string &candName = nt.get(candidate);
+  os << "    if (" << resultName << " != " << candName << ") {\n";
+  os << "      " << resultName << " = " << candName << ";\n";
   emitMetadataCombFanout(result, os, schedule, combIndices, nt);
   if (laneMarks)
     emitLaneMarks(*laneMarks, os, "      ");
@@ -1159,8 +1171,8 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
         if (it != laneMarks->end())
           resultMarks = &it->second;
       }
-      emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
-                            schedule, combIndices, resultMarks);
+      emitCombResultPublish(comb, static_cast<unsigned>(i), v, os, nt,
+                             schedule, combIndices, resultMarks);
     }
     os << "  }\n\n";
     return success();
@@ -1188,7 +1200,7 @@ static LogicalResult emitCombMethod(pyc::CombOp comb,
       if (it != laneMarks->end())
         resultMarks = &it->second;
     }
-    emitCombResultPublish(comb, idx, static_cast<unsigned>(i), v, os, nt,
+    emitCombResultPublish(comb, static_cast<unsigned>(i), v, os, nt,
                           schedule, combIndices, resultMarks);
   }
   os << "  }\n\n";
@@ -1259,6 +1271,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   struct Decl {
     std::string name;
     Type ty;
+    std::string init; // "{0x..ull,...}" for constants; empty => default {}
   };
   std::vector<Decl> decls;
   decls.reserve(256);
@@ -1266,12 +1279,43 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     for (Value r : op->getResults()) {
       if (getValueCppStorage(r) != CppStorageKind::Struct)
         continue;
-      decls.push_back(Decl{nt.get(r), r.getType()});
+      std::string init;
+      unsigned w = bitWidth(r.getType());
+      const llvm::APInt *cbits = nullptr;
+      llvm::APInt stored;
+      if (auto c = dyn_cast_or_null<arith::ConstantOp>(r.getDefiningOp())) {
+        if (auto value = dyn_cast<IntegerAttr>(c.getValue())) {
+          stored = value.getValue();
+          cbits = &stored;
+        }
+      } else if (auto c = dyn_cast_or_null<pyc::ConstantOp>(r.getDefiningOp())) {
+        stored = c.getValueAttr().getValue();
+        cbits = &stored;
+      }
+      if (cbits && w > 0) {
+        unsigned words = (w + 63u) / 64u;
+        init = "{";
+        for (unsigned i = 0; i < words; ++i) {
+          if (i)
+            init += ", ";
+          init += "0x" +
+                  llvm::utohexstr(cbits->extractBitsAsZExtValue(
+                      std::min(64u, w - i * 64u), i * 64u)) +
+                  "ull";
+        }
+        init += "}";
+      }
+      decls.push_back(Decl{nt.get(r), r.getType(), std::move(init)});
     }
   });
   std::sort(decls.begin(), decls.end(), [](const Decl &a, const Decl &b) { return a.name < b.name; });
-  for (const Decl &d : decls)
-    os << "  " << cppType(d.ty) << " " << d.name << "{};\n";
+  for (const Decl &d : decls) {
+    os << "  " << cppType(d.ty) << " " << d.name;
+    if (d.init.empty())
+      os << "{};\n";
+    else
+      os << " = " << cppType(d.ty) << d.init << ";\n";
+  }
   os << "\n";
 
   // Sequential primitive instances.
@@ -2455,7 +2499,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       os << "  " << cppType(operand.getType()) << " " << key
          << "_tick_input_" << index << "{};\n";
   };
-  os << "\n  // State-source snapshots used by dirty tick_compute.\n";
+  os << "\n  // State-source snapshots used by dirty tick.\n";
   for (const auto &ii : instInfos)
     emitTickSnapshotDecls(ii.member, ii.op->getOperands());
   for (auto r : regs)
@@ -2493,19 +2537,23 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   os << "    _pyc_sim_fast_enable = _pyc_parse_bool_env(\"PYC_SIM_FAST\", false);\n";
   os << "  }\n\n";
 
-  os << "  void _pyc_validate_primitive_bindings() const {\n";
-  for (auto r : regs)
-    os << "    if (!" << nt.get(r.getQ()) << "_inst) { std::cerr << \"pyc null reg binding: " << nt.get(r.getQ())
-       << "_inst\" << \"\\n\"; std::abort(); }\n";
-  for (auto delay : delayLines)
-    os << "    if (!" << nt.get(delay.getQ()) << "_inst) { std::cerr << \"pyc null delay_line binding: "
-       << nt.get(delay.getQ()) << "_inst\" << \"\\n\"; std::abort(); }\n";
-  for (auto mem : syncMemNMs) {
-    std::string instName = syncMemNMInstName.lookup(mem.getOperation());
-    os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem_nm binding: " << instName
-       << "\" << \"\\n\"; std::abort(); }\n";
+  const bool hasPrimitiveBindings =
+      !regs.empty() || !delayLines.empty() || !syncMemNMs.empty();
+  if (hasPrimitiveBindings) {
+    os << "  void _pyc_validate_primitive_bindings() const {\n";
+    for (auto r : regs)
+      os << "    if (!" << nt.get(r.getQ()) << "_inst) { std::cerr << \"pyc null reg binding: " << nt.get(r.getQ())
+         << "_inst\" << \"\\n\"; std::abort(); }\n";
+    for (auto delay : delayLines)
+      os << "    if (!" << nt.get(delay.getQ()) << "_inst) { std::cerr << \"pyc null delay_line binding: "
+         << nt.get(delay.getQ()) << "_inst\" << \"\\n\"; std::abort(); }\n";
+    for (auto mem : syncMemNMs) {
+      std::string instName = syncMemNMInstName.lookup(mem.getOperation());
+      os << "    if (!" << instName << ") { std::cerr << \"pyc null sync_mem_nm binding: " << instName
+         << "\" << \"\\n\"; std::abort(); }\n";
+    }
+    os << "  }\n\n";
   }
-  os << "  }\n\n";
 
   // Constructor (wire members default-initialize to 0).
   os << "  " << structName << "()";
@@ -2638,7 +2686,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
        << "nm_wvs_" << instName << ", nm_was_" << instName << ", nm_wds_" << instName << ", nm_wss_" << instName << ");\n";
     os << "    }\n";
   }
-  os << "    _pyc_validate_primitive_bindings();\n";
+  if (hasPrimitiveBindings)
+    os << "    _pyc_validate_primitive_bindings();\n";
   os << "    _pyc_init_runtime_controls();\n";
   os << "    #ifdef PYC_ENABLE_CTOR_EVAL\n";
   os << "    eval();\n";
@@ -4161,7 +4210,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
 
   os << "  }\n\n";
 
-  // tick_compute/tick_commit: two-phase sequential update (hierarchy-aware).
+  // tick/transfer: two-phase sequential update (hierarchy-aware).
   //
   // Large designs can produce enormous tick bodies (notably JanusBccBackendCompat), which
   // makes a single translation unit fragile and slow to compile. Split tick into helper
@@ -4189,8 +4238,8 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
       };
 
   auto emitTickComputePart = [&](unsigned begin, unsigned end, unsigned partIdx) {
-    os << "  inline void tick_compute_part_" << partIdx << "() {\n";
-    // Sub-modules (inputs + tick_compute).
+    os << "  inline void tick_part_" << partIdx << "() {\n";
+    // Sub-modules (inputs + tick).
     for (unsigned i = begin; i < end && i < instInfos.size(); ++i) {
       const auto &ii = instInfos[i];
       auto inst = ii.op;
@@ -4200,38 +4249,38 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
             for (unsigned j = 0; j < inst.getNumOperands(); ++j)
               os << indent << ii.member << "->" << ii.inPorts[j] << " = "
                  << nt.get(inst.getOperand(j)) << ";\n";
-            os << indent << ii.member << "->tick_compute();\n";
+            os << indent << ii.member << "->tick();\n";
           });
     }
     os << "  }\n\n";
   };
 
   auto emitTickCommitPart = [&](unsigned begin, unsigned end, unsigned partIdx) {
-    os << "  inline void tick_commit_part_" << partIdx << "() {\n";
+    os << "  inline void transfer_part_" << partIdx << "() {\n";
     // Sub-modules.
     for (unsigned i = begin; i < end && i < instInfos.size(); ++i)
-      os << "    " << instInfos[i].member << "->tick_commit();\n";
+      os << "    " << instInfos[i].member << "->transfer();\n";
     os << "  }\n\n";
   };
 
   // Parallel path: one tiny method per instance, so the fork body stays a flat
-  // switch and tick_compute/tick_commit can fork every submodule in one group
+  // switch and tick/transfer can fork every submodule in one group
   // (next-state sampling and commit are independent per instance: each reads
   // only its own ports and its own inputs, and writes only its own state).
   auto emitTickInstanceMethods = [&](unsigned idx) {
     const auto &ii = instInfos[idx];
     auto inst = ii.op;
-    os << "  inline void tick_compute_inst_" << idx << "() {\n";
+    os << "  inline void tick_inst_" << idx << "() {\n";
     emitStateTickCompute(
         ii.member, inst->getOperands(), "    ", [&](llvm::StringRef indent) {
           for (unsigned j = 0; j < inst.getNumOperands(); ++j)
             os << indent << ii.member << "->" << ii.inPorts[j] << " = "
                << nt.get(inst.getOperand(j)) << ";\n";
-          os << indent << ii.member << "->tick_compute();\n";
+          os << indent << ii.member << "->tick();\n";
         });
     os << "  }\n\n";
-    os << "  inline void tick_commit_inst_" << idx << "() {\n";
-    os << "    " << ii.member << "->tick_commit();\n";
+    os << "  inline void transfer_inst_" << idx << "() {\n";
+    os << "    " << ii.member << "->transfer();\n";
     os << "  }\n\n";
   };
 
@@ -4250,7 +4299,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     }
   }
 
-  os << "  void tick_compute() {\n";
+  os << "  void tick() {\n";
   if (!instInfos.empty()) {
     if (parallelInstances) {
       os << "    // Sub-modules: independent next-state sampling, forked.\n";
@@ -4258,13 +4307,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
          << instInfos.size() << ", [&](unsigned _pyc_worker) {\n";
       os << "      switch (_pyc_worker) {\n";
       for (unsigned i = 0; i < instInfos.size(); ++i)
-        os << "        case " << i << "u: tick_compute_inst_" << i << "(); return;\n";
+        os << "        case " << i << "u: tick_inst_" << i << "(); return;\n";
       os << "      }\n";
       os << "    });\n";
     } else {
       os << "    // Sub-modules.\n";
       for (unsigned i = 0; i < subParts; ++i)
-        os << "    tick_compute_part_" << i << "();\n";
+        os << "    tick_part_" << i << "();\n";
     }
   }
   os << "    // Local sequential primitives.\n";
@@ -4520,7 +4569,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
   os << "  }\n\n";
 
-  os << "  void tick_commit() {\n";
+  os << "  void transfer() {\n";
   if (fastEdge)
     os << "    _pyc_seq_armed = false;\n";
   if (!instInfos.empty()) {
@@ -4530,14 +4579,14 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
          << instInfos.size() << ", [&](unsigned _pyc_worker) {\n";
       os << "      switch (_pyc_worker) {\n";
       for (unsigned i = 0; i < instInfos.size(); ++i)
-        os << "        case " << i << "u: tick_commit_inst_" << i << "(); return;\n";
+        os << "        case " << i << "u: transfer_inst_" << i << "(); return;\n";
       os << "      }\n";
       os << "    });\n";
     } else {
       os << "    // Sub-modules.\n";
       unsigned commitParts = (static_cast<unsigned>(instInfos.size()) + kTickChunk - 1) / kTickChunk;
       for (unsigned i = 0; i < commitParts; ++i)
-        os << "    tick_commit_part_" << i << "();\n";
+        os << "    transfer_part_" << i << "();\n";
     }
   }
   os << "    // Local sequential primitives.\n";
@@ -4732,18 +4781,11 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   }
 	  os << "  }\n\n";
 
-	  // Decision 0027: provide explicit comb/tick/commit APIs + high-level step().
-	  // Decision 0001: expose transfer() as an alias of commit().
-	  os << "  void comb() { eval(); }\n";
-	  os << "  void tick() { tick_compute(); }\n";
-	  os << "  void commit() { tick_commit(); }\n";
-	  os << "  void transfer() { tick_commit(); }\n";
-	  os << "  void step() {\n";
-	  os << "    comb();\n";
-	  os << "    tick();\n";
-	  os << "    commit();\n";
-	  os << "    comb();\n";
-	  os << "  }\n";
+	  // Per-cycle surface: eval() (comb), tick() (sequential compute), transfer()
+	  // (commit/publish). The comb/tick/commit/transfer/step forwarder aliases
+	  // (Decision 0027/0001) were removed: the tb trait falls back to eval(),
+	  // nothing called commit()/step(), and tick()/transfer() are the real
+	  // implementations driven by tb and by parent modules in the hierarchy.
 
 	  os << "};\n\n";
 	  return success();
@@ -4875,7 +4917,6 @@ LogicalResult emitCpp(ModuleOp module, llvm::raw_ostream &os, const CppEmitterOp
   os << "#include <iostream>\n";
   os << "#include <memory>\n";
   os << "#include <string>\n";
-  os << "#include <type_traits>\n";
   os << "#include <utility>\n";
   os << "#include <cpp/pyc_sim.hpp>\n";
   os << "#include <cpp/pyc_state_loop.hpp>\n";
