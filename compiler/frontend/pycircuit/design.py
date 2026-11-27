@@ -395,12 +395,24 @@ class Design:
         for cm in self._mods.values():
             parts.append(cm.mod.emit_func_mlir())
             parts.append("\n")
+        # External black-box module declarations (docs/external-modules.md).
+        ext_decls = getattr(self, "_ext_module_decls", None)
+        if ext_decls:
+            from .ext import ext_module_mlir
+
+            parts.extend(ext_module_mlir(decl) for decl in ext_decls)
         parts.append("}\n")
         return "".join(parts)
 
     def emit_module_mlir_map(self) -> dict[str, str]:
         """Emit deterministic single-module `.pyc` MLIR text per compiled symbol."""
         out: dict[str, str] = {}
+        # External black-box declarations keep every module .pyc standalone.
+        ext_text = ""
+        if getattr(self, "_ext_module_decls", None):
+            from .ext import ext_module_mlir
+
+            ext_text = "".join(ext_module_mlir(d) for d in self._ext_module_decls)
         for sym in sorted(self._mods.keys()):
             cm = self._mods[sym]
             body = cm.mod.emit_func_mlir()
@@ -412,6 +424,7 @@ class Design:
                 f'module attributes {{pyc.top = @{sym}, pyc.frontend.contract = "{FRONTEND_CONTRACT}"}} {{\n'
                 + "".join(dep_decls)
                 + body
+                + ext_text
                 + "\n}\n"
             )
         return out

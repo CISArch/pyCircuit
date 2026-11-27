@@ -186,12 +186,18 @@ def _compile_to_design(build: Any, *, top_name: str, jit_params: dict[str, objec
         from .v5 import _make_compiled_module, compile_cycle_aware
 
         circuit = compile_cycle_aware(build, name=top_name, eager=True, hierarchical=True, **jit_params)
+        # External black-box declarations registered on the circuit (pycircuit.ext).
+        ext_decls = getattr(circuit, "_ext_module_decls", None)
         existing = getattr(circuit, "_v5_design", None)
         if isinstance(existing, Design):
+            if ext_decls:
+                existing._ext_module_decls = ext_decls
             return existing
         cm = _make_compiled_module(build, circuit, top_name)
         design = Design(top=top_name)
         design.add(cm)
+        if ext_decls:
+            design._ext_module_decls = ext_decls
         return design
     try:
         design_obj = compile(build, name=top_name, **jit_params)
@@ -2650,6 +2656,16 @@ def _cmd_build(args: argparse.Namespace) -> int:
             "cxx_standard": "c++17",
             "profile": str(args.profile),
         }
+        # External-module user sources (pycircuit.ext): link [backends.cpp] files
+        # and add the user header directories to the include path.
+        from .ext import discover_cpp_sources
+
+        ext_sources, ext_header_dirs = discover_cpp_sources([src.parent])
+        if ext_sources:
+            build_manifest["ext_sources"] = [str(p) for p in ext_sources]
+        for d in ext_header_dirs:
+            if str(d) not in include_dirs:
+                include_dirs.append(str(d))
         if args.cpp_pch:
             # Collect device hpp headers flagged for PCH across all module manifests.
             seen: set[str] = set()
