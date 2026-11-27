@@ -2867,6 +2867,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     return true;
   };
 
+  llvm::SmallVector<Operation *> fullOrdered;
+  bool hasFullTopo = topoOrder(/*includePrims=*/true, fullOrdered);
+
   // eval_comb_pass(): evaluate all combinational ops/assigns.
   //
   // Note: The IR is allowed to have "late" pyc.assign ops (e.g. queue wrappers
@@ -2876,6 +2879,9 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
   // Guard grouping: consecutive guarded combs that share one 64-bit dirty
   // word are wrapped in a single wordClean(word) probe; when the whole word is
   // clean one load+branch skips up to 64 per-comb checks.
+  // With a full topo order eval() interleaves prims itself and never calls
+  // eval_comb_pass, so only emit it in the no-topo fallback case.
+  if (!hasFullTopo) {
   os << "  inline void eval_comb_pass() {\n";
   llvm::SmallVector<Operation *> ordered;
   const bool blockOrder = !topoOrder(/*includePrims=*/false, ordered);
@@ -3033,9 +3039,7 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os,
     os << "    }\n";
   }
   os << "  }\n\n";
-
-  llvm::SmallVector<Operation *> fullOrdered;
-  bool hasFullTopo = topoOrder(/*includePrims=*/true, fullOrdered);
+  } // !hasFullTopo
 
   // Coarse-grained instance parallelism (--cpp-parallel-instances=N).
   //
