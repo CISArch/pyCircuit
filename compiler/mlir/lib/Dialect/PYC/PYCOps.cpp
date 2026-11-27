@@ -955,11 +955,13 @@ LogicalResult InstanceOp::verify() {
     return emitOpError("must be contained in an MLIR module");
 
   Operation *sym = SymbolTable::lookupSymbolIn(module, calleeAttr);
-  auto callee = dyn_cast_or_null<func::FuncOp>(sym);
-  if (!callee)
-    return emitOpError("callee must reference a func.func");
-
-  FunctionType ft = callee.getFunctionType();
+  FunctionType ft;
+  if (auto ext = dyn_cast_or_null<ExtModuleOp>(sym))
+    ft = ext.getFunctionType();
+  else if (auto callee = dyn_cast_or_null<func::FuncOp>(sym))
+    ft = callee.getFunctionType();
+  else
+    return emitOpError("callee must reference a func.func or pyc.ext_module");
   if (ft.getNumInputs() != getNumOperands())
     return emitOpError("operand count does not match callee signature");
   if (ft.getNumResults() != getNumResults())
@@ -981,6 +983,15 @@ LogicalResult InstanceOp::verify() {
       return emitOpError("name must be non-empty when provided");
   }
 
+  return success();
+}
+
+LogicalResult ExtModuleOp::verify() {
+  FunctionType ft = getFunctionType();
+  if (auto names = getArgNames(); names && names->size() != ft.getNumInputs())
+    return emitOpError("arg_names arity must match input count");
+  if (auto names = getResultNames(); names && names->size() != ft.getNumResults())
+    return emitOpError("result_names arity must match result count");
   return success();
 }
 
