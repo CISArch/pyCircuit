@@ -175,28 +175,6 @@ static void computeUniquePortNames(func::FuncOp f, std::vector<std::string> &inN
   }
 }
 
-// External-module ports carry their names in the ext symbol (the callee has no
-// body), so reuse the same uniquing as generated modules.
-static void computeUniqueExtPortNames(pyc::ExtModuleOp ext,
-                                      std::vector<std::string> &inNames,
-                                      std::vector<std::string> &outNames) {
-  NameTable nt;
-  inNames.clear();
-  outNames.clear();
-  auto ft = ext.getFunctionType();
-  auto nameAt = [&](std::optional<ArrayAttr> names, unsigned i,
-                    llvm::StringRef fallback) {
-    if (names && i < names->size())
-      if (auto s = dyn_cast<StringAttr>((*names)[i]))
-        return sanitizeId(s.getValue());
-    return std::string(fallback) + std::to_string(i);
-  };
-  for (unsigned i = 0; i < ft.getNumInputs(); ++i)
-    inNames.push_back(nt.unique(nameAt(ext.getArgNames(), i, "arg")));
-  for (unsigned i = 0; i < ft.getNumResults(); ++i)
-    outNames.push_back(nt.unique(nameAt(ext.getResultNames(), i, "out")));
-}
-
 // Emit a single combinational assignment for the common scalar/elementwise op
 // set shared by the pyc.comb region path and the top-level netlist path.
 // Returns std::nullopt when `op` is not one of these ops (the caller handles
@@ -750,21 +728,13 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
       auto calleeAttr = op->getAttrOfType<FlatSymbolRefAttr>("callee");
       if (!calleeAttr)
         return inst.emitError("missing required FlatSymbolRefAttr `callee`");
-      // A callee is either a func.func or an opaque pyc.ext_module boundary.
-      auto ext = mod.lookupSymbol<pyc::ExtModuleOp>(calleeAttr.getValue());
-      func::FuncOp callee;
-      if (!ext) {
-        callee = mod.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
-        if (!callee)
-          return inst.emitError("callee symbol not found: ") << calleeAttr.getValue();
-      }
+      auto callee = mod.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
+      if (!callee)
+        return inst.emitError("callee symbol not found: ") << calleeAttr.getValue();
 
       std::vector<std::string> inPorts;
       std::vector<std::string> outPorts;
-      if (ext)
-        computeUniqueExtPortNames(ext, inPorts, outPorts);
-      else
-        computeUniquePortNames(callee, inPorts, outPorts);
+      computeUniquePortNames(callee, inPorts, outPorts);
       if (inPorts.size() != inst.getNumOperands())
         return inst.emitError("operand count does not match callee signature");
       if (outPorts.size() != inst.getNumResults())
@@ -787,14 +757,7 @@ static LogicalResult emitFunc(func::FuncOp f, raw_ostream &os, const VerilogEmit
       for (unsigned i = 0; i < outPorts.size(); ++i)
         outConn.push_back(nt.get(inst.getResult(i)));
 
-      // External modules instantiate the user's Verilog top (default: symbol).
-      llvm::StringRef moduleName;
-      if (ext)
-        moduleName = ext.getVerilogTop() ? llvm::StringRef(*ext.getVerilogTop())
-                                         : llvm::StringRef(ext.getSymName());
-      else
-        moduleName = callee.getSymName();
-      os << moduleName << " " << instName << " (\n";
+      os << callee.getSymName() << " " << instName << " (\n";
       unsigned totalPorts = static_cast<unsigned>(inPorts.size() + outPorts.size());
       unsigned emitted = 0;
 

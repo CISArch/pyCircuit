@@ -8,7 +8,6 @@ include "mlir/IR/OpBase.td"
 include "mlir/IR/CommonAttrConstraints.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
-include "mlir/IR/SymbolInterfaces.td"
 include "pyc/Dialect/PYC/PYCTypes.td"
 
 class PYC_Op<string mnemonic, list<Trait> traits = []> :
@@ -374,20 +373,6 @@ def PYC_CdcSyncOp : PYC_Op<"cdc_sync", [MemoryEffects<[MemRead, MemWrite]>, AllT
   let results = (outs AnyInteger:$out);
   let hasVerifier = 1;
   let assemblyFormat = "$clk `,` $rst `,` $in attr-dict `:` type($out)";
-}
-
-// External black-box module declaration (docs/external-modules.md): the symbol
-// has no body; its semantics live in user backend artifacts. InstanceOp may
-// reference it, and analyses stop at that boundary instead of traversing.
-def PYC_ExtModuleOp : PYC_Op<"ext_module", [Symbol]> {
-  let summary = "External black-box module declaration";
-  let arguments = (ins SymbolNameAttr:$sym_name,
-                      TypeAttrOf<FunctionType>:$function_type,
-                      OptionalAttr<StrAttr>:$verilog_top,
-                      OptionalAttr<ArrayAttr>:$arg_names,
-                      OptionalAttr<ArrayAttr>:$result_names);
-  let hasVerifier = 1;
-  let assemblyFormat = "$sym_name attr-dict `:` $function_type";
 }
 
 def PYC_InstanceOp : PYC_Op<"instance", []> {

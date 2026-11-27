@@ -942,12 +942,8 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
       if (!calleeAttr)
         return inst.emitError("missing required FlatSymbolRefAttr `callee`");
       auto callee = module.lookupSymbol<func::FuncOp>(calleeAttr.getValue());
-      if (!callee) {
-        // External black-box callee: no body to walk (docs/external-modules.md).
-        if (module.lookupSymbol<pyc::ExtModuleOp>(calleeAttr.getValue()))
-          continue;
+      if (!callee)
         return inst.emitError("callee symbol not found: ") << calleeAttr.getValue();
-      }
       std::string seg = nameAttr.getValue().str();
       if (auto shortAttr = inst->getAttrOfType<StringAttr>("short_name"))
         seg = shortAttr.getValue().str();

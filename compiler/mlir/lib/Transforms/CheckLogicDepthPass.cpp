@@ -140,11 +140,7 @@ public:
           } else {
             auto sym = SymbolTable::lookupSymbolIn(module, calleeAttr.getValue());
             auto callee = dyn_cast_or_null<func::FuncOp>(sym);
-            if (!callee && dyn_cast_or_null<pyc::ExtModuleOp>(sym)) {
-              // External black-box boundary: depth stops here
-              // (docs/external-modules.md).
-              d = 1;
-            } else if (!callee) {
+            if (!callee) {
               inst.emitError("pyc.instance callee is not a func.func symbol: ") << calleeAttr.getValue();
               failedThisFunc = true;
               d = limit + 1;
