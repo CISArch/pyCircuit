@@ -1408,9 +1408,9 @@ def _render_tb_cpp(
 
     if expects_pre_by:
         # In the generated C++ TB, combinational logic only updates when we call
-        # `dut.comb()`. For pre-step (TICK-OBS) sampling, ensure values reflect
+        # `dut.eval()`. For pre-step (TICK-OBS) sampling, ensure values reflect
         # the drives applied for this cycle before checking expectations.
-        lines.append("    dut.comb();\n")
+        lines.append("    dut.eval();\n")
         lines.append("    // Pre-step expects for this cycle.\n")
         lines.append("    switch (cyc) {\n")
         for cyc in sorted(expects_pre_by.keys()):

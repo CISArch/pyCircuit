@@ -164,14 +164,14 @@ int main() {
   dut.clk = pyc::cpp::Wire<1>(0);
   dut.rst = pyc::cpp::Wire<1>(0);
   dut.data = pyc::cpp::Wire<8>(7);
-  dut.comb();
+  dut.eval();
   if (dut.reg_data.word(0) != 1)
     return 1;
   dut.clk = pyc::cpp::Wire<1>(1);
-  dut.comb();
+  dut.eval();
   dut.tick();
-  dut.commit();
-  dut.comb();
+  dut.transfer();
+  dut.eval();
   return dut.reg_data.word(0) == 8 ? 0 : 2;
 }
 CPP

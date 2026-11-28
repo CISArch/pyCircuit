@@ -13,10 +13,10 @@ int fail(const char *message) {
 }
 
 void runPhase(Dut &dut) {
-  dut.comb();
+  dut.eval();
   dut.tick();
-  dut.commit();
-  dut.comb();
+  dut.transfer();
+  dut.eval();
 }
 
 } // namespace
@@ -46,10 +46,10 @@ int main() {
   runPhase(dut);
   dut.enable = pyc::cpp::Wire<1>(0);
   dut.clk = pyc::cpp::Wire<1>(1);
-  dut.comb();
+  dut.eval();
   dut.tick();
-  dut.commit();
-  dut.comb();
+  dut.transfer();
+  dut.eval();
   if (dut.current.word(0) != 1)
     return fail("same-value register commit changed the visible output");
 

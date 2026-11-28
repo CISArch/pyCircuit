@@ -659,24 +659,26 @@ else
     pyc_warn "positive check failed: missing top.hpp for phase API check"
     fail=1
   else
-    if ! grep -q "void comb();" "${h}"; then
-      pyc_warn "positive check failed: missing comb() API (Decision 0027)"
+    # 2026-11-27 contract slimming: the comb/tick/commit/transfer/step
+    # forwarder aliases are gone; the surface is eval()/tick()/transfer().
+    if grep -q "void comb();" "${h}"; then
+      pyc_warn "positive check failed: comb() forwarder should be gone"
       fail=1
     fi
     if ! grep -q "void tick();" "${h}"; then
-      pyc_warn "positive check failed: missing tick() API (Decision 0027)"
+      pyc_warn "positive check failed: missing tick() API"
       fail=1
     fi
-    if ! grep -q "void commit();" "${h}"; then
-      pyc_warn "positive check failed: missing commit() API (Decision 0026/0027)"
+    if grep -q "void commit();" "${h}"; then
+      pyc_warn "positive check failed: commit() forwarder should be gone"
       fail=1
     fi
     if ! grep -q "void transfer();" "${h}"; then
-      pyc_warn "positive check failed: missing transfer() API (Decision 0001)"
+      pyc_warn "positive check failed: missing transfer() API"
       fail=1
     fi
-    if ! grep -q "void step();" "${h}"; then
-      pyc_warn "positive check failed: missing step() API (Decision 0027)"
+    if grep -q "void step();" "${h}"; then
+      pyc_warn "positive check failed: step() forwarder should be gone"
       fail=1
     fi
   fi
@@ -686,20 +688,20 @@ else
     pyc_warn "positive check failed: missing top.cpp for phase API check"
     fail=1
   else
-    if ! grep -q "void top::comb() { eval(); }" "${cpp}"; then
-      pyc_warn "positive check failed: comb() should delegate to eval()"
+    if grep -q "tick_compute\|tick_commit" "${cpp}"; then
+      pyc_warn "positive check failed: legacy tick_compute/tick_commit names remain"
       fail=1
     fi
-    if ! grep -q "void top::tick() { tick_compute(); }" "${cpp}"; then
-      pyc_warn "positive check failed: tick() should delegate to tick_compute()"
+    if ! grep -q "void top::tick() {" "${cpp}"; then
+      pyc_warn "positive check failed: missing real tick() body"
       fail=1
     fi
-    if ! grep -q "void top::transfer() { tick_commit(); }" "${cpp}"; then
-      pyc_warn "positive check failed: transfer() should delegate to tick_commit()"
+    if ! grep -q "void top::transfer() {" "${cpp}"; then
+      pyc_warn "positive check failed: missing real transfer() body"
       fail=1
     fi
-    if ! grep -q "commit();" "${cpp}"; then
-      pyc_warn "positive check failed: expected step() to call commit()"
+    if grep -q "void top::comb() { eval(); }" "${cpp}"; then
+      pyc_warn "positive check failed: comb() forwarder should be gone"
       fail=1
     fi
   fi
